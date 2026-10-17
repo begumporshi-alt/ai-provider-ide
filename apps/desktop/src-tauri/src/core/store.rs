@@ -348,7 +348,99 @@ const DATA_MIGRATIONS: &[DataMigration] = &[
     ("0026_pending_last_error", add_pending_last_error),
     ("0027_session_messages", create_session_messages),
     ("0028_session_memory_refs", add_session_memory_refs),
+    ("0029_axiom_evolution", create_axiom_tables),
 ];
+
+/// 0029 — AXIOM's four tables: the version chain, the finding register, the eval results and the
+/// promotion decisions.
+///
+/// Four tables rather than one JSON blob because each has a different lifetime and a different rule
+/// about being rewritten:
+///
+/// - `axiom_versions` is **append-only and immutable**. Nothing updates a version row except its
+///   `state` and its `decision_id`, and the `candidate → active/rejected/retired` transition is the
+///   only mutation the engine performs. A rejected version is kept, never deleted: rollback works
+///   because the thing rolled back to was never destroyed, and the reasoning behind a rejection is
+///   evidence about the agent that stays true after the rejection.
+/// - `axiom_findings` is **never deleted at all**. A finding that stops recurring is the proof that a
+///   fix worked; deleting it would destroy the only record of that.
+/// - `axiom_suite_results` is keyed by the version that produced it. Because versions are immutable,
+///   a stored result is reusable forever, which is what lets a second pass skip paying to reproduce a
+///   baseline. The `(suite_id, version_id, model, repeats)` index is that lookup.
+/// - `axiom_decisions` holds the guardian's checks, the four roles' verdicts and the per-metric
+///   deltas as JSON. A decision is a document to be re-read, not a table to be queried into.
+///
+/// A partial unique index carries the one invariant the engine also asserts in code — at most one
+/// `active` version — so a hand-edited database cannot leave the agent with two answers to "what
+/// configuration is this running".
+fn create_axiom_tables(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS axiom_versions (
+  id                   TEXT PRIMARY KEY,
+  parent_id            TEXT REFERENCES axiom_versions(id),
+  created_at           INTEGER NOT NULL,
+  prompt_override      TEXT,
+  max_iterations       INTEGER NOT NULL,
+  verification_nudge_max INTEGER NOT NULL,
+  reason               TEXT NOT NULL,
+  targets_finding_ids  TEXT NOT NULL DEFAULT '[]',
+  evidence             TEXT NOT NULL DEFAULT '[]',
+  state                TEXT NOT NULL CHECK (state IN ('candidate','active','rejected','retired')),
+  decision_id          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_axiom_versions_created ON axiom_versions(created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_axiom_versions_one_active
+  ON axiom_versions(state) WHERE state = 'active';
+
+CREATE TABLE IF NOT EXISTS axiom_findings (
+  id           TEXT PRIMARY KEY,
+  detector     TEXT NOT NULL,
+  title        TEXT NOT NULL,
+  severity     TEXT NOT NULL CHECK (severity IN ('info','minor','major','critical')),
+  root_cause   TEXT NOT NULL CHECK (root_cause IN ('model','prompt','memory','tool','orchestration','infra')),
+  rationale    TEXT NOT NULL,
+  differential INTEGER NOT NULL DEFAULT 0,
+  evidence     TEXT NOT NULL DEFAULT '[]',
+  occurrences  INTEGER NOT NULL DEFAULT 1,
+  metric       TEXT,
+  recorded_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_axiom_findings_detector ON axiom_findings(detector, recorded_at);
+
+CREATE TABLE IF NOT EXISTS axiom_suite_results (
+  id                TEXT PRIMARY KEY,
+  suite_id          TEXT NOT NULL,
+  version_id        TEXT NOT NULL,
+  model             TEXT NOT NULL,
+  started_at        INTEGER NOT NULL,
+  ended_at          INTEGER NOT NULL,
+  repeats           INTEGER NOT NULL,
+  pass_rate         REAL NOT NULL,
+  prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  tasks             TEXT NOT NULL DEFAULT '[]',
+  attempt_summaries TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_axiom_suite_results_reuse
+  ON axiom_suite_results(suite_id, version_id, model, repeats);
+
+CREATE TABLE IF NOT EXISTS axiom_decisions (
+  id           TEXT PRIMARY KEY,
+  candidate_id TEXT NOT NULL,
+  baseline_id  TEXT NOT NULL,
+  model        TEXT NOT NULL,
+  decided_at   INTEGER NOT NULL,
+  decision     TEXT NOT NULL CHECK (decision IN ('promote','reject')),
+  checks       TEXT NOT NULL DEFAULT '[]',
+  roles        TEXT NOT NULL DEFAULT '[]',
+  deltas       TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_axiom_decisions_candidate ON axiom_decisions(candidate_id);
+"#,
+    )?;
+    Ok(())
+}
 
 /// 0028 — the recall record on a transcript row.
 ///
@@ -1549,13 +1641,13 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0028 data migrations.
-        assert_eq!(info.schema_version, 28);
+        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0029 data migrations.
+        assert_eq!(info.schema_version, 29);
         // The two lists must stay numbered as one sequence: a data migration that reused a SQL
         // version number would be silently skipped on every database that already had it.
-        assert_eq!(28, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
+        assert_eq!(29, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
         // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
-        // P6 agent-run and P7 memory tables. `memories_fts` is a virtual table, so it shows up
+        // P6 agent-run, P7 memory and AXIOM evolution tables. `memories_fts` is a virtual table, so it shows up
         // in sqlite_master as a table too — assert it, because BM25 recall silently returns
         // nothing if the FTS index was never created.
         let conn = s.conn.lock().unwrap();
@@ -1588,6 +1680,10 @@ mod tests {
             "memory_principal_policy",
             "router_model_context",
             "idempotency_keys",
+            "axiom_versions",
+            "axiom_findings",
+            "axiom_suite_results",
+            "axiom_decisions",
         ] {
             let n: i64 = conn
                 .query_row(
@@ -1615,6 +1711,70 @@ mod tests {
         conn.execute("DELETE FROM providers WHERE id='p'", []).unwrap();
         let keys: i64 = conn.query_row("SELECT COUNT(*) FROM api_keys", [], |r| r.get(0)).unwrap();
         assert_eq!(keys, 0);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 0029 — AXIOM's tables, on a database that already existed without them.
+    ///
+    /// Two things are worth proving separately from "the tables are there". The first is that the step
+    /// re-applies to a store opened before AXIOM existed, which is every install in the field: the
+    /// migration runs against a database that has real rows in `agent_runs`, and it must not touch
+    /// them. The second is the one-active constraint, because it is the invariant the whole version
+    /// chain rests on — a database with two active versions has no answer to "what is the agent
+    /// running", and every read of `effectiveConfig` would be a coin flip.
+    #[test]
+    fn axiom_tables_arrive_on_an_existing_database_and_hold_one_active_version() {
+        let dir = std::env::temp_dir().join(format!("aip-test-axiom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::open(&dir).expect("open+migrate");
+
+        // An agent run recorded before AXIOM existed. The migration must leave it alone: AXIOM reads
+        // this table, and a migration that disturbed it would corrupt the evidence AXIOM audits.
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agent_runs (id, model, status, started_at) VALUES ('pre-existing','m','ok',1)",
+                [],
+            )
+            .unwrap();
+            // Rewind the tail, and drop the tables, so the step has something to do.
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS axiom_decisions;
+                 DROP TABLE IF EXISTS axiom_suite_results;
+                 DROP TABLE IF EXISTS axiom_findings;
+                 DROP TABLE IF EXISTS axiom_versions;
+                 DELETE FROM schema_version WHERE version >= 29;",
+            )
+            .unwrap();
+        }
+
+        s.migrate().expect("re-migrate applies 0029");
+        assert_eq!(s.info().unwrap().schema_version, 29);
+
+        let conn = s.conn.lock().unwrap();
+        let runs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent_runs WHERE id='pre-existing'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(runs, 1, "the history AXIOM audits survives the migration that adds it");
+
+        let insert = |id: &str, state: &str| {
+            conn.execute(
+                "INSERT INTO axiom_versions
+                   (id, created_at, max_iterations, verification_nudge_max, reason, state)
+                 VALUES (?1, 1, 40, 1, 'r', ?2)",
+                rusqlite::params![id, state],
+            )
+        };
+        insert("v1", "active").unwrap();
+        let second = insert("v2", "active");
+        assert!(
+            second.is_err(),
+            "two active versions would leave the agent with no single configuration to report"
+        );
+        // Retiring the first is what makes room, which is exactly the transition `setState` performs.
+        conn.execute("UPDATE axiom_versions SET state='retired' WHERE id='v1'", []).unwrap();
+        insert("v2", "active").expect("one active at a time, not one active ever");
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }

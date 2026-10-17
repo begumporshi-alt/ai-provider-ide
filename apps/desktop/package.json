@@ -23,6 +23,7 @@
   },
   "dependencies": {
     "@aiprovider/adapter-spec": "workspace:*",
+    "@aiprovider/axiom-core": "workspace:*",
     "@aiprovider/router-core": "workspace:*",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",

@@ -33,8 +33,8 @@ Set on open, and asserted by a test rather than assumed:
 
 ## Tables
 
-28 tables (27 `CREATE TABLE` + the `memories_fts` virtual table), plus `sqlite_sequence` and four FTS shadow
-tables (`memories_fts_data`, `_idx`, `_docsize`, `_config`), which is why `sqlite_master` reports 33.
+32 tables (31 `CREATE TABLE` + the `memories_fts` virtual table), plus `sqlite_sequence` and four FTS shadow
+tables (`memories_fts_data`, `_idx`, `_docsize`, `_config`), which is why `sqlite_master` reports 37.
 
 The authoritative list is the array in the `migrations_apply_once_and_are_idempotent` test in `core/store.rs`. **If
 you add a table, add it there too** — that assertion is what catches a migration that silently did not run.
@@ -51,15 +51,26 @@ you add a table, add it there too** — that assertion is what catches a migrati
 | Agent loop | `agent_runs`, `agent_steps` |
 | Memory | `memories`, `memories_fts` |
 | Live session context | `router_sessions`, `session_turns`, `session_state`, `session_titles`, `memory_pending`, `memory_principal_policy`, `router_model_context` |
+| AXIOM (agent supervision) | `axiom_versions`, `axiom_findings`, `axiom_suite_results`, `axiom_decisions` |
 | Migrations | `schema_version` |
 
-### Two things about specific tables
+### Three things about specific tables
 
 - **`ledger` has no foreign keys, by design.** Deleting a provider cascades its keys, manifests and catalog
   rows, but ledger history is preserved — spend history that disappears when a provider is removed is worse
   than a dangling reference.
 - **`memories_fts` must be asserted.** BM25 recall silently returns nothing if the FTS index was never created,
   which looks identical to "no memories match".
+- **The four `axiom_*` tables are split by lifetime, not folded into one JSON blob** (migration
+  `0029_axiom_evolution`). `axiom_versions` is append-only and immutable — only its `state`
+  (`candidate → active/rejected/retired`) and `decision_id` are ever written, and a partial unique index pins
+  *at most one `active` version* so a hand-edited database cannot leave the agent with two answers to "what
+  configuration is this running". Rollback works precisely because a rejected version is kept, never deleted.
+  `axiom_findings` is never deleted at all: a finding that stops recurring is the proof a fix worked, and
+  deleting it would destroy the only record of that. `axiom_suite_results` is keyed by the immutable version
+  that produced it, so a stored baseline is reusable forever and a second pass never re-pays for it.
+  `axiom_decisions` holds the Regression Guardian's checks and per-metric deltas as JSON — a document to be
+  re-read, not a table to be queried into.
 
 ## Migration rules
 
@@ -67,11 +78,11 @@ There are **two lists** and they are numbered as **one sequence**:
 
 ```rust
 const MIGRATIONS: &[(&str, &str)] = &[ … ];                 // 0001..0006, SQL
-const DATA_MIGRATIONS: &[(&str, fn(&Transaction) -> Result<()>)] = &[ … ];  // 0007..0023, Rust
+const DATA_MIGRATIONS: &[(&str, fn(&Transaction) -> Result<()>)] = &[ … ];  // 0007..0029, Rust
 ```
 
-A data migration's version is `MIGRATIONS.len() + idx + 1`. The pair is asserted at **23** total
-(`store.rs`, `assert_eq!(info.schema_version, 23)`).
+A data migration's version is `MIGRATIONS.len() + idx + 1`. The pair is asserted at **29** total
+(`store.rs`, `assert_eq!(info.schema_version, 29)`).
 
 **The trap:** appending a new SQL migration to `MIGRATIONS` shifts the version number of **every** data
 migration by one. On any database that already applied them, each data migration would then be re-run under a
@@ -92,7 +103,7 @@ Migrations run on every app launch and must be safe to re-run.
 
 **The 2026-09-22/23 snapshot below is kept as a lesson, not as current state** — its point was the gap
 between "defined in code" and "applied to the live database", which is a gap every reader should know exists.
-Code sits at `schema_version` **23** (`0023_idempotency_keys`, added 2026-10-04); the live database on any
+Code sits at `schema_version` **29** (`0029_axiom_evolution`, the four AXIOM tables); the live database on any
 given machine is at whatever version its last-launched build applied, and the migration runner closes the gap
 on the next launch. That is the mechanism; the story below is why the distinction once mattered:
 

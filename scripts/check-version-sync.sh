@@ -38,7 +38,8 @@ check() {
 for f in package.json \
          apps/desktop/package.json \
          packages/router-core/package.json \
-         packages/adapter-spec/package.json; do
+         packages/adapter-spec/package.json \
+         packages/axiom-core/package.json; do
   check "$f" "$(json_version "$f")"
 done
 

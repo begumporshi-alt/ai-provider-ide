@@ -1,17 +1,17 @@
 #!/usr/bin/env node
 /**
- * One coverage number across three packages.
+ * One coverage number across four packages.
  *
- * `pnpm -r test:coverage` runs three separate vitest processes, so it writes three separate reports.
- * Three percentages and no aggregate is exactly the gap this closes
+ * `pnpm -r test:coverage` runs four separate vitest processes, so it writes four separate reports.
+ * Four percentages and no aggregate is exactly the gap this closes
  * (docs/PRODUCT_COMPLETION_PLAN.md §4.2): without a single figure, "did this change make things
  * worse" has no answer.
  *
  * The combination is **weighted**: raw counts are summed and the percentage is recomputed. Averaging
- * the three `pct` values would weight a 300-line package the same as a 6,000-line one — a wrong
+ * the four `pct` values would weight a 300-line package the same as a 6,000-line one — a wrong
  * number that looks entirely plausible.
  *
- * A missing report is a hard error, never a zero. Summing two of three and printing a confident
+ * A missing report is a hard error, never a zero. Summing three of four and printing a confident
  * percentage is the failure mode this script exists to prevent.
  */
 import { readFileSync, existsSync } from "node:fs";
@@ -24,6 +24,7 @@ const PACKAGES = [
   { name: "desktop", dir: "apps/desktop" },
   { name: "router-core", dir: "packages/router-core" },
   { name: "adapter-spec", dir: "packages/adapter-spec" },
+  { name: "axiom-core", dir: "packages/axiom-core" },
 ];
 
 const METRICS = ["statements", "branches", "functions", "lines"];

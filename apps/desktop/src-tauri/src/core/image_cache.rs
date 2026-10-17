@@ -39,7 +39,11 @@ fn ext_for(media_type: &str) -> Option<&'static str> {
 /// name and the read command takes it, so the UI never needs to know where the cache lives.
 /// Content-addressed: the same bytes always land on the same name, so a replayed transcript
 /// finds its image even after the cache dir was partially evicted.
-pub fn write(app_data_dir: &std::path::Path, media_type: &str, base64: &str) -> Result<String, String> {
+pub fn write(
+    app_data_dir: &std::path::Path,
+    media_type: &str,
+    base64: &str,
+) -> Result<String, String> {
     let ext = ext_for(media_type)
         .ok_or_else(|| format!("\"{media_type}\" is not an image type the cache stores"))?;
     use base64::Engine as _;
@@ -145,7 +149,8 @@ mod tests {
     use super::*;
 
     fn tmp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("aiprovider-imgcache-{tag}-{}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("aiprovider-imgcache-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

@@ -13,6 +13,7 @@ use tauri::ipc::Channel;
 use tauri::State;
 
 use crate::core::agent_defs;
+use crate::core::axiom;
 use crate::core::context;
 use crate::core::crash_report;
 use crate::core::egress::{self, EgressRequest, EgressState, StreamEvent};
@@ -754,7 +755,8 @@ pub fn image_cache_write(
     media_type: String,
     base64: String,
 ) -> Result<String, CommandError> {
-    crate::core::image_cache::write(&app_data_dir(&store), &media_type, &base64).map_err(CommandError)
+    crate::core::image_cache::write(&app_data_dir(&store), &media_type, &base64)
+        .map_err(CommandError)
 }
 
 #[tauri::command]
@@ -791,6 +793,134 @@ pub fn app_build_identity() -> BuildIdentity {
 #[tauri::command]
 pub fn ui_session_key(store: State<'_, Arc<store::Store>>) -> Result<String, CommandError> {
     crate::core::ui_session::ensure(&store).map_err(CommandError)
+}
+
+// ---------- AXIOM evolution (P8) ----------
+// The engine itself is TypeScript in the webview (`packages/axiom-core`); this is only its storage.
+// Every command is a pass-through on purpose. The two invariants that matter — at most one active
+// version, and records of what happened are never rewritten — are enforced in `core::axiom`, so
+// there is one place that can be wrong about them rather than one per call site.
+//
+// Nothing here reads a secret, mutates the egress allowlist, or takes SQL. The one thing a webview
+// caller can do that has consequences outside this table set is promote a version, and that is the
+// point of the screen: promotion is a user-visible act with the decision record stored beside it.
+
+#[tauri::command]
+pub fn axiom_traces_list(
+    store: State<'_, Arc<Store>>,
+    limit: Option<usize>,
+    session_id: Option<String>,
+) -> Result<Vec<serde_json::Value>, CommandError> {
+    axiom::traces(&store, limit.unwrap_or(50), session_id.as_deref()).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn axiom_trace_get(
+    store: State<'_, Arc<Store>>,
+    run_id: String,
+) -> Result<Option<serde_json::Value>, CommandError> {
+    axiom::trace(&store, &run_id).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn axiom_versions_list(
+    store: State<'_, Arc<Store>>,
+) -> Result<Vec<axiom::AxiomVersion>, CommandError> {
+    axiom::list_versions(&store).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn axiom_version_get(
+    store: State<'_, Arc<Store>>,
+    id: String,
+) -> Result<Option<axiom::AxiomVersion>, CommandError> {
+    axiom::get_version(&store, &id).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn axiom_version_put(
+    store: State<'_, Arc<Store>>,
+    version: axiom::AxiomVersion,
+) -> Result<(), CommandError> {
+    axiom::put_version(&store, &version).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn axiom_version_set_state(
+    store: State<'_, Arc<Store>>,
+    id: String,
+    state: String,
+) -> Result<(), CommandError> {
+    axiom::set_state(&store, &id, &state).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn axiom_version_link_decision(
+    store: State<'_, Arc<Store>>,
+    version_id: String,
+    decision_id: String,
+) -> Result<(), CommandError> {
+    axiom::link_decision(&store, &version_id, &decision_id).map_err(CommandError)
+}
+
+/// The configuration the Assistant should be running with. Read on every agent turn rather than
+/// cached in the webview: a promotion has to take effect on the next turn, and a stale copy is the
+/// failure mode that would make "AXIOM improved the agent" unfalsifiable.
+#[tauri::command]
+pub fn axiom_active_config(
+    store: State<'_, Arc<Store>>,
+) -> Result<axiom::ActiveConfig, CommandError> {
+    axiom::active_config(&store).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn axiom_findings_put(
+    store: State<'_, Arc<Store>>,
+    findings: Vec<axiom::AxiomFinding>,
+) -> Result<(), CommandError> {
+    axiom::put_findings(&store, &findings).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn axiom_findings_list(
+    store: State<'_, Arc<Store>>,
+    limit: Option<usize>,
+) -> Result<Vec<axiom::AxiomFinding>, CommandError> {
+    axiom::list_findings(&store, limit.unwrap_or(200)).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn axiom_suite_result_put(
+    store: State<'_, Arc<Store>>,
+    result: axiom::SuiteResult,
+) -> Result<(), CommandError> {
+    axiom::put_suite_result(&store, &result).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn axiom_suite_results_list(
+    store: State<'_, Arc<Store>>,
+    suite_id: Option<String>,
+    version_id: Option<String>,
+) -> Result<Vec<serde_json::Value>, CommandError> {
+    axiom::list_suite_results(&store, suite_id.as_deref(), version_id.as_deref())
+        .map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn axiom_decision_put(
+    store: State<'_, Arc<Store>>,
+    decision: axiom::Decision,
+) -> Result<(), CommandError> {
+    axiom::put_decision(&store, &decision).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn axiom_decisions_list(
+    store: State<'_, Arc<Store>>,
+    limit: Option<usize>,
+) -> Result<Vec<serde_json::Value>, CommandError> {
+    axiom::list_decisions(&store, limit.unwrap_or(100)).map_err(CommandError)
 }
 
 pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
@@ -955,6 +1085,22 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         // webview can authenticate to `/admin/*` over `fetch()` — the enabler the pure-HTTP
         // decision assumed and invariant 2 denied.
         crate::tauri::commands::ui_session_key,
+        // AXIOM (P8): the evolution engine's storage. The engine runs in the webview; these carry
+        // its traces in and its versions, findings, results and decisions out.
+        axiom_traces_list,
+        axiom_trace_get,
+        axiom_versions_list,
+        axiom_version_get,
+        axiom_version_put,
+        axiom_version_set_state,
+        axiom_version_link_decision,
+        axiom_active_config,
+        axiom_findings_put,
+        axiom_findings_list,
+        axiom_suite_result_put,
+        axiom_suite_results_list,
+        axiom_decision_put,
+        axiom_decisions_list,
     ]
 }
 

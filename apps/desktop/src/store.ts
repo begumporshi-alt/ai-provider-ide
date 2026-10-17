@@ -6,6 +6,15 @@
  */
 import { invoke } from "@tauri-apps/api/core";
 import type { Modality } from "@aiprovider/adapter-spec";
+import type {
+  AgentConfig,
+  AgentVersion,
+  Finding,
+  PromotionDecision,
+  RunTrace,
+  SuiteResult,
+  VersionState,
+} from "@aiprovider/axiom-core";
 import { fetchAdmin, fetchAdminAs } from "./lib/gateway-client";
 import { gatewaySystemAiPort } from "./lib/gateway-turn";
 import {
@@ -2199,4 +2208,93 @@ export async function clearCrash(id: string): Promise<boolean> {
 
 export async function clearAllCrashes(): Promise<number> {
   return invoke<number>("crash_clear_all");
+}
+
+// ── P8: AXIOM evolution ──────────────────────────────────────────────────────
+// The engine is `@aiprovider/axiom-core` and runs here, in the webview. These calls are only its
+// storage: the host's four `axiom_*` tables (migration 0029) plus a read of `agent_runs`/`agent_steps`
+// assembled into the transcript shape the engine wants.
+//
+// The types are imported, not restated. The host serializes those same shapes, so a second
+// declaration here would be a copy of a contract that can drift from the original — and the drift
+// would show up as `undefined` at runtime, not as a compile error.
+
+/** A finding as stored. `recordedAt` is stamped by the host on write; the engine's `Finding` has no
+ *  such field, because when a finding was last observed is a fact about the database. */
+export type StoredFinding = Finding & { recordedAt: number };
+
+export interface ActiveAxiomConfig {
+  config: AgentConfig;
+  /** Null until something is promoted — every install starts here, running its built-in configuration. */
+  versionId: string | null;
+}
+
+export async function axiomListTraces(limit = 50, sessionId?: string | null): Promise<RunTrace[]> {
+  return invoke<RunTrace[]>("axiom_traces_list", { limit, sessionId: sessionId ?? null });
+}
+
+export async function axiomGetTrace(runId: string): Promise<RunTrace | null> {
+  return invoke<RunTrace | null>("axiom_trace_get", { runId });
+}
+
+export async function axiomListVersions(): Promise<AgentVersion[]> {
+  return invoke<AgentVersion[]>("axiom_versions_list");
+}
+
+export async function axiomGetVersion(id: string): Promise<AgentVersion | null> {
+  return invoke<AgentVersion | null>("axiom_version_get", { id });
+}
+
+/** Append a version. Refused if the id is taken: versions are immutable, because a suite result is
+ *  keyed to one and is only reusable forever if the configuration behind it cannot change. */
+export async function axiomPutVersion(version: AgentVersion): Promise<void> {
+  await invoke("axiom_version_put", { version });
+}
+
+/** Move a version's state. Promoting to `active` retires the incumbent in the same step. */
+export async function axiomSetVersionState(id: string, state: VersionState): Promise<void> {
+  await invoke("axiom_version_set_state", { id, state });
+}
+
+export async function axiomLinkDecision(versionId: string, decisionId: string): Promise<void> {
+  await invoke("axiom_version_link_decision", { versionId, decisionId });
+}
+
+/**
+ * What the agent should be running with. Read per turn rather than cached in the webview: a
+ * promotion has to take effect on the next turn, and a stale copy is the failure mode that would
+ * make "AXIOM improved the agent" unfalsifiable.
+ */
+export async function axiomActiveConfig(): Promise<ActiveAxiomConfig> {
+  return invoke<ActiveAxiomConfig>("axiom_active_config");
+}
+
+export async function axiomPutFindings(findings: Finding[]): Promise<void> {
+  await invoke("axiom_findings_put", { findings });
+}
+
+export async function axiomListFindings(limit = 200): Promise<StoredFinding[]> {
+  return invoke<StoredFinding[]>("axiom_findings_list", { limit });
+}
+
+export async function axiomPutSuiteResult(result: SuiteResult): Promise<void> {
+  await invoke("axiom_suite_result_put", { result });
+}
+
+export async function axiomListSuiteResults(opts?: {
+  suiteId?: string | null;
+  versionId?: string | null;
+}): Promise<SuiteResult[]> {
+  return invoke<SuiteResult[]>("axiom_suite_results_list", {
+    suiteId: opts?.suiteId ?? null,
+    versionId: opts?.versionId ?? null,
+  });
+}
+
+export async function axiomPutDecision(decision: PromotionDecision): Promise<void> {
+  await invoke("axiom_decision_put", { decision });
+}
+
+export async function axiomListDecisions(limit = 100): Promise<PromotionDecision[]> {
+  return invoke<PromotionDecision[]>("axiom_decisions_list", { limit });
 }

@@ -10,6 +10,7 @@ import { Shell } from "./components/Shell";
 import { ProvidersScreen } from "./screens/Providers";
 import { ModelsScreen } from "./screens/Models";
 import { AssistantScreen } from "./screens/Assistant";
+import { AxiomScreen } from "./screens/Axiom";
 import { CompareScreen } from "./screens/Compare";
 import { ActivityScreen } from "./screens/Activity";
 import { ContextScreen } from "./screens/Context";
@@ -28,6 +29,20 @@ export default function App() {
   const screen = useUi((s) => s.screen);
   const [ready, setReady] = useState(false);
   const [bootError, setBootError] = useState<string | null>(null);
+  /**
+   * Whether AXIOM has been opened at least once. Once it has, it stays mounted and is hidden with
+   * CSS instead of unmounted — the same cure the Assistant needed, for a related reason: an AXIOM
+   * evaluation makes paid model calls over several minutes, and unmounting the screen would leave
+   * that run going with no progress line and no Stop button, i.e. paid work nobody can see or end.
+   * It is *not* mounted from launch the way the Assistant is, because it has nothing in flight
+   * until opened, and mounting it early would only add its six startup reads to every tick raised
+   * anywhere else in the app.
+   */
+  const [axiomOpened, setAxiomOpened] = useState(false);
+
+  useEffect(() => {
+    if (screen === "axiom") setAxiomOpened(true);
+  }, [screen]);
 
   // R1: the gateway bridge no longer runs here, and since 25f it is not a webview at all — it is
   // Rust (`core/router_bridge.rs`), so UI render work and UI HMR reloads cannot touch in-flight
@@ -97,6 +112,11 @@ export default function App() {
         <AssistantScreen />
       </div>
       {screen === "providers" && <ProvidersScreen />}
+      {axiomOpened && (
+        <div className={screen === "axiom" ? undefined : "hidden"}>
+          <AxiomScreen />
+        </div>
+      )}
       {screen === "models" && <ModelsScreen />}
       {screen === "compare" && <CompareScreen />}
       {screen === "activity" && <ActivityScreen />}

@@ -10,6 +10,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { applyAgentEvent, attachReasoning, toolSegments, type TimelineSegment } from "./timeline";
+import { VERIFICATION_DEMAND } from "../../tools/agentLoop";
 import type { AgentEvent } from "../../tools/types";
 import type { Msg } from "./messages";
 
@@ -165,6 +166,34 @@ describe("attachReasoning", () => {
     expect(out[1]!.reasoning, "history keeps whatever it had").toBeUndefined();
     expect(out[5]!.reasoning).toBe("Second turn thinking.");
     expect(out[7]!.reasoning, "the closing message takes the trailing thinking").toBeUndefined();
+  });
+
+  it("does not read a turn boundary off the loop's own verification demand", () => {
+    // The gate pushes its demand as a user turn *mid*-run, between the claim it refused and the
+    // round that answers it. Taking the boundary from the last user turn would put the edit round
+    // and the refused claim in the history prefix, so both rounds' thinking would go unconsumed and
+    // land together on the final answer — one panel where the transcript shows two.
+    const msgs: Msg[] = [
+      msg("user", "edit the readme greeting"),
+      msg("assistant", "", [{ id: "c1" }]),
+      msg("tool", "edited"),
+      msg("assistant", "Done."),
+      msg("user", VERIFICATION_DEMAND),
+      msg("assistant", "There is nothing to check here."),
+    ];
+    const timeline = fold([
+      reasoning("Round one thinking."),
+      call("edit_file"),
+      reasoning("Round two thinking."),
+      assistant("Done."),
+    ]);
+
+    const out = attachReasoning(msgs, timeline);
+    expect(out[1]!.reasoning).toBe("Round one thinking.");
+    expect(out[3]!.reasoning, "the refused claim keeps its own round's thinking").toBe(
+      "Round two thinking.",
+    );
+    expect(out[5]!.reasoning, "the demand round is not given thinking it never produced").toBeUndefined();
   });
 
   it("returns the same array when there is nothing to attach", () => {

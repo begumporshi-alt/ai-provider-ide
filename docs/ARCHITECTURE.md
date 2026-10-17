@@ -142,9 +142,9 @@ allowlisting, secret scrubbing).
 | `vault` (Rust) | L0 | JSON file CRUD (`.secrets.json`, mode 600); one-shot reveal; stores the master key |
 | `sql-store` (Rust) | L0 | SQLite access + migrations |
 
-**The L4 screen rows above are the spec-era map, not the shipped set.** The app ships **13** screens —
-`ScreenId` in `apps/desktop/src/ui-state.ts`, one file each in `apps/desktop/src/screens/`. Seven of them
-post-date this map, and one of those seven is a rename rather than an addition:
+**The L4 screen rows above are the spec-era map, not the shipped set.** The app ships **16** screens —
+`ScreenId` in `apps/desktop/src/ui-state.ts`, one file each in `apps/desktop/src/screens/`. Ten of them
+post-date this map, and one of those ten is a rename rather than an addition:
 
 | Module | Layer | Purpose | Relation to the map |
 |---|---|---|---|
@@ -155,9 +155,12 @@ post-date this map, and one of those seven is a rename rather than an addition:
 | `screen-agents` | L4 | Agent definitions and the sandboxed tool loop | New |
 | `screen-memory` | L4 | Memory atoms, scopes, layers and supersession | New |
 | `screen-control` | L4 | Cross-cutting switches and the audit trails | New |
+| `screen-compare` | L4 | One prompt across several models at once | New |
+| `screen-subagents` | L4 | Subagent definitions and the runs delegated to them | New |
+| `screen-axiom` | L4 | Supervision over the Assistant: evaluate, diagnose, propose, validate, promote — the UI over `packages/axiom-core` | New |
 
-Twelve of the thirteen appear in the sidebar (`NAV` in `apps/desktop/src/components/Shell.tsx`);
-`screen-onboarding` is launched as a wizard rather than listed.
+Fifteen of the sixteen appear in the sidebar (`NAV` in `apps/desktop/src/lib/nav.ts`, rendered by
+`components/Shell.tsx`); `screen-onboarding` is launched as a wizard rather than listed.
 
 **This is an addition, not a rewrite.** The table above records what was *planned*; this one records what
 *shipped*, and the difference between the two is the part worth keeping. Registered as

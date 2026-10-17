@@ -106,6 +106,66 @@ const skills: Row[] = [];
 const agentRuns: Row[] = [];
 const agentSteps: Row[] = [];
 /**
+ * AXIOM's four tables (migration 0029 in the Rust host): the version chain, the finding register,
+ * the eval results and the promotion decisions.
+ *
+ * Rows are kept in the engine's camelCase shape because that is what `core/axiom.rs` returns — it
+ * reads snake_case columns and hands back JSON keyed the way `packages/axiom-core` types it. A shim
+ * that stored snake_case would be a second mapping, and the second mapping is the one that drifts.
+ */
+const axiomVersions: Row[] = [];
+const axiomFindings: Row[] = [];
+const axiomSuiteResults: Row[] = [];
+const axiomDecisions: Row[] = [];
+const AXIOM_VERSION_STATES = ["candidate", "active", "rejected", "retired"];
+const AXIOM_SEVERITIES = ["info", "minor", "major", "critical"];
+const AXIOM_ROOT_CAUSES = ["model", "prompt", "memory", "tool", "orchestration", "infra"];
+/** Mirrors `DEFAULT_LOOP` in `core/axiom.rs`, which mirrors `DEFAULT_MAX_ITERATIONS` in the agent loop. */
+const AXIOM_DEFAULT_LOOP = { maxIterations: 40, verificationNudgeMax: 1 };
+
+/**
+ * Deep copy through JSON. Every AXIOM row is plain JSON — that is the whole contract with the host,
+ * which stores these as JSON documents — so this is lossless, and a shallow spread would hand the
+ * caller a live reference into the store.
+ */
+function cloneJson<T>(v: T): T {
+  return JSON.parse(JSON.stringify(v)) as T;
+}
+
+/** One `agent_runs` row joined to its `agent_steps`, in the shape `core::axiom::traces` returns. */
+function wireTrace(run: Row): Row {
+  return {
+    id: run.id,
+    sessionId: run.session_id ?? null,
+    parentRunId: run.parent_run_id ?? null,
+    model: run.model,
+    status: run.status,
+    prompt: run.prompt ?? null,
+    iterations: run.iterations ?? 0,
+    startedAt: run.started_at,
+    endedAt: run.ended_at ?? null,
+    error: run.error ?? null,
+    promptTokens: run.prompt_tokens ?? 0,
+    completionTokens: run.completion_tokens ?? 0,
+    // `agent_runs` has no version column, so a production run cannot say which configuration
+    // produced it. The real host returns null for the same reason, and guessing here would hide the
+    // gap the engine is supposed to report rather than paper over.
+    versionId: null,
+    steps: agentSteps
+      .filter((s) => s.run_id === run.id)
+      .sort((a, b) => (a.seq as number) - (b.seq as number))
+      .map((s) => ({
+        seq: s.seq,
+        kind: s.kind,
+        label: s.label ?? null,
+        detail: s.detail ?? null,
+        ok: s.ok ?? null,
+        ts: s.ts,
+      })),
+  };
+}
+
+/**
  * The `agents/` definition files (core/agent_defs.rs): id -> raw JSON, exactly what the host
  * stores on disk. Same contract as the real commands — the id is a filename-safe slug and the
  * content must parse as a JSON object; field validation stays TypeScript-side.
@@ -2673,6 +2733,142 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         else if (m.layer === "L3") s.l3 += 1;
       }
       return s;
+    }
+
+    // ---- P8: AXIOM evolution ----
+    // Mirrors `core/axiom.rs`, including the two invariants it enforces: at most one `active`
+    // version, and a record of what happened is never rewritten. Both are held here too, because the
+    // AXIOM screen's promote and rollback buttons are the only place a browser test can watch them
+    // break — a shim that quietly allowed two actives would let a broken screen pass.
+    case "axiom_traces_list": {
+      const limit = (args.limit as number) ?? 50;
+      const sessionId = (args.session_id as string | null) ?? null;
+      return [...agentRuns]
+        .filter((r) => sessionId === null || r.session_id === sessionId)
+        .sort((a, b) => (b.started_at as number) - (a.started_at as number))
+        .slice(0, limit)
+        .map(wireTrace);
+    }
+    case "axiom_trace_get": {
+      const found = agentRuns.find((r) => r.id === args.run_id);
+      return found ? wireTrace(found) : null;
+    }
+    case "axiom_versions_list":
+      return [...axiomVersions]
+        .sort(
+          (a, b) =>
+            (a.createdAt as number) - (b.createdAt as number) || String(a.id).localeCompare(String(b.id)),
+        )
+        .map(cloneJson);
+    case "axiom_version_get": {
+      const found = axiomVersions.find((v) => v.id === args.id);
+      return found ? cloneJson(found) : null;
+    }
+    case "axiom_version_put": {
+      const v = args.version as Row;
+      if (!AXIOM_VERSION_STATES.includes(String(v.state))) throw new Error(`unknown version state '${v.state}'`);
+      if (axiomVersions.some((x) => x.id === v.id)) {
+        throw new Error(`version ${v.id} already exists — versions are immutable`);
+      }
+      axiomVersions.push(cloneJson(v));
+      return null;
+    }
+    case "axiom_version_set_state": {
+      const state = String(args.state);
+      if (!AXIOM_VERSION_STATES.includes(state)) throw new Error(`unknown version state '${state}'`);
+      const v = axiomVersions.find((x) => x.id === args.id);
+      if (!v) throw new Error(`no such version: ${String(args.id)}`);
+      // Promoting retires the incumbent in the same step. Two rows both claiming to be what the agent
+      // runs with is the one state that makes "which configuration is this?" unanswerable.
+      if (state === "active") {
+        for (const other of axiomVersions) {
+          if (other !== v && other.state === "active") other.state = "retired";
+        }
+      }
+      v.state = state;
+      return null;
+    }
+    case "axiom_version_link_decision": {
+      const v = axiomVersions.find((x) => x.id === args.version_id);
+      if (!v) throw new Error(`no such version: ${String(args.version_id)}`);
+      v.decisionId = args.decision_id;
+      return null;
+    }
+    case "axiom_active_config": {
+      const active = axiomVersions.find((v) => v.state === "active");
+      return active
+        ? { config: cloneJson(active.config), versionId: active.id }
+        : { config: { promptOverride: null, loop: { ...AXIOM_DEFAULT_LOOP } }, versionId: null };
+    }
+    case "axiom_findings_put": {
+      const incoming = (args.findings as Row[]) ?? [];
+      for (const f of incoming) {
+        if (!AXIOM_SEVERITIES.includes(String(f.severity))) throw new Error(`unknown severity '${f.severity}'`);
+        if (!AXIOM_ROOT_CAUSES.includes(String(f.rootCause))) {
+          throw new Error(`unknown root cause '${f.rootCause}'`);
+        }
+      }
+      for (const f of incoming) {
+        // `recordedAt` is stamped here, not taken from the payload: the engine's `Finding` has no such
+        // field, and "when did we last see this" is a fact about the store rather than about a caller.
+        const row = { ...cloneJson(f), recordedAt: Date.now() };
+        const seen = axiomFindings.find((x) => x.id === f.id);
+        // Re-recording is an update rather than a duplicate: the engine re-diagnoses the same history
+        // on every pass, and `occurrences` is the thing that moves.
+        if (seen) Object.assign(seen, row);
+        else axiomFindings.push(row);
+      }
+      return null;
+    }
+    case "axiom_findings_list": {
+      const limit = (args.limit as number) ?? 200;
+      return [...axiomFindings]
+        .sort(
+          (a, b) =>
+            (b.recordedAt as number) - (a.recordedAt as number) || String(b.id).localeCompare(String(a.id)),
+        )
+        .slice(0, limit)
+        .map(cloneJson);
+    }
+    case "axiom_suite_result_put": {
+      const r = args.result as Row;
+      for (const key of ["tasks", "attemptSummaries"]) {
+        if (!Array.isArray(r[key])) throw new Error(`${key} must be an array, got ${typeof r[key]}`);
+      }
+      if (axiomSuiteResults.some((x) => x.id === r.id)) {
+        throw new Error(`suite result ${r.id} already exists — the stored number is what makes two configurations comparable`);
+      }
+      axiomSuiteResults.push(cloneJson(r));
+      return null;
+    }
+    case "axiom_suite_results_list": {
+      const suiteId = (args.suite_id as string | null) ?? null;
+      const versionId = (args.version_id as string | null) ?? null;
+      return axiomSuiteResults
+        .filter(
+          (r) => (suiteId === null || r.suiteId === suiteId) && (versionId === null || r.versionId === versionId),
+        )
+        .sort((a, b) => (a.startedAt as number) - (b.startedAt as number))
+        .map(cloneJson);
+    }
+    case "axiom_decision_put": {
+      const d = args.decision as Row;
+      if (d.decision !== "promote" && d.decision !== "reject") throw new Error(`unknown decision '${d.decision}'`);
+      for (const key of ["checks", "roles", "deltas"]) {
+        if (!Array.isArray(d[key])) throw new Error(`${key} must be an array, got ${typeof d[key]}`);
+      }
+      if (axiomDecisions.some((x) => x.id === d.id)) {
+        throw new Error(`decision ${d.id} already exists — a version's decisionId points at exactly one verdict`);
+      }
+      axiomDecisions.push(cloneJson(d));
+      return null;
+    }
+    case "axiom_decisions_list": {
+      const limit = (args.limit as number) ?? 100;
+      return [...axiomDecisions]
+        .sort((a, b) => (b.decidedAt as number) - (a.decidedAt as number))
+        .slice(0, limit)
+        .map(cloneJson);
     }
 
     default:

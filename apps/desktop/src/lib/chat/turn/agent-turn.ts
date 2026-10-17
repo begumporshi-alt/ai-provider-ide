@@ -32,6 +32,27 @@ export interface AgentTurnRequest extends TurnRequestBase {
   /** The user's step budget, or null for no ceiling — see `AgentLoopOptions.maxIterations`. */
   maxIterations: number | null;
   /**
+   * How many times the verification gate may hold this turn — see
+   * `AgentLoopOptions.verificationNudgeMax`. Absent means the loop's built-in.
+   *
+   * This is the one loop parameter a promoted AXIOM version is allowed to change on an interactive
+   * turn, and the reason is D119's rule rather than a preference: a step bound is justified only
+   * where nobody can press Stop, and the Assistant's user can. A verification demand is not a bound
+   * — it holds a turn that claimed completion without evidence, and the user can still stop it.
+   */
+  verificationNudgeMax?: Parameters<typeof runAgentLoop>[0]["verificationNudgeMax"];
+  /**
+   * The active AXIOM version's prompt blocks, applied to this turn's system prompt — see
+   * `AgentSystemParts.axiomPatches`. Absent means the agent runs exactly as it did before AXIOM
+   * existed.
+   *
+   * Paired with `verificationNudgeMax` above: together they are the whole of what a promoted version
+   * changes on an interactive turn. The version's `loop.maxIterations` is deliberately *not* applied
+   * here (D119 — a step bound is justified only where nobody can press Stop); it bounds AXIOM's own
+   * unattended eval runs instead, where nobody can.
+   */
+  axiomPatches?: Parameters<typeof buildAgentSystem>[0]["axiomPatches"];
+  /**
    * The image-generation port behind `generate_image`, or absent to refuse the tool with a
    * sentence the model can act on. The screen owns it because only it knows the default image
    * model and can resolve provider URLs to bytes.
@@ -177,7 +198,16 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
       // The per-turn instruction goes last: it is the most specific thing in the prompt, and it is
       // a system message rather than a line in the user's text so the model can tell a constraint
       // the user set from a sentence the user wrote.
-      system: buildAgentSystem({ root: req.root, custom: req.customAgentPrompt, skillsBlock: req.skillsBlock, referencesBlock: req.referencesBlock, recalledMemory: ports.memory.block(recalled), planMode: req.planMode, perTurn: req.perTurn }),
+      system: buildAgentSystem({
+        root: req.root,
+        custom: req.customAgentPrompt,
+        skillsBlock: req.skillsBlock,
+        referencesBlock: req.referencesBlock,
+        recalledMemory: ports.memory.block(recalled),
+        planMode: req.planMode,
+        perTurn: req.perTurn,
+        axiomPatches: req.axiomPatches,
+      }),
       // MCP tools join the builtin registry when servers are configured and reachable; failure
       // or no configuration collapses to exactly the builtin set. The fetch is cached briefly
       // Rust-side connections stay live, so the common case is one cheap re-list per turn.
@@ -254,6 +284,9 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
       subagentRecorder: ports.orchestrator,
       // Clamped by the caller: this is the number that actually bounds the spend.
       maxIterations: req.maxIterations,
+      // Clamped again in the loop, because the value can come from a stored AXIOM version rather
+      // than from a field the user just typed.
+      verificationNudgeMax: req.verificationNudgeMax,
       confirm: req.confirm,
       onEvent,
       onFinish: ports.onFinishReason,

@@ -16,6 +16,9 @@ importers:
       '@aiprovider/adapter-spec':
         specifier: workspace:*
         version: link:../../packages/adapter-spec
+      '@aiprovider/axiom-core':
+        specifier: workspace:*
+        version: link:../../packages/axiom-core
       '@aiprovider/router-core':
         specifier: workspace:*
         version: link:../../packages/router-core
@@ -85,6 +88,22 @@ importers:
         version: 4.1.11(@types/node@26.6.0)(@vitest/coverage-v8@4.1.11)(vite@8.3.0(@types/node@26.6.0)(esbuild@0.28.2)(jiti@2.7.0))
 
   packages/adapter-spec:
+    dependencies:
+      zod:
+        specifier: ^3.24.0
+        version: 3.25.76
+    devDependencies:
+      '@vitest/coverage-v8':
+        specifier: ^4.1.11
+        version: 4.1.11(vitest@4.1.11)
+      typescript:
+        specifier: 6.0.3
+        version: 6.0.3
+      vitest:
+        specifier: ^4.1.11
+        version: 4.1.11(@types/node@26.6.0)(@vitest/coverage-v8@4.1.11)(vite@8.3.0(@types/node@26.6.0)(esbuild@0.28.2)(jiti@2.7.0))
+
+  packages/axiom-core:
     dependencies:
       zod:
         specifier: ^3.24.0

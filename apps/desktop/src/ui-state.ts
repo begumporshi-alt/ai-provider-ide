@@ -5,7 +5,7 @@
 import { create } from "zustand";
 import type { RecalledMemory } from "./lib/chat/turn/memory-refs";
 
-export type ScreenId = "providers" | "models" | "assistant" | "compare" | "activity" | "context" | "history" | "skills" | "agents" | "subagents" | "memory" | "settings" | "gateway" | "control" | "onboarding";
+export type ScreenId = "providers" | "models" | "assistant" | "axiom" | "compare" | "activity" | "context" | "history" | "skills" | "agents" | "subagents" | "memory" | "settings" | "gateway" | "control" | "onboarding";
 
 export interface OnboardingPrefill {
   name: string;

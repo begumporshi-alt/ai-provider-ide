@@ -67,24 +67,31 @@ pnpm --filter ai-provider-router-desktop tauri dev  # full desktop app
 
 ## The screen map
 
-Thirteen screens, reached from the sidebar in `apps/desktop/src/components/Shell.tsx`. The `NAV` constant there
-is the source of truth for the sidebar; this table adds which subsystem each screen belongs to.
+Sixteen screens. Fifteen are reached from the sidebar; the list it renders is `NAV` in
+`apps/desktop/src/lib/nav.ts`, which is the source of truth for both the sidebar and the command
+palette. This table adds which subsystem each screen belongs to.
 
 | Group | Screen | File | Belongs to |
 |---|---|---|---|
 | Providers | AI Providers | `screens/Providers.tsx` | Provider registry, keys, contracts, manifests, drift |
 | Tools | Model Browser | `screens/Models.tsx` | Model catalog, aliases, modality tags |
 | Tools | Assistant | `screens/Assistant.tsx` | The playground — text, image, agent mode |
+| Tools | AXIOM | `screens/Axiom.tsx` | Supervision over the Assistant — evaluate, diagnose, propose, validate, promote |
+| Tools | Compare | `screens/Compare.tsx` | The same prompt across models, side by side |
 | Tools | Activity | `screens/Activity.tsx` | Usage ledger, failures, fallbacks |
 | Tools | Context | `screens/Context.tsx` | Context graph of artifacts, memories, skills, messages |
 | Tools | History | `screens/History.tsx` | Session turns and timelines |
 | Tools | Skills | `screens/Skills.tsx` | Skill catalog and install |
 | Tools | Agents | `screens/Agents.tsx` | Agent runs and their step trail |
+| Tools | Subagents | `screens/Subagents.tsx` | Subagent definitions and their delegations |
 | Tools | Memory | `screens/Memory.tsx` | Memory atoms, scopes, recall, retention |
 | System | Control | `screens/Control.tsx` | The switchboard for cross-cutting switches |
 | System | Router Settings | `screens/Settings.tsx` | Failover, rotation, timeouts, system-AI pick |
 | System | Local Gateway | `screens/Gateway.tsx` | Endpoint URL, master and per-app keys, the Connect-your-IDE setup panel, copy-paste presets |
 | — | Onboarding | `screens/Onboarding.tsx` | Reached from Providers, not in the sidebar |
+
+The Group column is this table's own grouping by subsystem, not the sidebar's: `NAV` groups the same
+fifteen entries as Workspace / Knowledge / System, in the order a user reaches for them.
 
 **The sidebar is not the full list.** `Onboarding.tsx` is a screen with no `NAV` entry — it is entered from the
 Providers screen. When you add a screen, add it to `NAV` *and* to this table.
@@ -93,6 +100,12 @@ Providers screen. When you add a screen, add it to `NAV` *and* to this table.
 > screens from the spec era; Activity, Context, History, Skills, Agents, Memory and Control are not in it.
 > Those subsystems are designed in `GATEWAY_MEMORY_LAYER.md` and `CONTROL_SCREEN_BUILD.md`. Registered as
 > [07](07-drift-register.md) D6.
+
+> **AXIOM is the one screen that stays mounted once opened.** Every other screen but the Assistant is
+> unmounted on navigation; `App.tsx` keeps AXIOM alive and hides it with CSS instead, because an
+> evaluation is minutes of paid model calls and unmounting would leave them running with no progress
+> line and no Stop button. It is not mounted from launch the way the Assistant is — it has nothing in
+> flight until opened.
 
 ## Scale, as measured
 

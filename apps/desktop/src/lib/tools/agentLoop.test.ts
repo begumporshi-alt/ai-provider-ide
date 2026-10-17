@@ -12,6 +12,7 @@ import {
   FINAL_ROUND_NOTE, TRUNCATED_TOOL_CALL_NOTE, argumentProblem,
   resolveSubagentResultCap, SUBAGENT_RESULT_CAP, SUBAGENT_RESULT_CAP_MIN, SUBAGENT_RESULT_CAP_MAX,
   claimsCompletion,
+  VERIFICATION_NUDGE_MAX, VERIFICATION_NUDGE_MAX_CAP,
 } from "./agentLoop";
 import { AGENT_TOOLS, FAN_OUT_MAX } from "./registry";
 import type { AgentEvent, GenerateFn, ToolHost } from "./types";
@@ -3031,5 +3032,62 @@ describe("verification gate", () => {
     expect(claimsCompletion("This should work now.")).toBe(true);
     expect(claimsCompletion("All tests pass and the build is green.")).toBe(true);
     expect(claimsCompletion("")).toBe(false);
+  });
+
+  it("a configured ceiling holds the turn that many times and no more", async () => {
+    // What a promoted AXIOM configuration actually changes. The model here never verifies, so the
+    // only thing that decides how many demands it gets is the option.
+    const seen: ChatMessage[][] = [];
+    const model = gateModel(
+      [
+        { text: "writing", calls: [WRITE] },
+        { text: "Done." },
+      ],
+      seen,
+    );
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "fix it" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "r" }; } },
+      verificationNudgeMax: 2,
+    });
+    const demands = out.messages.filter((m) => String(m.content).includes("VERIFICATION GATE"));
+    expect(demands).toHaveLength(2);
+  });
+
+  it("a ceiling from a hand-edited configuration is clamped, not honoured", async () => {
+    // The value can arrive from a row in `axiom_versions`, which is a database a person can open.
+    // Without the clamp, one edited integer turns the gate into a loop that never lets a turn end.
+    const seen: ChatMessage[][] = [];
+    const model = gateModel(
+      [
+        { text: "writing", calls: [WRITE] },
+        { text: "Done." },
+      ],
+      seen,
+    );
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "fix it" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "r" }; } },
+      verificationNudgeMax: 99,
+    });
+    const demands = out.messages.filter((m) => String(m.content).includes("VERIFICATION GATE"));
+    expect(demands).toHaveLength(VERIFICATION_NUDGE_MAX_CAP);
+  });
+
+  it("the loop's cap and the engine's are the same number", async () => {
+    // Two constants in two packages that have to agree: the engine refuses to *propose* a value
+    // above its own cap, and the loop refuses to *honour* one above this one. If they drift, a
+    // promoted change is silently truncated — the version says "three demands", the agent runs two,
+    // and the measurement that justified the promotion was of a configuration nobody is running.
+    // An assertion rather than a comment, because a comment cannot fail.
+    const { VERIFICATION_NUDGE_HARD_MAX } = await import("@aiprovider/axiom-core");
+    expect(VERIFICATION_NUDGE_MAX_CAP).toBe(VERIFICATION_NUDGE_HARD_MAX);
+    expect(VERIFICATION_NUDGE_MAX).toBeLessThanOrEqual(VERIFICATION_NUDGE_MAX_CAP);
   });
 });

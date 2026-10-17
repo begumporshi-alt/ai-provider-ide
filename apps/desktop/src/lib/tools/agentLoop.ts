@@ -147,6 +147,18 @@ export const WRAP_UP_NOTE =
 export const VERIFICATION_NUDGE_MAX = 1;
 
 /**
+ * The largest `verificationNudgeMax` a caller may configure. Clamped in the loop the same way
+ * `maxIterations` is clamped to `MAX_ITERATIONS_CAP`: this is a library, and the value can now come
+ * from a stored AXIOM configuration that a person could edit by hand.
+ *
+ * Agrees with `VERIFICATION_NUDGE_HARD_MAX` in `@aiprovider/axiom-core`, which caps a *proposed*
+ * value before it is ever stored. `agentLoop.test.ts` asserts the two are equal, so the agreement is
+ * a test rather than a coincidence — two constants that must match and are only kept matching by a
+ * comment are two constants that will stop matching.
+ */
+export const VERIFICATION_NUDGE_MAX_CAP = 3;
+
+/**
  * The automatic demand itself. It names what is missing (evidence), what counts as evidence
  * (tests, a build, an assertion), and the one honest way out (say there is nothing to verify) —
  * so a false-positive trigger costs one cheap round, not a fabricated test run.
@@ -650,6 +662,10 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     // the app cannot see must never be left unbounded, while the Assistant's user can watch it and
     // press Stop.)
     maxIterations = null,
+    // Resolved once, not read per gate: a turn is one configuration, and re-reading the option at
+    // each demand would let a caller change it mid-run into a transcript that nagged an
+    // unpredictable number of times.
+    verificationNudgeMax = VERIFICATION_NUDGE_MAX,
     confirm,
     onEvent,
     signal,
@@ -727,6 +743,10 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
   // this loop is a library: a caller handing it `5000` must not get 5000 rounds out of a constant the
   // rest of the app treats as the maximum. `null` — no budget — stays `null`, which is the point.
   const bound = maxIterations === null ? null : Math.min(maxIterations, MAX_ITERATIONS_CAP);
+
+  // Clamped here as well as at the field, for the reason `bound` gives: this loop is a library.
+  // A negative or absurd value would either disable the gate silently or hold a turn open forever.
+  const nudgeCap = Math.max(0, Math.min(Math.floor(verificationNudgeMax), VERIFICATION_NUDGE_MAX_CAP));
 
   for (let iter = 1; bound === null || iter <= bound; iter++) {
     if (signal?.aborted) throw new DOMException("Agent loop aborted", "AbortError");
@@ -874,11 +894,14 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
       // ordinary tool round of this turn. `tools` guards the no-registry caller (nothing could
       // verify anything there), and the budget's final round is never held (see the constant's
       // note): a demand there would re-enter the loop past its own ceiling.
+      //
+      // The ceiling is `nudgeCap`, resolved from the `verificationNudgeMax` option, so a promoted
+      // AXIOM configuration can buy one more demand — and only ever a bounded number more.
       if (
         tools &&
         mutatedThisTurn &&
         !verifiedThisTurn &&
-        verificationNudges < VERIFICATION_NUDGE_MAX &&
+        verificationNudges < nudgeCap &&
         !isFinalRound &&
         claimsCompletion(text)
       ) {

@@ -13,6 +13,58 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 
 ### Added
 
+- **AXIOM: the app can now audit, diagnose and improve its own Assistant, and refuses to believe the
+  Assistant's word about any of it.** A new sidebar screen and a new package,
+  `packages/axiom-core`, run the seven-stage loop — observe, evaluate, diagnose, design, modify,
+  validate, evolve — over the agent that is actually shipping. It reads what the Assistant did from
+  `agent_runs`/`agent_steps`, runs it against a task suite whose expectations check the *transcript*
+  rather than the agent's account of it, finds the root cause of what failed, proposes one bounded
+  change, re-measures, and promotes only if the numbers moved past the noise floor and nothing that
+  used to work stopped working.
+
+  The stage that earns the name is **06 Validate**. A change is put to a Regression Guardian that
+  compares the candidate against the baseline on pass rate, per-capability pass rate, cost, latency
+  and tool-loop incidence, and to four independent roles — investigator, architect, critic,
+  verifier — each of which can object. Promotion needs the guardian *and* every role. The fixture
+  the package is tested against is an agent that lifts its headline metric by breaking a capability:
+  told to verify before claiming, it produces a *cheap* verification and stops running the shell.
+  `verificationCalls` goes up, the pass rate on the edited task goes up, the `shell` capability goes
+  to zero — and AXIOM rejects it, retains the candidate as `rejected` rather than deleting it, and
+  records which check blocked it. A rejected version is kept for the same reason a promoted one is:
+  rollback is only possible because nothing was ever destroyed.
+
+  **The measurements are of the real agent, not a model of it.** An eval task runs through the same
+  `runAgentLoop`, `AGENT_TOOLS`, tool host and prompt composition a send uses, in a scratch
+  directory (`.axiom-eval`) inside the workspace root, so a synthetic task's side effects land
+  somewhere disposable. A fixture runner would have been cheaper and would have proven nothing about
+  the thing shipping. Eval runs are paid, so the first one is gated on a consent dialog quoting the
+  call count and the token assumption — and the estimate is deliberately *unknown* rather than
+  guessed, because the gateway picks the provider and a price invented for the dialog would be a
+  number nobody could check.
+
+  **What a promoted version changes is narrow, and the narrowness is the point.** It travels as a
+  set of prompt patches keyed by detector (`[axiom:premature-success]` and friends) applied on top
+  of whatever base prompt the app composes today, never as a stored override run verbatim — so
+  promoting a version cannot quietly discard a system prompt the user has since edited. Patches are
+  idempotent by marker and capped, and a cap refusal is dropped rather than truncating an
+  instruction mid-sentence. Of the loop parameters, exactly one crosses into an interactive turn:
+  `verificationNudgeMax`. A version's `maxIterations` bounds AXIOM's own eval runs and nothing
+  else, because D119 removed the interactive step bound on the rule that a bound is justified only
+  where nobody can press Stop — and an unattended eval has nobody at the keyboard.
+
+  **A stopped run is reported, never judged.** Aborting an evaluation mid-suite leaves numbers
+  behind that look like measurements. They are surfaced, and refused as a basis for a decision: a
+  candidate whose own run stopped is left `candidate` with no decision rather than rejected for
+  tasks it never ran, and a baseline that stopped early produces no candidate at all. AXIOM is also
+  the one screen that stays mounted once opened, hidden with CSS on navigation, because unmounting
+  it would leave minutes of paid model calls running with no progress line and no Stop button.
+
+  Persistence is four tables — `axiom_versions`, `axiom_findings`, `axiom_suite_results`,
+  `axiom_decisions` — added by migration `0029`, with `schema_version` now 29 and a partial unique
+  index enforcing at the schema level that at most one version is `active`. The core package holds
+  no API key, performs no network I/O and touches no database: everything crosses ports implemented
+  by the Rust host, which is what lets 245 unit tests run the whole loop against in-memory stores.
+
 - **The Assistant can fan out: several independent sub-agent tasks in one round, with structured
   results.** `dispatch_agent` runs one child per call, so a set of independent items — survey these
   twelve files, check these eight endpoints — was either serialised across rounds or run as a batch
@@ -412,6 +464,43 @@ it, and `pnpm check-version-sync` fails the build when one does not.
   form *absent*.
 
 ### Fixed
+
+- **The verification gate's own demand was being answered by the wrong branch of the test oracle, and
+  it silently reverted the work under test (drift D121).** `92efa4a` added a gate that holds a turn
+  which mutated the workspace, claimed completion, and verified nothing: it pushes an automated demand
+  and gives the model one more round. That demand says *"browser_expect **against** the affected
+  page"*, and the harness oracle's loose second-turn branch matches `/again/i` — a substring test, so
+  `against` satisfies it. The demand round was therefore answered with
+  `edit_file { old: "there", new: "world" }`, which undoes the edit the turn had just made. Seventeen
+  specs across five files failed on the consequence: an approval modal for an edit nobody asked for,
+  a change set that never rendered, a README back at its pre-turn contents, or a closing sentence
+  rendered twice. Main's browser gate had been red since the gate landed.
+
+  The commit anticipated the trap and dodged it for its own prompt by placing that prompt's branches
+  above the loose one — placement only protects the branch it was written for. The fix is the same idea
+  applied to every other prompt: `mock.mjs` now detects that the message being answered is the gate's
+  demand, keyed on the **tail** of the wire rather than the demand's presence in the history (it stays
+  there for the rest of the turn, and a presence test would answer an already-answered demand forever —
+  an interactive turn has no step budget to stop it), and replies with the demand's own escape clause
+  in wording that is neither a completion claim nor a repeat of the first answer, so the gate does not
+  fire twice and the closing sentence renders once. The specs were left alone: they were asserting the
+  right things about a workspace the harness had been quietly reverting.
+
+- **A gated turn no longer collapses its reasoning into one blob (drift D122).** `attachReasoning`
+  scopes itself to the current turn by walking back to the last user message and leaving everything
+  before it alone. The verification gate pushes its demand as a user message *mid-turn*, so after a
+  gate fired the boundary was the loop's own demand and every round the person had sent fell into the
+  history prefix: their thinking went unconsumed and landed together on the final answer. A transcript
+  that should have read `Thinking → tools → Thinking → answer` read `tools → claim → demand → all the
+  thinking at once` — the 2026-10-06 defect that `agent-timeline.spec.ts` exists to pin, reintroduced
+  on 2026-10-16. Measured rather than inferred: the rendered panel was labelled
+  `Thought process · 176 characters`, and the oracle's two thoughts are 86 and 90 characters on the
+  wire, so 86 + 90 = 176 is exactly the two rounds concatenated.
+
+  The walk now skips a user turn that starts with the loop's own demand, imported from the loop rather
+  than matched against a copied literal. A person's turn is still the boundary. This was invisible
+  until the fix above landed, because the affected specs failed earlier on the reverted workspace and
+  never reached their reasoning assertions — a red gate hides whatever else is red behind it.
 
 - **A manifest that cannot read a stream no longer asks for one (drift D47).** A dialect with no
   `stream` block has no `chunkMap` to read SSE with, so the answer was already read as unary — but the

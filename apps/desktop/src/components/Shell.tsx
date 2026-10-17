@@ -34,6 +34,7 @@ export function useHeaderSlot(): HTMLDivElement | null {
 /** 15px stroke icons keyed by the `icon` strings in `nav.ts`. Stroke inherits currentColor. */
 const ICON_PATHS: Record<string, ReactNode> = {
   chat: <path d="M4 5.5h16v10H9.5L4 19.5v-14Z" />,
+  axiom: <path d="M3.5 12h3.5l2-5.5 3 11 2.5-5.5H20.5" />,
   compare: (
     <>
       <rect x="4" y="5.5" width="6.5" height="13" rx="1" />

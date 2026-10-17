@@ -241,6 +241,24 @@ async function oracle(req, res, path) {
     const toolMsgs = messages.filter((m) => m.role === "tool");
     const lastToolResult = String(toolMsgs[toolMsgs.length - 1]?.content ?? "");
     /**
+     * Whether the message being answered is the loop's own verification-gate demand rather than
+     * anything a person typed. Keyed on the TAIL of the wire and not on the demand's mere presence
+     * in `messages`: it stays there for the rest of the turn, so a presence test would keep
+     * answering a demand that was already answered, round after round, with nothing to stop it —
+     * an interactive turn has no step budget (D119).
+     *
+     * This exists because the demand's prose contains the substring `again`: "browser_expect
+     * **against** the affected page". The loose SECOND-TURN branch below matches `/again/i`, so
+     * before this flag it answered a gate demand with an `edit_file` that *undid* the mutation the
+     * gated turn had just made — README.md went `world → there → world`, which left the specs
+     * asserting a reverted file, an empty change set, or an approval modal for an edit nobody
+     * asked for. The VERIFICATION-GATE variant above documents the same trap and dodges it by
+     * sitting higher in the chain; that only covers its own prompt. This covers every other one.
+     */
+    const answeringGate = /AUTOMATED VERIFICATION GATE/.test(
+      userText(messages[messages.length - 1] ?? { content: "" }),
+    );
+    /**
      * Whether this conversation has already presented a plan. The plan variants key on this rather
      * than on `!sawToolResult`: a planning pass is usually the second thing in a conversation (an
      * ordinary pass came first), so "clean history" would mean "never present a plan".
@@ -300,6 +318,18 @@ async function oracle(req, res, path) {
       content = "";
     } else if (tools && askedFor(/fix the login bug and say when it is done/i)) {
       content = "The tests pass — 3 green, the fix is verified.";
+    } else if (tools && answeringGate) {
+      // Agent mode, GATE-ANSWERED variant: the generic reply to a verification demand, for every
+      // prompt other than the `fix the login bug` one above — that one produces real evidence and
+      // so never reaches here. This harness has no test suite to run, so the reply takes the
+      // demand's own escape clause instead of repeating the claim.
+      //
+      // Two properties are load-bearing and both are the reason the wording is what it is. It is
+      // NOT a completion claim — no word in `COMPLETION_CLAIM` appears — so the gate does not fire
+      // a second time and the turn ends here rather than looping. And it is NOT the fallback
+      // sentence below, so a gated turn renders one closing answer instead of two identical ones,
+      // which is what made `getByText("Done. …")` a Playwright strict-mode violation.
+      content = "There is no test or build in this workspace to run, so the edit above stands unproved.";
     } else if (tools && /The user approved the plan/.test(lastToolResult)) {
       // Agent mode, PLAN-APPROVED variant: the round-trip that follows an approved
       // `exit_plan_mode`. Keyed on the tool RESULT, not on a user turn — the approval is consumed
@@ -335,7 +365,10 @@ async function oracle(req, res, path) {
       //
       // The plan variants above MUST stay above this one: this test is deliberately loose, and the
       // decline sentence tells the model to "call exit_plan_mode again" — which this branch would
-      // otherwise answer with an edit_file the plan gate then refuses, forever.
+      // otherwise answer with an edit_file the plan gate then refuses, forever. The GATE-ANSWERED
+      // variant must stay above it for the same reason and a worse outcome: the verification
+      // demand's "against the affected page" matches this `/again/i`, and answering a demand with
+      // the reverting edit below undoes the work the specs are about to assert on.
       toolCall = { name: "edit_file", arguments: JSON.stringify({ path: "README.md", old: "there", new: "world" }) };
       content = "";
     } else if (tools && !sawToolResult && /big change/i.test(last)) {

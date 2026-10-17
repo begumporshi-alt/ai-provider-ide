@@ -122,6 +122,7 @@ import {
 } from "../lib/chat/turn/session-references";
 import { runPlainTurn } from "../lib/chat/turn/plain-turn";
 import { runAgentTurn } from "../lib/chat/turn/agent-turn";
+import { activeAxiomTurn } from "../lib/axiom/active";
 import { beginTurn, currentTurn } from "../lib/chat/turn/controller";
 import type { Trace } from "../lib/chat/turn/ports";
 import type { TranscriptEntry } from "../lib/chat/turn/ports";
@@ -2408,6 +2409,11 @@ function Chat({
         turn.finish();
         return;
       }
+      // The promoted AXIOM configuration, read at send time rather than held in state — see
+      // `lib/axiom/active` for why it is not cached, and for the one loop parameter it deliberately
+      // leaves out. A read that fails yields no patches and no ceiling, i.e. the turn runs exactly as
+      // it did before AXIOM existed.
+      const axiom = await activeAxiomTurn();
       // The turn engine (lib/chat/turn/agent-turn) runs the whole branch against injected ports:
       // run record, checkpoint host, confirm gate, graph recording, memory, trace, change set.
       await runAgentTurn(
@@ -2436,6 +2442,12 @@ function Chat({
           // Already the parsed shape (`number | null`); the clamp happened when it was typed or
           // loaded, and re-clamping here would only risk disagreeing with the field.
           maxIterations,
+          // What a promoted AXIOM version is allowed to change on an interactive turn: its prompt
+          // blocks, and how many times the verification gate may hold it. Deliberately not its
+          // iteration budget — `activeAxiomTurn` explains why, and the reason is D119's rule that a
+          // step bound is justified only where nobody can press Stop.
+          verificationNudgeMax: axiom.verificationNudgeMax,
+          axiomPatches: axiom.patches,
           // The sub-agent budget from Router Settings → defaults; a blank or broken value means
           // **no ceiling** — the loop's own default, because real sub-agent work runs long
           // (measured across 433 runs: median 24 tool calls, p90 55). A low value here cuts

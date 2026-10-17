@@ -3,6 +3,7 @@
  * phase 1) so the screen's prompt editor, context meter and send paths read one definition.
  */
 import { type ChatMessage } from "@aiprovider/router-core";
+import { applyPromptPatches, type PromptPatchBlock } from "@aiprovider/axiom-core";
 import { userWireContent } from "./messages";
 import type { Msg } from "./messages";
 
@@ -101,16 +102,36 @@ export interface AgentSystemParts {
   planMode?: boolean;
   /** The per-turn instruction's system text, empty when none was set. */
   perTurn?: string;
+  /**
+   * The AXIOM blocks from the active version (`parsePromptPatches` on its stored prompt), or absent
+   * when nothing is promoted. A stored version travels as its patches rather than as a whole
+   * `promptOverride` so that promoting one cannot quietly discard a system prompt the user has since
+   * edited — see `parsePromptPatches` in `@aiprovider/axiom-core`.
+   */
+  axiomPatches?: PromptPatchBlock[];
 }
 
 /**
- * The agent request's system turn: base prompt → skills → recalled memory → plan mode → the
- * per-turn instruction, each absent piece omitted. Order matters — the per-turn constraint is the
- * most specific and reads last, directly above the user's turn.
+ * The agent request's system turn: base prompt → AXIOM's patches → skills → recalled memory → plan
+ * mode → the per-turn instruction, each absent piece omitted. Order matters — the per-turn
+ * constraint is the most specific and reads last, directly above the user's turn.
+ *
+ * The patches go immediately after the base rather than at the end because that is what they are:
+ * amendments to the agent's standing instructions, measured against this prompt and promoted as a
+ * configuration. Everything after them is per-turn context, which changes underneath a standing
+ * instruction every send.
+ *
+ * `applyPromptPatches` refuses past its own caps rather than appending a truncated block, so a
+ * hand-edited row in `axiom_versions` cannot buy the agent an arbitrarily long prompt. The refusal
+ * is dropped here on purpose: the version was capped when it was built, and the screen shows what the
+ * active version contains — silently appending a half-instruction would be the worse failure.
  */
 export function buildAgentSystem(parts: AgentSystemParts): string {
+  const base = parts.axiomPatches?.length
+    ? applyPromptPatches(agentSystem(parts.root, parts.custom), parts.axiomPatches).prompt
+    : agentSystem(parts.root, parts.custom);
   return (
-    agentSystem(parts.root, parts.custom) +
+    base +
     parts.skillsBlock +
     (parts.referencesBlock ?? "") +
     (parts.recalledMemory ? `\n\n${parts.recalledMemory}` : "") +

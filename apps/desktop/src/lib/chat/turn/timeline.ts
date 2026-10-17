@@ -27,6 +27,7 @@
  * The tool results. A result belongs to its call, the transcript pairs them by call id
  * (`indexToolCalls`), and duplicating that pairing would give two answers to one question.
  */
+import { VERIFICATION_DEMAND } from "../../tools/agentLoop";
 import type { AgentEvent, SubagentChildProgress } from "../../tools/types";
 import { tryParseArgs } from "./graph-record";
 import type { Msg } from "./messages";
@@ -208,10 +209,17 @@ export function attachReasoning(msgs: Msg[], timeline: readonly TimelineSegment[
   // segments that belong to this one.
   let start = 0;
   for (let i = msgs.length - 1; i >= 0; i--) {
-    if (msgs[i]!.role === "user") {
-      start = i + 1;
-      break;
-    }
+    const m = msgs[i]!;
+    if (m.role !== "user") continue;
+    // The loop's own verification demand rides the wire as a user turn, but it is not a turn
+    // boundary — the gate pushes it *mid*-turn, between the claim it refused and the round that
+    // answers it. Taking it as the start would place every earlier round in the history prefix this
+    // walk deliberately leaves alone, and those are precisely the rounds whose deliberation it
+    // exists to attribute: their thinking would pile up unconsumed and land in one panel on the
+    // final answer, which is the blob this function was written to prevent.
+    if (m.content.startsWith(VERIFICATION_DEMAND)) continue;
+    start = i + 1;
+    break;
   }
 
   let cursor = 0;

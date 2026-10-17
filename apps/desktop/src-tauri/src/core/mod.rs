@@ -31,6 +31,7 @@ pub mod adapter_runtime;
 pub mod agent_defs;
 pub mod artifact;
 pub mod assistant_stream;
+pub mod axiom;
 pub mod body_shape;
 pub mod bridge_policy;
 pub mod browser;

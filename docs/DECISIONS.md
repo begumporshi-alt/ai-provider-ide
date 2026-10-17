@@ -1805,3 +1805,54 @@ that is not drift (then the rethrown path needs its own health record).
 - **Revisit if:** the post-output silence recurs (tighten `UPSTREAM_IDLE_TIMEOUT` against the
   accumulated idle-gap distribution, the way `first_msg_ms` calibrated the byte bound); or a
   client surfaces `failure_detail` and needs it structured rather than prose.
+
+## 2026-10-17 — A promoted AXIOM version travels as patches, and changes one loop parameter
+
+- **The problem AXIOM had to answer before it could change anything.** The engine's own closing rule
+  is that an agent is improved only when independent evaluation shows measurable gains *while
+  preserving what already worked*. That rule constrains the representation of a change, not just the
+  test of it. A version stored as a whole `promptOverride` and replayed verbatim would satisfy the
+  measurement and still be unsafe: between the run that produced it and the run that promotes it, the
+  user may have edited the system prompt, and replaying a stored override discards that edit
+  silently. The improvement would be real and the regression invisible, because nothing compares the
+  promoted text against the text the agent is running today.
+- **Decision:** a version travels as its **patches**. `applyPromptPatches` writes detector-keyed
+  markers (`[axiom:premature-success]`) onto whatever base the app composes at send time, and
+  `parsePromptPatches` is its exact inverse, so a stored version is a set of amendments rather than a
+  transcript. `buildAgentSystem` applies them immediately after the base prompt and before skills,
+  memory and per-turn text — they are amendments to the agent's standing instructions, and that is
+  the position where that reads correctly. Patches are idempotent by marker and capped at 6 / 2400
+  chars; **a cap refusal drops the patch rather than truncating it**, because half an instruction is
+  worse than none and a duplicate reads as sensible prose, so nothing downstream would ever complain.
+- **Of the loop parameters, exactly one crosses into an interactive turn.** `verificationNudgeMax`,
+  ceilinged at 3 and pinned by a test in both packages rather than by a comment, because the two
+  constants have to agree and only a test notices when they stop. A version's `maxIterations` bounds
+  **AXIOM's own eval runs and nothing else**. That is D119's rule applied rather than quoted: a step
+  bound is justified only where nobody can press Stop, an interactive turn has somebody, and an
+  unattended eval has nobody. Letting a promoted version re-impose the bound D119 deleted would have
+  been a regression delivered as an improvement — precisely the shape the guardian exists to catch,
+  arriving through a door the guardian does not watch.
+- **Deliberately not done:** applying patches to subagent definitions, and letting AXIOM edit
+  `registry.ts` or the loop's source. v1's actuators are the prompt and one loop parameter; anything
+  else is a `manual` proposal that reports what is missing in words a user can act on. A code-writing
+  actuator would make the engine's own changes the hardest thing in the system to evaluate, and
+  `ImproveReport.notDone` exists to say so out loud rather than to leave it implied.
+- **A stopped run is reported, never judged** (same entry, because it is the same rule). Aborting an
+  eval leaves numbers that look like measurements. `SuiteRun.aborted` was already documented as
+  "worth reading, not worth measuring against" and already kept such a result out of the store; what
+  was missing is that `benchmark` dropped the flag, so `improve` would have compared a
+  half-finished candidate against a complete baseline and recorded the resulting regression as a
+  decision. Now a stopped baseline produces no candidate, and a stopped candidate is left `candidate`
+  with no decision — inert, because only an `active` version changes what runs.
+- **Falsification:** `parsePromptPatches` round-trips and replays onto a *different* base, which is
+  the user-edited-prompt case stated as a test; `prompt.test.ts` pins the ordering and that a custom
+  prompt survives a promotion; `pipeline.test.ts` pins both stopped-run paths, including that no
+  version row is created when the baseline stops. The metric-gaming fixture is the guardian's own
+  test: verification calls up, edited task's pass rate up, `shell` capability to zero, promotion
+  refused. Gates: `axiom-core` 245/0, desktop vitest 797/0 over 66 files, `cargo test --lib` 1665/0,
+  `pnpm -r typecheck` clean, `cargo clippy --all-targets -D warnings` 0 new warnings, key-leak grep
+  and version sync OK.
+- **Revisit if:** a proposal needs an actuator that writes code (then the eval suite has to cover
+  AXIOM's own changes, not only the agent's); or a patch ever needs to sit *inside* the base prompt
+  rather than after it, which would mean the base has structure AXIOM has to understand; or the
+  nudge ceiling moves, which has to move in both packages at once.

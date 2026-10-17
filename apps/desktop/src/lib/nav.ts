@@ -34,12 +34,17 @@ export interface NavGroup {
  * Workspace / Knowledge / System, in the order a user reaches for them: what they work in,
  * what the router has learned, and what runs underneath. The labels are load-bearing — the
  * specs click them by exact accessible name — so "AI Providers" stays "AI Providers".
+ *
+ * AXIOM sits beside the Assistant rather than down in System, even though it is a supervisory
+ * engine: it is reached for *about the Assistant*, and the moment a user wants it is the moment
+ * the Assistant disappointed them. Grouping by subject beats grouping by mechanism here.
  */
 export const NAV: readonly NavGroup[] = [
   {
     group: "Workspace",
     items: [
       { id: "assistant", label: "Assistant", icon: "chat" },
+      { id: "axiom", label: "AXIOM", icon: "axiom" },
       { id: "compare", label: "Compare", icon: "compare" },
       { id: "models", label: "Model Browser", icon: "cube" },
       { id: "activity", label: "Activity", icon: "clock" },

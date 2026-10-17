@@ -183,12 +183,16 @@ async fn with_page<T>(
 ) -> Result<T, String> {
     let mut conns = conns_cell().lock().await;
     for attempt in 0..2 {
-        if !conns.contains_key(&port) {
+        // The vacant entry is held open across `connect`, which is what `clippy::map_entry` asks for
+        // and costs nothing extra here: the whole map is already locked for the duration of this
+        // function, so the connect was never racing another caller for the slot.
+        if let std::collections::hash_map::Entry::Vacant(slot) = conns.entry(port) {
             let conn = connect(port).await?;
-            conns.insert(port, conn);
+            slot.insert(conn);
         }
-        let conn =
-            conns.get_mut(&port).ok_or("the browser connection dropped before the call — call again")?;
+        let conn = conns
+            .get_mut(&port)
+            .ok_or("the browser connection dropped before the call — call again")?;
         match f(conn).await {
             Ok(v) => return Ok(v),
             // The cached socket died (tab closed, Chrome restarted). Drop it and retry once; a
@@ -343,16 +347,14 @@ impl EventLedger {
                     .and_then(|a| a.as_array())
                     .map(|args| {
                         args.iter()
-                            .map(|a| {
-                                match a.get("value") {
-                                    Some(Value::String(s)) => s.clone(),
-                                    Some(other) => other.to_string(),
-                                    None => a
-                                        .get("description")
-                                        .and_then(|d| d.as_str())
-                                        .unwrap_or_default()
-                                        .to_string(),
-                                }
+                            .map(|a| match a.get("value") {
+                                Some(Value::String(s)) => s.clone(),
+                                Some(other) => other.to_string(),
+                                None => a
+                                    .get("description")
+                                    .and_then(|d| d.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
                             })
                             .collect::<Vec<_>>()
                             .join(" ")
@@ -406,10 +408,9 @@ impl EventLedger {
                 }
             }
             "Network.requestWillBeSent" => {
-                if let (Some(id), Some(req)) = (
-                    params.get("requestId").and_then(|v| v.as_str()),
-                    params.get("request"),
-                ) {
+                if let (Some(id), Some(req)) =
+                    (params.get("requestId").and_then(|v| v.as_str()), params.get("request"))
+                {
                     let line = format!(
                         "{} {}",
                         req.get("method").and_then(|m| m.as_str()).unwrap_or("GET"),
@@ -420,7 +421,8 @@ impl EventLedger {
                 return;
             }
             "Network.responseReceived" => {
-                let status = params.pointer("/response/status").and_then(|s| s.as_u64()).unwrap_or(0) as u16;
+                let status =
+                    params.pointer("/response/status").and_then(|s| s.as_u64()).unwrap_or(0) as u16;
                 if status < 400 {
                     return;
                 }
@@ -464,7 +466,11 @@ impl EventLedger {
                     level,
                     url,
                     status: 0,
-                    text: params.get("errorText").and_then(|e| e.as_str()).unwrap_or("failed").into(),
+                    text: params
+                        .get("errorText")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("failed")
+                        .into(),
                     count: 1,
                 }
             }
@@ -624,25 +630,28 @@ pub fn browser_navigate(args: &Value) -> crate::core::tools::ToolResult {
         _ => return crate::core::tools::ToolResult::err("navigate needs a \"url\""),
     };
     let port = port_of(args);
-    wrap_err(port, rt!().block_on(with_page(port, move |conn| {
-        let url = url.clone();
-        Box::pin(async move {
-            command(conn, "Page.navigate", json!({ "url": url })).await?;
-            // Poll readyState instead of trusting navigate's return: it resolves when the frame
-            // *starts* loading, and the model wants the page it can already read.
-            let deadline = std::time::Instant::now() + LOAD_TIMEOUT;
-            loop {
-                let ready = evaluate(conn, "document.readyState").await?;
-                if ready.as_str() == Some("complete") || std::time::Instant::now() >= deadline {
-                    break;
+    wrap_err(
+        port,
+        rt!().block_on(with_page(port, move |conn| {
+            let url = url.clone();
+            Box::pin(async move {
+                command(conn, "Page.navigate", json!({ "url": url })).await?;
+                // Poll readyState instead of trusting navigate's return: it resolves when the frame
+                // *starts* loading, and the model wants the page it can already read.
+                let deadline = std::time::Instant::now() + LOAD_TIMEOUT;
+                loop {
+                    let ready = evaluate(conn, "document.readyState").await?;
+                    if ready.as_str() == Some("complete") || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            evaluate(conn, "JSON.stringify({ title: document.title, url: location.href })")
-                .await
-                .map(|v| v.as_str().unwrap_or_default().to_string())
-        })
-    })))
+                evaluate(conn, "JSON.stringify({ title: document.title, url: location.href })")
+                    .await
+                    .map(|v| v.as_str().unwrap_or_default().to_string())
+            })
+        })),
+    )
 }
 
 /// `browser_snapshot` — the text outline of the page's interactive elements, each with the
@@ -650,11 +659,16 @@ pub fn browser_navigate(args: &Value) -> crate::core::tools::ToolResult {
 /// and say to re-snapshot.
 pub fn browser_snapshot(args: &Value) -> crate::core::tools::ToolResult {
     let port = port_of(args);
-    wrap_err(port, rt!().block_on(with_page(port, |conn| {
-        Box::pin(async move {
-            evaluate(conn, SNAPSHOT_JS).await.map(|v| v.as_str().unwrap_or_default().to_string())
-        })
-    })))
+    wrap_err(
+        port,
+        rt!().block_on(with_page(port, |conn| {
+            Box::pin(async move {
+                evaluate(conn, SNAPSHOT_JS)
+                    .await
+                    .map(|v| v.as_str().unwrap_or_default().to_string())
+            })
+        })),
+    )
 }
 
 /// `browser_click` — real mouse events at the element's center, not a synthetic `.click()`:
@@ -769,11 +783,8 @@ pub fn browser_wait_for(args: &Value) -> crate::core::tools::ToolResult {
             )
         }
     };
-    let timeout_ms = args
-        .get("timeout_ms")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(10_000)
-        .clamp(250, 30_000);
+    let timeout_ms =
+        args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(10_000).clamp(250, 30_000);
     let port = port_of(args);
     // Same quoting boundary as `browser_fill`: the model's text arrives as a JSON string literal,
     // never as JS source.
@@ -842,11 +853,8 @@ pub fn browser_expect(args: &Value) -> crate::core::tools::ToolResult {
             ))
         }
     };
-    let timeout_ms = args
-        .get("timeout_ms")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(10_000)
-        .clamp(250, 30_000);
+    let timeout_ms =
+        args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(10_000).clamp(250, 30_000);
     let port = port_of(args);
     let quoted = serde_json::to_string(&value).expect("String always serializes");
     // Each poll returns one value the loop can judge: text a bool, element a JSON blob with the
@@ -1021,7 +1029,9 @@ fn browser_start_with(candidates: &[&str], port: u16) -> crate::core::tools::Too
     };
     let profile = std::env::temp_dir().join(format!("aiprovider-debug-profile-{port}"));
     if let Err(e) = std::fs::create_dir_all(&profile) {
-        return crate::core::tools::ToolResult::err(format!("cannot create the debug profile directory: {e}"));
+        return crate::core::tools::ToolResult::err(format!(
+            "cannot create the debug profile directory: {e}"
+        ));
     }
     let child = std::process::Command::new(&binary)
         .arg(format!("--remote-debugging-port={port}"))
@@ -1154,7 +1164,10 @@ mod tests {
         assert_eq!(net.len(), 2, "one 404 and one transport failure");
         assert_eq!((net[0].level.as_str(), net[0].status), ("POST", 404));
         assert_eq!(net[1].text, "net::ERR_CONNECTION_REFUSED");
-        assert!(ledger.drain(EventKind::Console).len() == 2, "console entries are untouched by the net drain");
+        assert!(
+            ledger.drain(EventKind::Console).len() == 2,
+            "console entries are untouched by the net drain"
+        );
     }
 
     #[test]
@@ -1170,8 +1183,22 @@ mod tests {
         assert_eq!(format_console(&console), "[error] boom (3×)");
 
         let net = vec![
-            PageEvent { kind: EventKind::Net, level: "GET".into(), url: "http://x/404".into(), status: 404, text: String::new(), count: 1 },
-            PageEvent { kind: EventKind::Net, level: "GET".into(), url: "http://x/refused".into(), status: 0, text: "net::ERR_CONNECTION_REFUSED".into(), count: 1 },
+            PageEvent {
+                kind: EventKind::Net,
+                level: "GET".into(),
+                url: "http://x/404".into(),
+                status: 404,
+                text: String::new(),
+                count: 1,
+            },
+            PageEvent {
+                kind: EventKind::Net,
+                level: "GET".into(),
+                url: "http://x/refused".into(),
+                status: 0,
+                text: "net::ERR_CONNECTION_REFUSED".into(),
+                count: 1,
+            },
         ];
         assert_eq!(
             format_net(&net),
@@ -1437,23 +1464,32 @@ mod tests {
             let nav = browser_navigate(&serde_json::json!({ "url": page, "port": port }));
             assert!(nav.ok, "navigate: {:?}", nav.error);
 
-            let text = browser_expect(&serde_json::json!({ "kind": "text", "value": "loaded-late", "port": port }));
+            let text = browser_expect(
+                &serde_json::json!({ "kind": "text", "value": "loaded-late", "port": port }),
+            );
             assert!(text.ok, "late text is retried until it shows: {:?}", text.error);
             assert!(text.output.contains("loaded-late"), "got: {}", text.output);
 
-            let element = browser_expect(&serde_json::json!({ "kind": "element", "value": "#go", "port": port }));
+            let element = browser_expect(
+                &serde_json::json!({ "kind": "element", "value": "#go", "port": port }),
+            );
             assert!(element.ok, "the selector matches: {:?}", element.error);
             assert!(
-                element.output.contains("1 element matches") && element.output.contains("expect-test"),
+                element.output.contains("1 element matches")
+                    && element.output.contains("expect-test"),
                 "the hit names the count and the page: {}",
                 element.output
             );
 
-            let title = browser_expect(&serde_json::json!({ "kind": "title", "value": "expect-test", "port": port }));
+            let title = browser_expect(
+                &serde_json::json!({ "kind": "title", "value": "expect-test", "port": port }),
+            );
             assert!(title.ok, "got: {:?}", title.error);
             assert!(title.output.contains("expect-test"), "got: {}", title.output);
 
-            let url = browser_expect(&serde_json::json!({ "kind": "url", "value": "data:text/html", "port": port }));
+            let url = browser_expect(
+                &serde_json::json!({ "kind": "url", "value": "data:text/html", "port": port }),
+            );
             assert!(url.ok, "got: {:?}", url.error);
 
             let miss = browser_expect(&serde_json::json!({
@@ -1466,7 +1502,9 @@ mod tests {
                 "the miss diagnoses the page: {reason}"
             );
 
-            let bad = browser_expect(&serde_json::json!({ "kind": "element", "value": "#[unclosed", "port": port }));
+            let bad = browser_expect(
+                &serde_json::json!({ "kind": "element", "value": "#[unclosed", "port": port }),
+            );
             assert!(!bad.ok, "an invalid selector must fail fast");
             assert!(
                 bad.error.as_deref().unwrap_or_default().contains("not a valid CSS selector"),
@@ -1474,7 +1512,8 @@ mod tests {
                 bad.error
             );
 
-            let bad_kind = browser_expect(&serde_json::json!({ "kind": "count", "value": "x", "port": port }));
+            let bad_kind =
+                browser_expect(&serde_json::json!({ "kind": "count", "value": "x", "port": port }));
             assert!(!bad_kind.ok, "an unknown kind must be refused");
         }));
         stop_chrome(&mut child);

@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
-  buildAgentSystem, buildPlainRequestMessages, NO_TOOLS_SYSTEM, PLAN_MODE_SYSTEM,
+  buildAgentSystem, buildPlainRequestMessages, AGENT_SYSTEM, NO_TOOLS_SYSTEM, PLAN_MODE_SYSTEM,
 } from "./prompt";
+import { PROMPT_CAP, countPatches } from "@aiprovider/axiom-core";
 import type { ChatMessage } from "@aiprovider/router-core";
 
 describe("buildAgentSystem", () => {
@@ -66,6 +67,62 @@ describe("buildAgentSystem", () => {
     expect(without).not.toContain("References gathered");
     const empty = buildAgentSystem({ root: "", skillsBlock: "", referencesBlock: "" });
     expect(empty).toBe(without);
+  });
+
+  it("puts a promoted version's blocks after the base prompt and before the per-turn context", () => {
+    // The position is the point: the blocks amend the agent's standing instructions, so they sit
+    // with them, above the pieces that change on every send.
+    const out = buildAgentSystem({
+      root: "/tmp/ws",
+      skillsBlock: "\n\n## skill one",
+      recalledMemory: "remembered fact",
+      perTurn: "Only look, do not fix.",
+      axiomPatches: [{ marker: "axiom:premature-success", text: "Run the check before claiming it passes." }],
+    });
+    const iBase = out.indexOf("Your workspace root is: /tmp/ws");
+    const iPatch = out.indexOf("[axiom:premature-success]");
+    const iSkills = out.indexOf("## skill one");
+    const iMemory = out.indexOf("remembered fact");
+    const iPerTurn = out.indexOf("Only look, do not fix.");
+    expect([iBase, iPatch, iSkills, iMemory, iPerTurn]).toEqual(
+      [iBase, iPatch, iSkills, iMemory, iPerTurn].sort((a, b) => a - b),
+    );
+  });
+
+  it("lands on the prompt the user actually runs, including one they wrote themselves", () => {
+    // The reason a version travels as patches rather than as a whole prompt: a stored override
+    // applied verbatim would silently discard this custom prompt, and the agent AXIOM benchmarked
+    // would stop being the agent the user runs.
+    const out = buildAgentSystem({
+      root: "",
+      skillsBlock: "",
+      custom: "You are terse. Never pad an answer.",
+      // The screen derives these from the stored prompt; parsing it is axiom-core's round trip.
+      axiomPatches: [{ marker: "axiom:tool-loop", text: "Stop repeating a call that already failed." }],
+    });
+    expect(out.startsWith("You are terse. Never pad an answer.")).toBe(true);
+    expect(out).toContain("[axiom:tool-loop]\nStop repeating a call that already failed.");
+    expect(out).not.toContain(AGENT_SYSTEM);
+  });
+
+  it("adds nothing when no version is promoted", () => {
+    const without = buildAgentSystem({ root: "", skillsBlock: "" });
+    expect(buildAgentSystem({ root: "", skillsBlock: "", axiomPatches: [] })).toBe(without);
+  });
+
+  it("refuses a hand-edited version's excess instead of appending all of it", () => {
+    // `axiom_versions` is a database a person can open. The cap is applied here, at the point the
+    // prompt is actually composed, so the number of blocks in a turn's prompt does not depend on
+    // how the row got there.
+    const out = buildAgentSystem({
+      root: "",
+      skillsBlock: "",
+      axiomPatches: Array.from({ length: PROMPT_CAP.maxPatches + 3 }, (_, i) => ({
+        marker: `axiom:detector-${i}`,
+        text: "x".repeat(20),
+      })),
+    });
+    expect(countPatches(out)).toBe(PROMPT_CAP.maxPatches);
   });
 });
 

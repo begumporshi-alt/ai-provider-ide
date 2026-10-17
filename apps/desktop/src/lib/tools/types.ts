@@ -222,6 +222,23 @@ export interface AgentLoopOptions {
    */
   maxIterations?: number | null;
   /**
+   * How many times this turn may be held open by the verification gate — the loop's automatic
+   * demand for evidence when a turn changed the workspace, claimed completion, and ran nothing that
+   * checks either. Absent means `VERIFICATION_NUDGE_MAX`.
+   *
+   * An option rather than the constant it overrides because AXIOM (`@aiprovider/axiom-core`) can
+   * promote a configuration that raises it: `premature-success` is the detector that fires on an
+   * unverified completion claim, and the bounded change it proposes is one more demand. Clamped to
+   * `VERIFICATION_NUDGE_MAX_CAP` in the loop, so a hand-edited row in `axiom_versions` cannot make a
+   * turn nag forever.
+   *
+   * Note what is *not* an option here: `maxIterations` above stays `null` for an interactive turn no
+   * matter what a promoted version says. D119's rule is that a step bound is justified only where
+   * nobody can press Stop, and the Assistant's user can. AXIOM's own eval runs are the unattended
+   * caller, and they are where its `loop.maxIterations` is applied.
+   */
+  verificationNudgeMax?: number;
+  /**
    * Per-call confirmation gate. Return true to execute, false to deny (the UI shows the
    * user an allow/deny prompt). When omitted, every call executes (non-interactive use).
    *

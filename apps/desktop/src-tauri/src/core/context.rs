@@ -1309,8 +1309,10 @@ mod context_graph_tests {
         assistant.tool_calls = Some(calls.into());
         assistant.model = Some("openrouter/gpt-4o".into());
         assistant.reasoning = Some("let me look".into());
-        assistant.memory_refs =
-            Some(r#"[{"id":"m1","layer":"L1","text":"Tushu lives in Dhaka","at":1,"pinned":false}]"#.into());
+        assistant.memory_refs = Some(
+            r#"[{"id":"m1","layer":"L1","text":"Tushu lives in Dhaka","at":1,"pinned":false}]"#
+                .into(),
+        );
         let mut result = msg("s1", 1, "tool", "file body");
         result.tool_call_id = Some("call_1".into());
         append_session_messages(&s, &[assistant, result]).unwrap();
@@ -1323,7 +1325,11 @@ mod context_graph_tests {
         assert_eq!(rows[0].reasoning.as_deref(), Some("let me look"));
         // The recall record survives verbatim too: the resumed transcript renders its card
         // straight from this JSON.
-        assert!(rows[0].memory_refs.as_deref().unwrap_or_default().contains("Tushu lives in Dhaka"));
+        assert!(rows[0]
+            .memory_refs
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Tushu lives in Dhaka"));
         assert_eq!(rows[1].tool_call_id.as_deref(), Some("call_1"));
         let _ = std::fs::remove_dir_all(&d);
     }
