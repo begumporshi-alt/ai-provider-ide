@@ -26,9 +26,9 @@
  * it needs the host to stamp one onto `agent_runs` — which it does not do today.
  */
 import { DEFAULT_THRESHOLDS, runDetectors, type DetectorHit, type DetectorThresholds } from "./detectors";
+import { hash32 } from "./hash";
 import type { DetectorPolicy } from "./trace";
 import { deriveMetrics } from "./trace";
-import type { IdPort } from "./ports";
 import type { Finding, RootCause, RunMetrics, RunTrace, Severity } from "./types";
 
 /** Evidence kept per finding. Bounded because a finding with 400 evidence rows is unreadable, and
@@ -45,10 +45,20 @@ export interface ObservedRun {
 export interface DiagnoseInput {
   runs: RunTrace[];
   policy: DetectorPolicy;
-  ids: IdPort;
   thresholds?: DetectorThresholds;
   /** The iteration ceiling those runs were given. Without it `runaway` cannot know what "full" is. */
   maxIterations: number;
+}
+
+/**
+ * The id of a recurring finding: its detector plus a hash of the group it was found in. Deliberately
+ * **not** minted per pass — the engine re-diagnoses the same history on every pass, and the store
+ * carries a finding that keeps recurring as one row whose `occurrences` count moves, which only
+ * works if the next pass produces the same id for the same problem. A fresh id per pass would turn
+ * the register into an append log of duplicates while reading as a deduplicated one.
+ */
+export function findingId(detector: Finding["detector"], groupKey: string): string {
+  return `finding-${detector}-${hash32(groupKey)}`;
 }
 
 export interface DiagnoseReport {
@@ -216,7 +226,7 @@ export function diagnose(input: DiagnoseInput): DiagnoseReport {
       });
     }
     findings.push({
-      id: input.ids.next("finding"),
+      id: findingId(g.detector, g.key),
       detector: g.detector,
       title: first?.title ?? g.detector,
       severity,

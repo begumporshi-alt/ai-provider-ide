@@ -1758,7 +1758,10 @@ describe("runAgentLoop", () => {
     });
 
     const toolMsg = out.messages.find((m) => m.role === "tool")!;
-    const shown = Number(toolMsg.content.match(/^session big: (\d+) of 41 stored message/m)?.[1]);
+    expect(typeof toolMsg.content).toBe("string");
+    const shown = Number(
+      (typeof toolMsg.content === "string" ? toolMsg.content : "").match(/^session big: (\d+) of 41 stored message/m)?.[1],
+    );
     expect(shown).toBeGreaterThan(0);
     expect(shown).toBeLessThan(41);
     expect(toolMsg.content).toContain("size cap");

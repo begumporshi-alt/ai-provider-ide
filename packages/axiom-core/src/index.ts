@@ -53,7 +53,7 @@ export {
   type DetectorThresholds,
 } from "./detectors";
 
-export { diagnose, observe, type DiagnoseInput, type DiagnoseReport, type ObservedRun } from "./diagnose";
+export { diagnose, findingId, observe, type DiagnoseInput, type DiagnoseReport, type ObservedRun } from "./diagnose";
 export { autopsy, type Autopsy, type AutopsyLine } from "./autopsy";
 
 export { describeExpectation, parseSuite, suiteSchema, type SuiteParseFailure, type SuiteParseResult } from "./suite";
@@ -110,6 +110,7 @@ export { conveneRoles, critique, investigate, reviewArchitecture, verify, type R
 
 export {
   BUILTIN_VERSION_ID,
+  builtinVersionId,
   createAxiom,
   type Axiom,
   type AxiomConfig,

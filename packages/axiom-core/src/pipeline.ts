@@ -29,6 +29,7 @@ import { diagnose, observe, type DiagnoseReport, type ObservedRun } from "./diag
 import { DEFAULT_THRESHOLDS, type DetectorThresholds } from "./detectors";
 import { DEFAULT_REPEATS, evaluateSuite, type EvaluateOptions } from "./evaluate";
 import { DEFAULT_GUARDIAN, runGuardian, type GuardianOptions, type GuardianReport } from "./guardian";
+import { hash32 } from "./hash";
 import type { AxiomPorts } from "./ports";
 import { conveneRoles } from "./roles";
 import { deriveMetrics, type DetectorPolicy } from "./trace";
@@ -46,12 +47,25 @@ import type {
 } from "./types";
 
 /**
- * The version id used for the configuration AXIOM found in place — the built-in prompt and the
- * loop's compiled-in parameters. It has no row of its own, because inventing one would mean writing
- * a version nobody chose. Results keyed by it are still reusable: the built-in configuration changes
- * only when the code changes, and then the app's own version changes with it.
+ * The family name for the configuration AXIOM found in place — the built-in prompt and the loop's
+ * compiled-in parameters. It has no row of its own, because inventing one would mean writing a
+ * version nobody chose.
+ *
+ * Results are not keyed by this constant but by `builtinVersionId` below, which is content-keyed:
+ * the built-in configuration changes when the code changes, and a baseline measured against
+ * yesterday's prompt must not be reused as a baseline for today's.
  */
 export const BUILTIN_VERSION_ID = "builtin";
+
+/**
+ * The reusable key for a builtin measurement: a hash of the built-in prompt and the loop
+ * parameters the benchmark would run with. When the code changes either, the hash changes, the
+ * reuse lookup in `benchmark` misses, and the baseline is measured again — sound, because the
+ * only thing that made reuse sound was that the configuration could not change underneath it.
+ */
+export function builtinVersionId(prompt: string, loop: { maxIterations: number; verificationNudgeMax: number }): string {
+  return `builtin-${hash32(`${prompt}\n${loop.maxIterations}:${loop.verificationNudgeMax}`)}`;
+}
 
 export interface AxiomConfig {
   /** The agent loop's own predicates. Required — see trace.ts for why there is no default. */
@@ -149,6 +163,13 @@ export interface Axiom {
     proposal: Proposal;
     baseline: SuiteResult;
     baselineVersion: AgentVersion | null;
+    /**
+     * The id the baseline's numbers are keyed under, when the caller already knows it. When the
+     * baseline is the built-in configuration this is the content-keyed form from `builtinVersionId`,
+     * not the `BUILTIN_VERSION_ID` family name — a decision should name the configuration its
+     * numbers actually came from.
+     */
+    baselineId?: string;
     signal?: AbortSignal;
   }): Promise<ValidationResult>;
   improve(input: { suite: EvalSuite; model: string; signal?: AbortSignal }): Promise<ImproveReport>;
@@ -242,6 +263,7 @@ export function createAxiom(ports: AxiomPorts, config: AxiomConfig): Axiom {
     proposal: Proposal;
     baseline: SuiteResult;
     baselineVersion: AgentVersion | null;
+    baselineId?: string;
     signal?: AbortSignal;
   }): Promise<ValidationResult> {
     const nothing: ValidationResult = {
@@ -318,7 +340,7 @@ export function createAxiom(ports: AxiomPorts, config: AxiomConfig): Axiom {
     const decision: PromotionDecision = {
       id: ports.ids.next("decision"),
       candidateId: built.version.id,
-      baselineId: input.baselineVersion?.id ?? BUILTIN_VERSION_ID,
+      baselineId: input.baselineId ?? input.baselineVersion?.id ?? BUILTIN_VERSION_ID,
       model: input.model,
       decidedAt: ports.clock.now(),
       decision: promote ? "promote" : "reject",
@@ -351,7 +373,10 @@ export function createAxiom(ports: AxiomPorts, config: AxiomConfig): Axiom {
     const observation = await observeRuns();
     const active = await ports.configs.effectiveConfig();
     const baselineVersion = await ports.configs.activeVersion();
-    const versionId = baselineVersion?.id ?? BUILTIN_VERSION_ID;
+    // Content-keyed when the baseline is the built-in configuration, so an app update that changed
+    // the built-in prompt or the loop defaults cannot silently reuse a baseline measured against
+    // what the configuration used to be.
+    const versionId = baselineVersion?.id ?? builtinVersionId(await ports.configs.builtinPrompt(), active.loop);
 
     const base = await benchmark({
       suite: input.suite,
@@ -367,7 +392,6 @@ export function createAxiom(ports: AxiomPorts, config: AxiomConfig): Axiom {
     const diagnosis = diagnose({
       runs: [...observation.runs, ...base.attempts.map((a) => a.trace)],
       policy: config.policy,
-      ids: ports.ids,
       thresholds,
       maxIterations: active.loop.maxIterations,
     });
@@ -456,6 +480,7 @@ export function createAxiom(ports: AxiomPorts, config: AxiomConfig): Axiom {
       proposal: target,
       baseline: base.result,
       baselineVersion,
+      baselineId: versionId,
       ...(input.signal ? { signal: input.signal } : {}),
     });
 
@@ -525,7 +550,7 @@ export function createAxiom(ports: AxiomPorts, config: AxiomConfig): Axiom {
 
   return {
     observe: observeRuns,
-    diagnoseOf: (runs, maxIterations) => diagnose({ runs, policy: config.policy, ids: ports.ids, thresholds, maxIterations }),
+    diagnoseOf: (runs, maxIterations) => diagnose({ runs, policy: config.policy, thresholds, maxIterations }),
     autopsyOf: async (runId) => {
       const trace = await ports.traces.getRun(runId);
       if (!trace) return null;

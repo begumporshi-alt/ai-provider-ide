@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { createAxiom, type AxiomConfig } from "../src/pipeline";
+import { builtinVersionId, createAxiom, type AxiomConfig } from "../src/pipeline";
+import { MemoryConfigStore, MemoryResultStore, createClock } from "../src/inmemory";
 import type { EvalSuite } from "../src/types";
 import {
+  TEST_BUILTIN_PROMPT,
   TEST_LOOP,
   TEST_POLICY,
+  createMemoryTraceSource,
+  createScriptedRunner,
   createTestPorts,
+  sequentialIds,
   trace,
   call,
   result,
@@ -275,7 +280,7 @@ describe("pipeline — 02 to 07, the whole loop", () => {
     // the diagnosis, and the report has to say so rather than look like a full second pass.
     const { ports, axiom } = setup(GAMES_THE_METRIC);
     const first = await axiom.improve({ suite: SUITE, model: MODEL });
-    expect(first.baseline.versionId).toBe("builtin");
+    expect(first.baseline.versionId).toBe(builtinVersionId(TEST_BUILTIN_PROMPT, TEST_LOOP));
     expect(first.notDone.join(" ")).not.toMatch(/reused from a stored result/);
     const runsAfterFirst = ports.runner.runs.length;
 
@@ -319,6 +324,35 @@ describe("pipeline — benchmark reuse", () => {
     expect(reused.attempts).toEqual([]);
     expect(reused.capabilityAttempts.length).toBe(6);
     expect(ports.runner.runs.length).toBe(6);
+  });
+
+  it("re-runs the builtin baseline after the built-in prompt changes, because the stored numbers describe a different configuration", async () => {
+    const runner = createScriptedRunner(CLEAN);
+    const results = new MemoryResultStore();
+    const mkPorts = (prompt: string) => ({
+      runner,
+      results,
+      traces: createMemoryTraceSource(runner.runs),
+      configs: new MemoryConfigStore(prompt),
+      ids: sequentialIds(),
+      clock: createClock(),
+    });
+    const axiomOf = (prompt: string) =>
+      createAxiom(mkPorts(prompt), { policy: TEST_POLICY, repeats: 3 });
+
+    const first = await axiomOf(TEST_BUILTIN_PROMPT).improve({ suite: SUITE, model: MODEL });
+    const runsAfterFirst = runner.runs.length;
+    expect(first.baseline.versionId).toBe(builtinVersionId(TEST_BUILTIN_PROMPT, TEST_LOOP));
+
+    await axiomOf("A different system prompt entirely.").improve({ suite: SUITE, model: MODEL });
+    expect(runner.runs.length).toBeGreaterThan(runsAfterFirst);
+
+    // The original prompt's stored baseline is still exactly where it was — reuse keys on content,
+    // so a change invalidates only the entries whose configuration changed.
+    const third = await axiomOf(TEST_BUILTIN_PROMPT).improve({ suite: SUITE, model: MODEL });
+    expect(third.baseline.versionId).toBe(first.baseline.versionId);
+    expect(third.baseline.id).toBe(first.baseline.id);
+    expect(runner.runs.length).toBe(runsAfterFirst + 6);
   });
 });
 

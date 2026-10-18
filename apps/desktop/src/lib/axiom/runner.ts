@@ -149,40 +149,45 @@ export function createEvalRunner(opts: EvalRunnerOptions): AgentRunnerPort {
           onEvent,
           signal: ac.signal,
         });
-
-        const stopped = ac.signal.aborted;
-        const status = stopped ? "stopped" : hitCeiling ? "error" : "ok";
-        const error = stopped
-          ? "stopped"
-          : hitCeiling
-            ? `step ceiling: ${iterations} iterations, the model was still calling tools`
-            : null;
-        endRun(runId, status, iterations, error ?? undefined, promptTokens, completionTokens);
-        return {
-          id: runId,
-          sessionId: opts.sessionId ?? null,
-          parentRunId: null,
-          model: req.model,
-          prompt: req.task.prompt,
-          status,
-          iterations,
-          startedAt,
-          endedAt: Date.now(),
-          error,
-          promptTokens,
-          completionTokens,
-          steps,
-          // Null rather than the version under test: the runner is handed a configuration, not an id,
-          // and a trace asserting an id it was never given is the kind of claim this package exists
-          // to catch. The `SuiteResult` carries the id, which is where a comparison reads it from.
-          versionId: null,
-        };
       } catch (e) {
-        endRun(runId, "error", iterations, (e as Error).message, promptTokens, completionTokens);
-        throw e;
+        if (!ac.signal.aborted) {
+          endRun(runId, "error", iterations, (e as Error).message, promptTokens, completionTokens);
+          throw e;
+        }
+        // An abort mid-run is a decision, not a fault — the loop throws AbortError on Stop. Fall
+        // through so the trace below is returned as 'stopped' and evaluateSuite keeps the attempts
+        // that did happen under `aborted`, instead of a throw discarding them.
       } finally {
         req.signal?.removeEventListener("abort", onAbort);
       }
+
+      const stopped = ac.signal.aborted;
+      const status = stopped ? "stopped" : hitCeiling ? "error" : "ok";
+      const error = stopped
+        ? "stopped"
+        : hitCeiling
+          ? `step ceiling: ${iterations} iterations, the model was still calling tools`
+          : null;
+      endRun(runId, status, iterations, error ?? undefined, promptTokens, completionTokens);
+      return {
+        id: runId,
+        sessionId: opts.sessionId ?? null,
+        parentRunId: null,
+        model: req.model,
+        prompt: req.task.prompt,
+        status,
+        iterations,
+        startedAt,
+        endedAt: Date.now(),
+        error,
+        promptTokens,
+        completionTokens,
+        steps,
+        // Null rather than the version under test: the runner is handed a configuration, not an id,
+        // and a trace asserting an id it was never given is the kind of claim this package exists
+        // to catch. The `SuiteResult` carries the id, which is where a comparison reads it from.
+        versionId: null,
+      };
     },
   };
 }

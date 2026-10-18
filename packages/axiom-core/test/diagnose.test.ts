@@ -3,7 +3,7 @@ import { DEFAULT_THRESHOLDS, DETECTORS, runDetectors } from "../src/detectors";
 import { diagnose, observe } from "../src/diagnose";
 import { deriveMetrics } from "../src/trace";
 import type { Finding, RunTrace } from "../src/types";
-import { TEST_POLICY, call, done, result, said, sequentialIds, trace } from "./fakes";
+import { TEST_POLICY, call, done, result, said, trace } from "./fakes";
 
 /** A run that does work and then claims it holds without checking — the defect under test. */
 function premature(id: string, model: string, prompt: string, status: RunTrace["status"] = "ok"): RunTrace {
@@ -41,7 +41,7 @@ function verified(id: string, model: string, prompt: string): RunTrace {
 const TASK = "Fix the parser bug";
 
 function run(runs: RunTrace[]): Finding[] {
-  return diagnose({ runs, policy: TEST_POLICY, ids: sequentialIds(), maxIterations: 40 }).findings;
+  return diagnose({ runs, policy: TEST_POLICY, maxIterations: 40 }).findings;
 }
 
 function only(findings: Finding[], detector: Finding["detector"]): Finding {
@@ -173,7 +173,6 @@ describe("the report", () => {
     const report = diagnose({
       runs: [premature("a", "m", TASK), verified("b", "m", TASK), verified("c", "m", TASK)],
       policy: TEST_POLICY,
-      ids: sequentialIds(),
       maxIterations: 40,
     });
     expect(report.runsExamined).toBe(3);
@@ -186,7 +185,6 @@ describe("the report", () => {
     const report = diagnose({
       runs: [verified("a", "m", TASK)],
       policy: TEST_POLICY,
-      ids: sequentialIds(),
       maxIterations: 40,
     });
     expect(report.findings).toHaveLength(0);
@@ -196,6 +194,15 @@ describe("the report", () => {
   it("gives every finding a distinct id", () => {
     const findings = run([premature("a", "m", "one"), premature("b", "m", "two")]);
     expect(new Set(findings.map((f) => f.id)).size).toBe(findings.length);
+  });
+
+  it("gives the same recurring finding the same id on the next pass, so the register updates one row", () => {
+    // The store deduplicates by id; a fresh id per pass would append a duplicate for a problem that
+    // never went away. Two passes over the same run, built through different inputs, must agree.
+    const first = run([premature("a", "m", TASK)]);
+    const second = run([premature("a", "m", TASK)]);
+    expect(second.map((f) => f.id)).toEqual(first.map((f) => f.id));
+    expect(first[0]?.id).toMatch(/^finding-premature-success-/);
   });
 });
 
