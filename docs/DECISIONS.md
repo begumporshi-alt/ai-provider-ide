@@ -1849,10 +1849,32 @@ that is not drift (then the rethrown path needs its own health record).
   prompt survives a promotion; `pipeline.test.ts` pins both stopped-run paths, including that no
   version row is created when the baseline stops. The metric-gaming fixture is the guardian's own
   test: verification calls up, edited task's pass rate up, `shell` capability to zero, promotion
-  refused. Gates: `axiom-core` 245/0, desktop vitest 797/0 over 66 files, `cargo test --lib` 1665/0,
+  refused. Gates: `axiom-core` 250/0, desktop vitest 799/0 over 67 files, `cargo test --lib` 1665/0,
   `pnpm -r typecheck` clean, `cargo clippy --all-targets -D warnings` 0 new warnings, key-leak grep
   and version sync OK.
 - **Revisit if:** a proposal needs an actuator that writes code (then the eval suite has to cover
   AXIOM's own changes, not only the agent's); or a patch ever needs to sit *inside* the base prompt
   rather than after it, which would mean the base has structure AXIOM has to understand; or the
   nudge ceiling moves, which has to move in both packages at once.
+
+## 2026-10-19 — Guardian noise floor pools within tasks, not across them
+
+- **The problem the guardian faced.** The variance pool for the noise floor was pooling across
+  tasks, which measured suite heterogeneity (difficulty differences) rather than model sampling noise.
+  On `passRate`, this pinned the floor at ~0.47, rejecting real improvements (0.25 delta from fixing
+  an entire task) no matter how many repeats were paid for — repeats cannot buy confidence when the
+  floor measures the wrong thing.
+- **Decision:** pool variance **within** tasks only. A task's spread shows how much the model samples
+  differently run to run on that same task. Pooling across tasks confounds difficulty with noise.
+  The `withinTaskSpread()` function groups attempts by `taskId` before computing pooled variance.
+- **Measured impact:** the old gate (0.500 → 0.470 floor) refused a 0.250 delta fix on `passRate` as
+  noise; the new gate clears it. The specific test that had to keep failing was the "measures spread
+  within a task" test in `compareMetric` describe block. Gates: `axiom-core` 250/0 vitest, `pnpm -r
+  typecheck` clean.
+- **Deliberately not done:** adding a paired sign-test gate across tasks. That would require measuring
+  whether each task improved individually rather than using a variance threshold. The `r ≥ 3`
+  idea only half-addressed this; a proper paired test is a design decision about gate stringency,
+  not a code task.
+- **Falsification:** `pipeline.test.ts` end-to-end test passes; `guardian.test.ts` has four new tests
+  covering within-task spread (2) and `builtinPrompt` prompt-budget checks (2).
+- **Revisit if:** a paired sign-test gate is adopted, or the variance threshold itself changes.

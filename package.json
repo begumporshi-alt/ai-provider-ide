@@ -4,6 +4,9 @@
   "version": "1.2.0",
   "license": "Apache-2.0",
   "packageManager": "pnpm@10.12.4",
+  "engines": {
+    "node": ">=22.12"
+  },
   "scripts": {
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",

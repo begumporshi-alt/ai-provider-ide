@@ -322,6 +322,9 @@ export function createAxiom(ports: AxiomPorts, config: AxiomConfig): Axiom {
       baselineVersion: input.baselineVersion,
       proposal: input.proposal,
       findings,
+      // The base the candidate's override was built on. `buildCandidate` appended to exactly this
+      // string, so the guardian can tell a patch from text the markers cannot see.
+      builtinPrompt: basePrompt,
       options: guardianOpts,
     });
 

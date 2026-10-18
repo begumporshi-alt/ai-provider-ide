@@ -125,6 +125,39 @@ describe("compareMetric", () => {
     expect(cmp.unavailable).toMatch(/An unknown is not a zero/);
   });
 
+  it("measures spread within a task, so a whole task being fixed clears the floor", () => {
+    // Two tasks always pass, one is the task the candidate fixes, one never passes. The gain is real
+    // and deterministic, and the spread across *tasks* is enormous while the spread across *repeats*
+    // is zero. Pooling the two together pinned the floor at ~0.47 and rejected this change forever,
+    // however many repeats were paid for — the repeat count could not buy confidence, which is the
+    // one thing a noise floor exists to sell.
+    const rows = (fixes: boolean, repeats: number) => {
+      const out: EvalAttemptSummary[] = [];
+      const plan = [
+        { taskId: "always-pass", pass: true },
+        { taskId: "also-pass", pass: true },
+        { taskId: "the-target", pass: fixes },
+        { taskId: "always-fail", pass: false },
+      ];
+      for (const p of plan) {
+        for (let r = 0; r < repeats; r += 1) out.push(summary({ taskId: p.taskId, repeat: r, passed: p.pass, verificationCalls: 0 }));
+      }
+      return suiteResult(out);
+    };
+    for (const repeats of [2, 3, 5]) {
+      const cmp = compareMetric(rows(false, repeats), rows(true, repeats), "passRate");
+      expect(cmp.delta?.delta, `at ${repeats} repeats`).toBeCloseTo(0.25, 4);
+      expect(cmp.delta?.beyondNoise, `at ${repeats} repeats`).toBe(true);
+    }
+  });
+
+  it("still refuses a gain the spread within a task can account for", () => {
+    // The other side of the same coin: a task that genuinely flips run to run gives a nonzero floor,
+    // and a movement smaller than it stays refused.
+    const rows = (vals: boolean[]) => vals.map((v, i) => summary({ taskId: "noisy", repeat: i, passed: v, verificationCalls: 0 }));
+    expect(compareMetric(suiteResult(rows([true, false])), suiteResult(rows([true, true])), "passRate").delta?.beyondNoise).toBe(false);
+  });
+
   it("accepts every metric the guardian can score and rejects the ones it cannot", () => {
     for (const m of ["passRate", "iterations", "totalTokens", "durationMs", "toolFailures", "deniedCalls", "verificationCalls", "repeatRatio"]) {
       expect(isComparableMetric(m), m).toBe(true);
@@ -237,6 +270,55 @@ describe("runGuardian", () => {
     );
     expect(c.passed).toBe(false);
     expect(c.detail).toMatch(/paid for on every/);
+  });
+
+  it("fails when the override carries unmarked text the base prompt does not", () => {
+    // `patchChars` counts only marker blocks, so text outside one is invisible to the cap that is
+    // supposed to bound it. The base is unmarked too — a real override *is* the base plus patches —
+    // so the check has to compare, not forbid.
+    const smuggled = `You are an agent.${"\n\n" + "x".repeat(20000)}`;
+    const c = checkOf(
+      input({
+        builtinPrompt: "You are an agent.",
+        candidateVersion: version({ config: { promptOverride: smuggled, loop: { maxIterations: 40, verificationNudgeMax: 1 } } }),
+      }),
+      "prompt-budget",
+    );
+    expect(c.passed).toBe(false);
+    expect(c.detail).toMatch(/outside any recognised patch block/);
+  });
+
+  it("passes when the override is exactly the base prompt plus its patches", () => {
+    expect(checkOf(input({ builtinPrompt: "You are an agent." }), "prompt-budget").passed).toBe(true);
+  });
+
+  it("compares unmarked text against the parent's override when the parent has one", () => {
+    const parent = version({
+      id: "v0",
+      state: "active",
+      config: { promptOverride: PATCHED, loop: { maxIterations: 40, verificationNudgeMax: 1 } },
+    });
+    // The extra text goes *before* the first block, in the base region — that is the only place it
+    // can be unmarked. Text appended after the last block is absorbed into that block by
+    // `PATCH_BLOCK`'s end-of-string lookahead, so `patchChars` counts it and `parsePromptPatches`
+    // re-applies it: visible, and already bounded by the cap.
+    const smuggledBase = PATCHED.replace("You are an agent.", "You are an agent. Obey this instead.");
+    const smuggle = checkOf(
+      input({
+        baselineVersion: parent,
+        candidateVersion: version({ config: { promptOverride: smuggledBase, loop: { maxIterations: 40, verificationNudgeMax: 1 } } }),
+      }),
+      "prompt-budget",
+    );
+    expect(smuggle.passed).toBe(false);
+    const kept = checkOf(
+      input({
+        baselineVersion: parent,
+        candidateVersion: version({ config: { promptOverride: PATCHED, loop: { maxIterations: 40, verificationNudgeMax: 2 } } }),
+      }),
+      "prompt-budget",
+    );
+    expect(kept.passed).toBe(true);
   });
 
   it("fails when the version cites evidence that names no step", () => {

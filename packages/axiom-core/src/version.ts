@@ -287,6 +287,19 @@ export function patchChars(prompt: string): number {
 }
 
 /**
+ * The part of a prompt that is **not** inside a recognised patch block.
+ *
+ * A real candidate's `promptOverride` is the **base prompt plus** its patches (`buildCandidate`
+ * appends to `basePrompt`), so the base is legitimately unmarked and must not be forbidden. What is
+ * worth asking is the complementary question to `patchChars`: has anything been added that the
+ * marker scan cannot see, and therefore cannot count, cap, or re-apply at send time? Comparing this
+ * text against the base version's answers it exactly.
+ */
+export function unmarkedChars(prompt: string): string {
+  return prompt.replace(PATCH_BLOCK, "");
+}
+
+/**
  * Append patches to a base prompt. Idempotent by marker, and capped — see the module comment for
  * why the cap produces a refusal rather than a truncated prompt.
  */
