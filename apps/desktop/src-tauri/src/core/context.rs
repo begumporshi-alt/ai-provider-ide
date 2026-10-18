@@ -1516,7 +1516,7 @@ mod context_graph_tests {
                  DROP TRIGGER IF EXISTS session_messages_fts_ad;
                  DROP TRIGGER IF EXISTS session_messages_fts_au;
                  DROP TABLE IF EXISTS session_messages_fts;
-                 DELETE FROM schema_version WHERE version = 30;",
+                 DELETE FROM schema_version WHERE version >= 30;",
             )
             .unwrap();
             conn.execute(

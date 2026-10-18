@@ -2298,3 +2298,41 @@ export async function axiomPutDecision(decision: PromotionDecision): Promise<voi
 export async function axiomListDecisions(limit = 100): Promise<PromotionDecision[]> {
   return invoke<PromotionDecision[]>("axiom_decisions_list", { limit });
 }
+
+/** One attempt to improve the agent, whatever became of it — the ledger the History timeline reads.
+ *  `status` is `completed` | `refused` | `aborted` | `failed`; the decision fields stay null until
+ *  the pass got far enough to know them, and `report` is the engine's own document (a full
+ *  ImproveReport when completed, `{error: message}` otherwise). */
+export interface StoredAuditPass {
+  id: string;
+  startedAt: number;
+  endedAt: number;
+  status: "completed" | "refused" | "aborted" | "failed";
+  suiteId: string | null;
+  model: string | null;
+  repeats: number | null;
+  decision: "promote" | "reject" | null;
+  candidateId: string | null;
+  baselineId: string | null;
+  report: Record<string, unknown>;
+}
+
+export async function axiomPutAudit(audit: {
+  id: string;
+  startedAt: number;
+  endedAt: number;
+  status: StoredAuditPass["status"];
+  suiteId: string | null;
+  model: string | null;
+  repeats: number | null;
+  decision: StoredAuditPass["decision"];
+  candidateId: string | null;
+  baselineId: string | null;
+  report: Record<string, unknown>;
+}): Promise<void> {
+  await invoke("axiom_audit_put", { audit });
+}
+
+export async function axiomListAudits(limit = 200): Promise<StoredAuditPass[]> {
+  return invoke<StoredAuditPass[]>("axiom_audits_list", { limit });
+}

@@ -162,6 +162,33 @@ pub struct Decision {
     pub deltas: serde_json::Value,
 }
 
+/// One attempt to improve the agent, whatever became of it — the record 0031 adds.
+///
+/// The four tables above record what AXIOM concluded; this one records that a pass *happened*. A
+/// completed pass stores its whole `ImproveReport`; a refused, aborted or failed one stores the
+/// error it ended with, in the same column. The nullable fields stay null until the pass got far
+/// enough to know them, so a row can never imply a decision it did not make.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuditPass {
+    pub id: String,
+    pub started_at: i64,
+    pub ended_at: i64,
+    /// `completed` | `refused` | `aborted` | `failed`. Validated against those four on write.
+    pub status: String,
+    pub suite_id: Option<String>,
+    pub model: Option<String>,
+    pub repeats: Option<i64>,
+    pub decision: Option<String>,
+    pub candidate_id: Option<String>,
+    pub baseline_id: Option<String>,
+    /// The engine's own document — an `ImproveReport` for a completed pass, `{error: message}`
+    /// otherwise. Stored whole and returned parsed, never re-shaped here.
+    pub report: serde_json::Value,
+}
+
+pub const AUDIT_STATUSES: [&str; 4] = ["completed", "refused", "aborted", "failed"];
+
 pub const DEFAULT_LOOP: LoopParams = LoopParams { max_iterations: 40, verification_nudge_max: 1 };
 
 fn default_config() -> AgentConfig {
@@ -626,6 +653,86 @@ pub fn list_decisions(store: &Store, limit: usize) -> Result<Vec<serde_json::Val
 }
 
 // ---------------------------------------------------------------------------
+// Audit passes — the ledger of attempts, one row each
+// ---------------------------------------------------------------------------
+
+/// Append one audit pass. Same refusal as `put_version`: an id already taken is a caller bug worth
+/// an error, because a pass that re-ran after a failure is a *new* record, not an edit of the old
+/// one — the failed attempt is evidence.
+pub fn put_audit(store: &Store, a: &AuditPass) -> Result<(), String> {
+    if !AUDIT_STATUSES.contains(&a.status.as_str()) {
+        return Err(format!("unknown audit status '{}'", a.status));
+    }
+    if let Some(d) = &a.decision {
+        if d != "promote" && d != "reject" {
+            return Err(format!("unknown decision '{}'", d));
+        }
+    }
+    let report = serde_json::to_string(&a.report).map_err(|e| e.to_string())?;
+    let c = conn(store)?;
+    refuse_taken_id(&c, "axiom_audits", &a.id, "audit pass", "a re-run is a new record, not an edit")?;
+    c.execute(
+        "INSERT INTO axiom_audits
+           (id, started_at, ended_at, status, suite_id, model, repeats, decision,
+            candidate_id, baseline_id, report)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        rusqlite::params![
+            a.id,
+            a.started_at,
+            a.ended_at,
+            a.status,
+            a.suite_id,
+            a.model,
+            a.repeats,
+            a.decision,
+            a.candidate_id,
+            a.baseline_id,
+            report
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn list_audits(store: &Store, limit: usize) -> Result<Vec<serde_json::Value>, String> {
+    let c = conn(store)?;
+    let mut stmt = c
+        .prepare(
+            "SELECT id, started_at, ended_at, status, suite_id, model, repeats, decision,
+                    candidate_id, baseline_id, report
+             FROM axiom_audits ORDER BY started_at DESC, id DESC LIMIT ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([limit as i64], |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, String>(0)?,
+                "startedAt": r.get::<_, i64>(1)?,
+                "endedAt": r.get::<_, i64>(2)?,
+                "status": r.get::<_, String>(3)?,
+                "suiteId": r.get::<_, Option<String>>(4)?,
+                "model": r.get::<_, Option<String>>(5)?,
+                "repeats": r.get::<_, Option<i64>>(6)?,
+                "decision": r.get::<_, Option<String>>(7)?,
+                "candidateId": r.get::<_, Option<String>>(8)?,
+                "baselineId": r.get::<_, Option<String>>(9)?,
+                "report": r.get::<_, String>(10)?,
+            }))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        let mut v = row.map_err(|e| e.to_string())?;
+        let obj = v.as_object_mut().ok_or("an audit row is not an object")?;
+        let raw = obj.remove("report").and_then(|x| x.as_str().map(String::from)).unwrap_or_default();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::json!({}));
+        obj.insert("report".to_string(), doc);
+        out.push(v);
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // Traces — the agent's own history, in the shape the engine reads
 // ---------------------------------------------------------------------------
 
@@ -982,6 +1089,76 @@ mod axiom_tests {
         assert!(traces(&s, 10, Some("other")).unwrap().is_empty());
         assert!(trace(&s, "r1").unwrap().is_some());
         assert!(trace(&s, "nope").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn audit(id: &str, status: &str) -> AuditPass {
+        AuditPass {
+            id: id.into(),
+            started_at: 100,
+            ended_at: 200,
+            status: status.into(),
+            suite_id: Some("suite-1".into()),
+            model: Some("m".into()),
+            repeats: Some(2),
+            decision: None,
+            candidate_id: None,
+            baseline_id: None,
+            report: serde_json::json!({ "runsExamined": 3, "runsClean": 2 }),
+        }
+    }
+
+    #[test]
+    fn an_audit_pass_comes_back_as_one_json_tree_with_its_report_parsed() {
+        let (s, d) = temp_store("audits");
+        let mut pass = audit("a1", "completed");
+        pass.decision = Some("promote".into());
+        pass.candidate_id = Some("v2".into());
+        pass.baseline_id = Some("v1".into());
+        pass.report = serde_json::json!({
+            "runsExamined": 6, "totalHits": 2,
+            "notDone": ["the candidate did not beat the noise floor"],
+        });
+        put_audit(&s, &pass).unwrap();
+
+        // A refused pass: the fields it never learned stay null, and its report is the error.
+        let refused = audit("a2", "refused");
+        put_audit(&s, &refused).unwrap();
+
+        let all = list_audits(&s, 10).unwrap();
+        assert_eq!(all.len(), 2);
+        // Newest first — the ledger is read top-down.
+        assert_eq!(all[0]["id"], "a2");
+        assert!(all[0]["decision"].is_null());
+        assert_eq!(all[0]["report"], serde_json::json!({ "runsExamined": 3, "runsClean": 2 }));
+        assert_eq!(all[1]["id"], "a1");
+        assert_eq!(all[1]["decision"], "promote");
+        assert_eq!(all[1]["candidateId"], "v2");
+        assert_eq!(all[1]["report"]["totalHits"], 2, "the report is parsed, not a JSON string");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_audit_pass_cannot_be_overwritten_and_a_rerun_is_a_second_record() {
+        let (s, d) = temp_store("audit-append");
+        put_audit(&s, &audit("a1", "failed")).unwrap();
+        let err = put_audit(&s, &audit("a1", "completed")).unwrap_err();
+        assert!(err.contains("new record"), "{err}");
+        assert_eq!(list_audits(&s, 10).unwrap()[0]["status"], "failed");
+
+        put_audit(&s, &audit("a2", "completed")).unwrap();
+        assert_eq!(list_audits(&s, 10).unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_unknown_audit_status_or_decision_is_refused_rather_than_stored() {
+        let (s, d) = temp_store("audit-vocab");
+        assert!(put_audit(&s, &audit("a1", "promoted")).is_err());
+        assert!(put_audit(&s, &audit("a1", "completed")).is_ok());
+        let mut bad = audit("a1b", "completed");
+        bad.decision = Some("maybe".into());
+        assert!(put_audit(&s, &bad).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 }

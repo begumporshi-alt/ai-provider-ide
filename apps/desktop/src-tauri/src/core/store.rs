@@ -350,6 +350,7 @@ const DATA_MIGRATIONS: &[DataMigration] = &[
     ("0028_session_memory_refs", add_session_memory_refs),
     ("0029_axiom_evolution", create_axiom_tables),
     ("0030_session_transcript_search", create_session_messages_fts),
+    ("0031_axiom_audit_history", create_axiom_audits),
 ];
 
 /// 0029 — AXIOM's four tables: the version chain, the finding register, the eval results and the
@@ -438,6 +439,45 @@ CREATE TABLE IF NOT EXISTS axiom_decisions (
   deltas       TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS idx_axiom_decisions_candidate ON axiom_decisions(candidate_id);
+"#,
+    )?;
+    Ok(())
+}
+
+/// 0031 — every audit pass, one record each.
+///
+/// An AXIOM pass was the one thing the engine did that left no durable trace of itself: the
+/// `ImproveReport` lived only in React state, so a completed pass, a consent refusal, an aborted
+/// benchmark or a crash all looked identical after a reload — nothing had happened. This table is
+/// the ledger that closes that gap. One row per attempt to improve, whatever became of it:
+///
+/// - `status` says which of the four endings it met, so "did AXIOM run and stop early?" is a query,
+///   not a memory.
+/// - `decision`/`candidate_id`/`baseline_id` are null until the pass got far enough to know — a
+///   refused run promoted nothing, and the row must not imply otherwise.
+/// - `report` is the engine's own document, stored whole. Like a decision's checks and roles, it is
+///   a document to be re-read, not a table to be queried into; the verdict a reader wants is
+///   computed from it at render time rather than denormalized into a column that could disagree.
+///
+/// Append-only and keyed by an id the webview mints per pass, so a re-run after an error writes a
+/// second record instead of editing the first — the failed attempt is evidence too.
+fn create_axiom_audits(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS axiom_audits (
+  id           TEXT PRIMARY KEY,
+  started_at   INTEGER NOT NULL,
+  ended_at     INTEGER NOT NULL,
+  status       TEXT NOT NULL CHECK (status IN ('completed','refused','aborted','failed')),
+  suite_id     TEXT,
+  model        TEXT,
+  repeats      INTEGER,
+  decision     TEXT CHECK (decision IS NULL OR decision IN ('promote','reject')),
+  candidate_id TEXT,
+  baseline_id  TEXT,
+  report       TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_axiom_audits_started ON axiom_audits(started_at);
 "#,
     )?;
     Ok(())
@@ -1689,11 +1729,11 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0030 data migrations.
-        assert_eq!(info.schema_version, 30);
+        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0031 data migrations.
+        assert_eq!(info.schema_version, 31);
         // The two lists must stay numbered as one sequence: a data migration that reused a SQL
         // version number would be silently skipped on every database that already had it.
-        assert_eq!(30, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
+        assert_eq!(31, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
         // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
         // P6 agent-run, P7 memory and AXIOM evolution tables. `memories_fts` is a virtual table, so it shows up
         // in sqlite_master as a table too — assert it, because BM25 recall silently returns
@@ -1733,6 +1773,7 @@ mod tests {
             "axiom_findings",
             "axiom_suite_results",
             "axiom_decisions",
+            "axiom_audits",
         ] {
             let n: i64 = conn
                 .query_row(
@@ -1798,8 +1839,8 @@ mod tests {
             .unwrap();
         }
 
-        s.migrate().expect("re-migrate applies 0029..0030");
-        assert_eq!(s.info().unwrap().schema_version, 30);
+        s.migrate().expect("re-migrate applies 0029..0031");
+        assert_eq!(s.info().unwrap().schema_version, 31);
 
         let conn = s.conn.lock().unwrap();
         let runs: i64 = conn

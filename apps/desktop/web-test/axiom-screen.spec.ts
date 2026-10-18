@@ -235,3 +235,118 @@ test("axiom end to end: a real audit fills the stepper with what actually happen
   await expect(page.getByTestId("axiom-plan")).not.toContainText("Run an audit");
   await expect(page.getByTestId("axiom-health")).toBeVisible();
 });
+
+test("axiom history: a finished audit is still on the timeline after leaving the screen", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  await page.evaluate(async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const h = (window as any).__webTest;
+    const now = Date.now();
+    // A completed pass, stored whole — the report is the same shape the engine returned, so what
+    // the timeline restores is what the pass actually said, not a summary of it.
+    await h.invoke("axiom_audit_put", {
+      audit: {
+        id: "a-old",
+        startedAt: now - 120_000,
+        endedAt: now - 90_000,
+        status: "completed",
+        suiteId: "suite-seed",
+        model: "mock-model",
+        repeats: 1,
+        decision: null,
+        candidateId: null,
+        baselineId: "builtin-abc",
+        report: {
+          observation: { totals: { runs: 4, ok: 4, error: 0, stopped: 0, unfinished: 0, toolCalls: 11, totalTokens: 1200, durationMs: 30_000 } },
+          diagnosis: { findings: [], runsExamined: 4, runsClean: 4 },
+          baseline: {
+            id: "sr-old", suiteId: "suite-seed", versionId: "builtin-abc", model: "mock-model",
+            startedAt: now - 120_000, endedAt: now - 90_000, repeats: 1,
+            tasks: [], attemptSummaries: [], passRate: 0.5,
+            cost: { promptTokens: 300, completionTokens: 100 },
+          },
+          proposals: [],
+          attempted: null,
+          candidate: null,
+          candidateResult: null,
+          guardian: null,
+          decision: null,
+          capabilityMap: [],
+          capabilityMapOf: "none",
+          notDone: ["the pass reused a stored baseline instead of re-running it"],
+        },
+      },
+    });
+    // A pass that never got past the consent gate is on the timeline too — its ending is a fact.
+    await h.invoke("axiom_audit_put", {
+      audit: {
+        id: "a-refused",
+        startedAt: now - 60_000,
+        endedAt: now - 59_000,
+        status: "refused",
+        suiteId: "suite-seed",
+        model: "mock-model",
+        repeats: 1,
+        decision: null,
+        candidateId: null,
+        baselineId: null,
+        report: { error: "the paid run was refused" },
+      },
+    });
+    // A decision recorded outside any pass (before the ledger existed) joins the timeline rather
+    // than vanishing now the old Decisions list is gone.
+    await h.invoke("axiom_version_put", {
+      version: {
+        id: "v-legacy",
+        parentId: null,
+        createdAt: now - 180_000,
+        state: "rejected",
+        decisionId: "d-legacy",
+        reason: "seeded as a legacy rejection",
+        targetsFindingIds: [],
+        evidence: [],
+        config: { promptOverride: null, loop: { maxIterations: 40, verificationNudgeMax: 1 } },
+      },
+    });
+    await h.invoke("axiom_decision_put", {
+      decision: {
+        id: "d-legacy",
+        candidateId: "v-legacy",
+        baselineId: "builtin",
+        model: "mock-model",
+        decidedAt: now - 180_000,
+        decision: "reject",
+        checks: [],
+        roles: [],
+        deltas: [],
+      },
+    });
+  });
+
+  await page.getByRole("button", { name: "Model Browser", exact: true }).click();
+  await page.getByRole("button", { name: "AXIOM", exact: true }).click();
+
+  // Newest first, one entry per ending: refused, completed, then the legacy decision.
+  const history = page.getByTestId("axiom-history");
+  await expect(history).toBeVisible();
+  await expect(history).toContainText("refused — the spend was declined");
+  await expect(history).toContainText("the paid run was refused");
+  await expect(history).toContainText("completed — nothing promoted");
+  await expect(history).toContainText("no audit record — decided outside a pass");
+
+  // The completed pass's report restores into the screen: the pass-rate card reads the stored
+  // measurement without paying to reproduce it, because no suite result is seeded — 50% can only
+  // have come from the audit's report.
+  await expect(page.getByTestId("axiom-metric-pass")).toContainText("50%");
+
+  // The pass's own seven-stage summary is one expansion away.
+  await history.getByText("the pass in seven stages").first().click();
+  await expect(history).toContainText("01 Observe");
+  await expect(history).toContainText("reused a stored baseline");
+
+  // Leaving and coming back is the whole point of the ledger: nothing depends on React state.
+  await page.getByRole("button", { name: "Model Browser", exact: true }).click();
+  await page.getByRole("button", { name: "AXIOM", exact: true }).click();
+  await expect(page.getByTestId("axiom-history")).toContainText("refused — the spend was declined");
+  await expect(page.getByTestId("axiom-metric-pass")).toContainText("50%");
+});

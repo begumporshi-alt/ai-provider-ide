@@ -934,6 +934,22 @@ pub fn axiom_decisions_list(
     axiom::list_decisions(&store, limit.unwrap_or(100)).map_err(CommandError)
 }
 
+#[tauri::command]
+pub fn axiom_audit_put(
+    store: State<'_, Arc<Store>>,
+    audit: axiom::AuditPass,
+) -> Result<(), CommandError> {
+    axiom::put_audit(&store, &audit).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn axiom_audits_list(
+    store: State<'_, Arc<Store>>,
+    limit: Option<usize>,
+) -> Result<Vec<serde_json::Value>, CommandError> {
+    axiom::list_audits(&store, limit.unwrap_or(200)).map_err(CommandError)
+}
+
 pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
         vault_put,
@@ -1113,6 +1129,8 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         axiom_suite_results_list,
         axiom_decision_put,
         axiom_decisions_list,
+        axiom_audit_put,
+        axiom_audits_list,
     ]
 }
 

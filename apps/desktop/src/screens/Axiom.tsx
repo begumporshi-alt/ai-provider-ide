@@ -24,6 +24,7 @@ import {
   describeCapabilityState,
   estimateCost,
   parseSuite,
+  PaidRunRefusedError,
   type AgentVersion,
   type Autopsy,
   type ConsentPort,
@@ -35,14 +36,17 @@ import {
 } from "@aiprovider/axiom-core";
 import {
   axiomActiveConfig,
+  axiomListAudits,
   axiomListDecisions,
   axiomListFindings,
   axiomListSuiteResults,
   axiomListTraces,
   axiomListVersions,
+  axiomPutAudit,
   axiomSetVersionState,
   catalog,
   registry,
+  type StoredAuditPass,
   type StoredFinding,
 } from "../store";
 import { selectableModels } from "../lib/models/selectable";
@@ -75,6 +79,7 @@ export function AxiomScreen() {
   const [decisions, setDecisions] = useState<PromotionDecision[]>([]);
   const [findings, setFindings] = useState<StoredFinding[]>([]);
   const [traces, setTraces] = useState<RunTrace[]>([]);
+  const [audits, setAudits] = useState<StoredAuditPass[]>([]);
   /**
    * Every recorded suite result, kept so the cost estimate can use this suite's own measured token
    * counts once they exist rather than the standing assumption — `estimateCost` prefers history for
@@ -93,16 +98,17 @@ export function AxiomScreen() {
     return selectableModels(catalog.forModality("text"), catalog.aliases, slugOf, isEnabled);
   }, [tick]);
 
-  const reload = useCallback(async () => {
+  const reload = useCallback(async (opts?: { restoreReport?: boolean }) => {
     // Each read is independent and each failure is survivable: a screen that could not render its
     // version chain because the traces table was empty would be a screen that shows nothing.
-    const [v, a, d, f, t, s] = await Promise.allSettled([
+    const [v, a, d, f, t, s, h] = await Promise.allSettled([
       axiomListVersions(),
       axiomActiveConfig(),
       axiomListDecisions(),
       axiomListFindings(),
       axiomListTraces(40),
       axiomListSuiteResults(),
+      axiomListAudits(100),
     ]);
     if (v.status === "fulfilled") setVersions(v.value);
     if (a.status === "fulfilled") setActiveId(a.value.versionId);
@@ -110,10 +116,20 @@ export function AxiomScreen() {
     if (f.status === "fulfilled") setFindings(f.value);
     if (t.status === "fulfilled") setTraces(t.value);
     if (s.status === "fulfilled") setPriors(s.value);
+    if (h.status === "fulfilled") setAudits(h.value);
+    // On a fresh mount, the newest completed pass is what the report area should show — a screen
+    // that makes the last audit invisible until it is re-run would ask the user to pay to read
+    // their own history. Later reloads keep whatever is on screen: a mid-session restore could
+    // clobber a report the user is mid-way through reading.
+    if (opts?.restoreReport && h.status === "fulfilled") {
+      const latest = h.value.find((x) => x.status === "completed");
+      const rep = latest && isImproveReport(latest.report) ? (latest.report as unknown as ImproveReport) : null;
+      if (rep) setReport(rep);
+    }
   }, []);
 
   useEffect(() => {
-    void reload();
+    void reload({ restoreReport: true });
     void fetchDefaultRoot().then(setRoot);
   }, [reload, tick]);
 
@@ -165,6 +181,18 @@ export function AxiomScreen() {
     setProgress("starting");
     const ac = new AbortController();
     controller.current = ac;
+    const auditId = `audit-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const startedAt = Date.now();
+    // Whatever the pass becomes, it becomes a record: completed, refused (you declined the spend),
+    // aborted (you stopped it), or failed. A pass that leaves no row is a pass history cannot
+    // distinguish from a pass that never happened.
+    let outcome: {
+      status: StoredAuditPass["status"];
+      reportDoc: Record<string, unknown>;
+      decision: StoredAuditPass["decision"];
+      candidateId: string | null;
+      baselineId: string | null;
+    } | null = null;
     try {
       const ports = {
         ...createAxiomPorts({
@@ -185,16 +213,51 @@ export function AxiomScreen() {
       // checks it between attempts and hands it to the runner, which aborts the loop in flight.
       const rep = await axiom.improve({ suite: parsed.suite, model: model.trim(), signal: ac.signal });
       setReport(rep);
-      await reload();
+      outcome = {
+        status: "completed",
+        reportDoc: rep as unknown as Record<string, unknown>,
+        decision: rep.decision?.decision ?? null,
+        candidateId: rep.decision?.candidateId ?? null,
+        baselineId: rep.baseline.versionId,
+      };
     } catch (e) {
+      const msg = (e as Error).message;
       // A declined paid run arrives here as `PaidRunRefusedError`, which is a decision rather than a
       // fault — but it is still the honest thing to show, because the alternative is a screen that
       // looks like it ran and produced nothing.
-      setError((e as Error).message);
+      setError(msg);
+      outcome = {
+        status: ac.signal.aborted ? "aborted" : e instanceof PaidRunRefusedError ? "refused" : "failed",
+        reportDoc: { error: msg },
+        decision: null,
+        candidateId: null,
+        baselineId: null,
+      };
     } finally {
       controller.current = null;
       setRunning(false);
       setProgress(null);
+      if (outcome) {
+        try {
+          await axiomPutAudit({
+            id: auditId,
+            startedAt,
+            endedAt: Date.now(),
+            status: outcome.status,
+            suiteId: parsed.suite.id,
+            model: model.trim(),
+            repeats,
+            decision: outcome.decision,
+            candidateId: outcome.candidateId,
+            baselineId: outcome.baselineId,
+            report: outcome.reportDoc,
+          });
+        } catch {
+          // The ledger is additive; a failed write must not mask the pass's own outcome, which the
+          // screen above already shows.
+        }
+        await reload();
+      }
     }
   };
 
@@ -378,6 +441,22 @@ export function AxiomScreen() {
 
   /** A version proposed but not yet judged — the one state where a decision is still open. */
   const candidate = versions.find((v) => v.state === "candidate") ?? null;
+
+  /**
+   * The History timeline: one entry per audit pass, newest first. Decisions recorded before the
+   * ledger existed (or by hand, outside any pass) join the timeline too — a promotion is part of
+   * the story even when there is no audit row around it, and folding the old Decisions list into
+   * this one means the story has one telling, not two.
+   */
+  const history = useMemo(() => {
+    const entries: { at: number; key: string; audit: StoredAuditPass | null; decision: PromotionDecision | null }[] = [];
+    for (const a of audits) entries.push({ at: a.startedAt, key: a.id, audit: a, decision: null });
+    const covered = new Set(audits.map((a) => a.candidateId).filter((x): x is string => x !== null));
+    for (const d of decisions) {
+      if (!covered.has(d.candidateId)) entries.push({ at: d.decidedAt, key: d.id, audit: null, decision: d });
+    }
+    return entries.sort((a, b) => b.at - a.at);
+  }, [audits, decisions]);
 
   return (
     <div className="mx-auto max-w-6xl">
@@ -805,40 +884,29 @@ export function AxiomScreen() {
         )}
       </Section>
 
-      <Section title={`Decisions (${decisions.length})`}>
-        {decisions.length === 0 ? (
-          <p className="text-[12px]" style={{ color: "var(--text-faint)" }}>No promotion has been decided yet.</p>
+      <Section title={`History (${history.length} pass${history.length === 1 ? "" : "es"})`}>
+        {history.length === 0 ? (
+          <p className="text-[12px]" style={{ color: "var(--text-faint)" }}>
+            No audit has run yet. Every pass lands here when it ends — completed, declined, stopped or failed —
+            so the next session can read what this one did.
+          </p>
         ) : (
-          <div className="flex flex-col gap-2">
-            {decisions.map((d) => (
-              <div key={d.id} className="rounded border p-2" style={{ borderColor: "var(--border)" }}>
-                <div className="flex items-baseline gap-2">
-                  <span className="text-[12px] font-semibold" style={{ color: d.decision === "promote" ? "var(--success)" : "var(--danger)" }}>
-                    {d.decision === "promote" ? "promoted" : "rejected"}
-                  </span>
-                  <span className="mono text-[11px]" style={{ color: "var(--text-faint)" }}>
-                    {d.candidateId} over {d.baselineId} · {d.model} · {fmtTime(d.decidedAt)}
-                  </span>
-                </div>
-                <ul className="mt-1 flex flex-col gap-0.5">
-                  {d.deltas.map((m) => (
-                    <li key={m.metric} className="mono text-[11px]" style={{ color: "var(--text-dim)" }}>
-                      {m.metric}: {m.baseline} → {m.candidate} ({m.delta >= 0 ? "+" : ""}{m.delta.toFixed(3)})
-                      {m.beyondNoise ? "" : " · within noise"}
-                    </li>
-                  ))}
-                </ul>
-                <ul className="mt-1 flex flex-col gap-0.5">
-                  {d.checks.filter((c) => !c.passed).map((c) => (
-                    <li key={c.id} className="text-[11px]" style={{ color: "var(--danger)" }}>{c.label}: {c.detail}</li>
-                  ))}
-                  {d.roles.filter((r) => !r.approve).flatMap((r) => r.objections.map((o, i) => (
-                    <li key={`${r.role}-${i}`} className="text-[11px]" style={{ color: "var(--warn)" }}>{r.role}: {o}</li>
-                  )))}
-                </ul>
-              </div>
+          <ol data-testid="axiom-history" className="flex flex-col gap-0">
+            {history.map((e) => (
+              <li key={e.key} className="relative pl-6">
+                <span
+                  aria-hidden
+                  className="absolute left-[5px] top-4 h-2.5 w-2.5 rounded-full"
+                  style={{ background: entryTone(e).color, outline: "2px solid var(--surface)" }}
+                />
+                {e.at !== history[history.length - 1]?.at && (
+                  <span aria-hidden className="absolute left-[10px] top-6 bottom-0 w-px" style={{ background: "var(--border)" }} />
+                )}
+                {e.audit ? <AuditEntry audit={e.audit} onAutopsy={openAutopsy} /> : null}
+                {e.decision ? <DecisionEntry decision={e.decision} /> : null}
+              </li>
             ))}
-          </div>
+          </ol>
         )}
       </Section>
 
@@ -1168,6 +1236,182 @@ function StateChip({ state }: { state: AgentVersion["state"] }) {
   const color =
     state === "active" ? "var(--success)" : state === "rejected" ? "var(--danger)" : state === "candidate" ? "var(--info)" : "var(--text-faint)";
   return <span className="mono rounded px-1.5 py-0.5 text-[10px]" style={{ background: "var(--surface-2)", color }}>{state}</span>;
+}
+
+/**
+ * A stored audit report is trusted structurally, not blindly: completed passes hold a full
+ * `ImproveReport`, the other endings hold `{error}`, and a guard is cheaper than a render that
+ * throws on a shape the store did not write.
+ */
+function isImproveReport(doc: Record<string, unknown>): boolean {
+  return "observation" in doc && "baseline" in doc && "diagnosis" in doc;
+}
+
+/** The dot color and one-line verdict a timeline entry is remembered by. */
+function entryTone(e: { audit: StoredAuditPass | null; decision: PromotionDecision | null }): { color: string; label: string } {
+  const a = e.audit;
+  if (a) {
+    if (a.status === "completed") {
+      if (a.decision === "promote") return { color: "var(--success)", label: `promoted ${shortId(a.candidateId)}` };
+      if (a.decision === "reject") return { color: "var(--danger)", label: "candidate rejected" };
+      return { color: "var(--text-faint)", label: "completed — nothing promoted" };
+    }
+    if (a.status === "refused") return { color: "var(--warn)", label: "refused — the spend was declined" };
+    if (a.status === "aborted") return { color: "var(--warn)", label: "stopped part way" };
+    return { color: "var(--danger)", label: "failed" };
+  }
+  const d = e.decision!;
+  return d.decision === "promote"
+    ? { color: "var(--success)", label: `promoted ${shortId(d.candidateId)}` }
+    : { color: "var(--danger)", label: "candidate rejected" };
+}
+
+const shortId = (id: string | null) => (id ? (id.length > 10 ? `…${id.slice(-8)}` : id) : "—");
+
+/** One audit pass on the timeline: verdict, delta chips, and the pass's own seven-stage summary. */
+function AuditEntry({ audit, onAutopsy }: { audit: StoredAuditPass; onAutopsy: (runId: string) => void }) {
+  const tone = entryTone({ audit, decision: null });
+  const rep = isImproveReport(audit.report) ? (audit.report as unknown as ImproveReport) : null;
+  const error = typeof audit.report.error === "string" ? audit.report.error : null;
+  const deltas = rep?.decision?.deltas ?? [];
+  return (
+    <div className="border-b py-2.5 last:border-b-0" style={{ borderColor: "var(--border)" }}>
+      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+        <span className="text-[12px] font-semibold" style={{ color: tone.color }}>{tone.label}</span>
+        <span className="mono text-[11px]" style={{ color: "var(--text-faint)" }}>
+          {audit.suiteId ?? "—"} · {audit.model ?? "—"} · {fmtTime(audit.startedAt)}
+        </span>
+        <span
+          className="rounded px-1.5 py-0.5 text-[10px]"
+          style={{ background: "var(--surface-2)", color: tone.color }}
+        >
+          {audit.status}
+        </span>
+      </div>
+      {error && <div className="mt-0.5 text-[11px]" style={{ color: "var(--danger)" }}>{error}</div>}
+      {deltas.length > 0 && (
+        <div className="mt-1 flex flex-wrap gap-1">
+          {deltas.map((m) => (
+            <span
+              key={m.metric}
+              className="mono rounded px-1.5 py-0.5 text-[10px]"
+              style={{ background: "var(--surface-2)", color: m.beyondNoise ? "var(--text)" : "var(--text-faint)" }}
+              title={`${m.baseline} → ${m.candidate}${m.beyondNoise ? "" : " · within noise"}`}
+            >
+              {m.metric} {m.delta >= 0 ? "+" : ""}{m.delta.toFixed(3)}{m.beyondNoise ? "" : " ·noise"}
+            </span>
+          ))}
+        </div>
+      )}
+      {(rep || (audit.suiteId && error)) && (
+        <details className="mt-1">
+          <summary className="cursor-pointer select-none text-[11px]" style={{ color: "var(--text-faint)" }}>
+            the pass in seven stages
+          </summary>
+          <div className="mt-1.5 pl-3">
+            {rep ? (
+              <>
+                <StageSummary rep={rep} />
+                {rep.notDone.length > 0 && (
+                  <div className="mt-1.5">
+                    <div className="text-[11px] font-medium" style={{ color: "var(--warn)" }}>What this pass did not do</div>
+                    <ul className="mt-0.5 flex flex-col gap-0.5">
+                      {rep.notDone.map((n, i) => (
+                        <li key={i} className="text-[11px]" style={{ color: "var(--text-dim)" }}>{n}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                <AutopsyLinks rep={rep} onAutopsy={onAutopsy} />
+              </>
+            ) : (
+              <p className="text-[11px]" style={{ color: "var(--text-dim)" }}>
+                The pass ended before a report existed — its suite, model and ending are the record.
+              </p>
+            )}
+          </div>
+        </details>
+      )}
+    </div>
+  );
+}
+
+/** The seven stages as one line each, from the stored report — the shape a pass took, compact. */
+function StageSummary({ rep }: { rep: ImproveReport }) {
+  const line = (n: string, name: string, text: string, color?: string) => (
+    <li className="flex gap-2 text-[11px]" style={{ color: color ?? "var(--text-dim)" }}>
+      <span className="mono w-16 shrink-0" style={{ color: "var(--text-faint)" }}>{n} {name}</span>
+      <span>{text}</span>
+    </li>
+  );
+  const guardian = rep.guardian;
+  return (
+    <ul className="flex flex-col gap-0.5">
+      {line("01", "Observe", `${rep.observation.totals.runs} run(s) read · ${rep.observation.totals.toolCalls} tool call(s)`)}
+      {line("02", "Evaluate", `baseline ${pct(rep.baseline.passRate)} on ${rep.baseline.tasks.length} task(s) × ${rep.baseline.repeats}${rep.candidateResult ? ` · candidate ${pct(rep.candidateResult.passRate)}` : ""}`)}
+      {line("03", "Diagnose", rep.diagnosis.findings.length === 0 ? "no detector fired" : `${rep.diagnosis.findings.length} finding(s)`, rep.diagnosis.findings.some(isSerious) ? "var(--danger)" : undefined)}
+      {line("04", "Design", rep.proposals.length === 0 ? "nothing to propose" : `${rep.proposals.length} proposal(s) — ${rep.proposals[0]?.title ?? ""}`)}
+      {line("05", "Modify", rep.candidate ? `candidate ${shortId(rep.candidate.id)}` : "no candidate built")}
+      {line("06", "Validate", guardian ? (guardian.passed ? "guardian passed" : "guardian refused") : "skipped", guardian && !guardian.passed ? "var(--danger)" : undefined)}
+      {line("07", "Evolve", rep.decision ? (rep.decision.decision === "promote" ? `promoted ${shortId(rep.decision.candidateId)}` : `rejected ${shortId(rep.decision.candidateId)}`) : "no decision", rep.decision?.decision === "promote" ? "var(--success)" : rep.decision ? "var(--danger)" : undefined)}
+    </ul>
+  );
+}
+
+/** The eval runs this pass's numbers came from, each openable as an autopsy. */
+function AutopsyLinks({ rep, onAutopsy }: { rep: ImproveReport; onAutopsy: (runId: string) => void }) {
+  const runIds = [
+    ...new Set(
+      [...rep.baseline.attemptSummaries, ...(rep.candidateResult?.attemptSummaries ?? [])].map((a) => a.runId),
+    ),
+  ];
+  if (runIds.length === 0) return null;
+  return (
+    <div className="mt-1.5 flex flex-wrap items-center gap-1">
+      <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>Autopsy the runs:</span>
+      {runIds.slice(0, 8).map((id) => (
+        <Button key={id} onClick={() => onAutopsy(id)} ariaLabel={`Open the autopsy for run ${id}`}>
+          …{id.slice(-6)}
+        </Button>
+      ))}
+      {runIds.length > 8 && <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>+{runIds.length - 8} more in Recorded runs</span>}
+    </div>
+  );
+}
+
+/** A decision with no audit row around it — recorded before the ledger existed. */
+function DecisionEntry({ decision: d }: { decision: PromotionDecision }) {
+  return (
+    <div className="border-b py-2.5 last:border-b-0" style={{ borderColor: "var(--border)" }}>
+      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+        <span className="text-[12px] font-semibold" style={{ color: d.decision === "promote" ? "var(--success)" : "var(--danger)" }}>
+          {d.decision === "promote" ? "promoted" : "rejected"} {shortId(d.candidateId)}
+        </span>
+        <span className="mono text-[11px]" style={{ color: "var(--text-faint)" }}>
+          over {shortId(d.baselineId)} · {d.model} · {fmtTime(d.decidedAt)}
+        </span>
+        <span className="rounded px-1.5 py-0.5 text-[10px]" style={{ background: "var(--surface-2)", color: "var(--text-faint)" }}>
+          no audit record — decided outside a pass
+        </span>
+      </div>
+      <ul className="mt-1 flex flex-col gap-0.5">
+        {d.deltas.map((m) => (
+          <li key={m.metric} className="mono text-[11px]" style={{ color: "var(--text-dim)" }}>
+            {m.metric}: {m.baseline} → {m.candidate} ({m.delta >= 0 ? "+" : ""}{m.delta.toFixed(3)})
+            {m.beyondNoise ? "" : " · within noise"}
+          </li>
+        ))}
+      </ul>
+      <ul className="mt-1 flex flex-col gap-0.5">
+        {d.checks.filter((c) => !c.passed).map((c) => (
+          <li key={c.id} className="text-[11px]" style={{ color: "var(--danger)" }}>{c.label}: {c.detail}</li>
+        ))}
+        {d.roles.filter((r) => !r.approve).flatMap((r) => r.objections.map((o, i) => (
+          <li key={`${r.role}-${i}`} className="text-[11px]" style={{ color: "var(--warn)" }}>{r.role}: {o}</li>
+        )))}
+      </ul>
+    </div>
+  );
 }
 
 /**

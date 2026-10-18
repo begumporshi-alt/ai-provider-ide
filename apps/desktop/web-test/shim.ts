@@ -117,6 +117,7 @@ const axiomVersions: Row[] = [];
 const axiomFindings: Row[] = [];
 const axiomSuiteResults: Row[] = [];
 const axiomDecisions: Row[] = [];
+const axiomAudits: Row[] = [];
 const AXIOM_VERSION_STATES = ["candidate", "active", "rejected", "retired"];
 const AXIOM_SEVERITIES = ["info", "minor", "major", "critical"];
 const AXIOM_ROOT_CAUSES = ["model", "prompt", "memory", "tool", "orchestration", "infra"];
@@ -2923,6 +2924,26 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       const limit = (args.limit as number) ?? 100;
       return [...axiomDecisions]
         .sort((a, b) => (b.decidedAt as number) - (a.decidedAt as number))
+        .slice(0, limit)
+        .map(cloneJson);
+    }
+    case "axiom_audit_put": {
+      const a = args.audit as Row;
+      const STATUSES = ["completed", "refused", "aborted", "failed"];
+      if (!STATUSES.includes(String(a.status))) throw new Error(`unknown audit status '${a.status}'`);
+      if (a.decision !== null && a.decision !== "promote" && a.decision !== "reject") {
+        throw new Error(`unknown decision '${a.decision}'`);
+      }
+      if (axiomAudits.some((x) => x.id === a.id)) {
+        throw new Error(`audit pass ${a.id} already exists — a re-run is a new record, not an edit`);
+      }
+      axiomAudits.push(cloneJson(a));
+      return null;
+    }
+    case "axiom_audits_list": {
+      const limit = (args.limit as number) ?? 200;
+      return [...axiomAudits]
+        .sort((a, b) => (b.startedAt as number) - (a.startedAt as number) || String(b.id).localeCompare(String(a.id)))
         .slice(0, limit)
         .map(cloneJson);
     }
