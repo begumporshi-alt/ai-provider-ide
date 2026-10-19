@@ -11,6 +11,7 @@
  * specifics. A flat store has to guess how much to hand back; this one does not.
  */
 import {
+  assignMemoryScope,
   captureMemories,
   captureMemory,
   listMemories,
@@ -555,7 +556,16 @@ export async function captureAndRecord(
  * rides along in recall. Session-null so the fact outlives the conversation.
  */
 export async function captureCore(text: string): Promise<Memory | null> {
-  return captureAndRecord("L3", text, null, { pinned: true });
+  const m = await captureAndRecord("L3", text, null, { pinned: true });
+  if (!m) return null;
+  // L3 is identity. Without this it is born capture-only like every other row and never
+  // reaches a prompt — the exact failure the scoped read path cannot fix on its own.
+  try {
+    await assignMemoryScope(m.id, { kind: "global" });
+  } catch {
+    // The row is still pinned and visible in the Memory screen; a later save can re-scope it.
+  }
+  return m;
 }
 
 /** Edit the text of an existing core fact. Returns false when the id was not found. */

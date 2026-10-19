@@ -36,6 +36,7 @@ const listMemories = vi.spyOn(store, "listMemories");
 const listScopedMemories = vi.spyOn(store, "listScopedMemories");
 const sessionMemories = vi.spyOn(store, "sessionMemories");
 const updateMemory = vi.spyOn(store, "updateMemory");
+const assignMemoryScope = vi.spyOn(store, "assignMemoryScope");
 const recordContext = vi.spyOn(store, "recordContext");
 
 function mem(id: string, layer: Memory["layer"], text: string, pinned = false): Memory {
@@ -58,6 +59,7 @@ describe("memory engine", () => {
     listScopedMemories.mockReset();
     sessionMemories.mockReset();
     updateMemory.mockReset();
+    assignMemoryScope.mockReset();
     recordContext.mockReset();
     captureMemories.mockResolvedValue(0);
     // Echo the capture back with the id a stored row would carry, so the distilled rows a test
@@ -69,6 +71,7 @@ describe("memory engine", () => {
     listMemories.mockResolvedValue([]);
     sessionMemories.mockResolvedValue([]);
     updateMemory.mockResolvedValue(true);
+    assignMemoryScope.mockResolvedValue(true);
     recordContext.mockResolvedValue();
     startSession("mem-test");
   });
@@ -368,6 +371,27 @@ describe("memory engine", () => {
         expect.objectContaining({ layer: "L3", text: "Lives in Dhaka", pinned: true }),
       );
       expect(m).not.toBeNull();
+    });
+
+    it("marks a new core fact global so it is not capture-only", async () => {
+      captureMemory.mockResolvedValue(mem("core-1", "L3", "I am Tushu", true));
+      assignMemoryScope.mockResolvedValue(true);
+
+      const m = await captureCore("I am Tushu");
+
+      expect(m?.id).toBe("core-1");
+      expect(assignMemoryScope).toHaveBeenCalledWith("core-1", { kind: "global" });
+    });
+
+    it("keeps the fact when the scope write fails", async () => {
+      // A memory write must never fail a chat: the row is already stored and pinned, and a later
+      // save can re-scope it, so a failed promotion is swallowed rather than thrown.
+      captureMemory.mockResolvedValue(mem("core-2", "L3", "I am Tushu", true));
+      assignMemoryScope.mockRejectedValue(new Error("admin route unavailable"));
+
+      const m = await captureCore("I am Tushu");
+
+      expect(m?.id).toBe("core-2");
     });
 
     it("editCore routes through updateMemory and survives a missing id", async () => {

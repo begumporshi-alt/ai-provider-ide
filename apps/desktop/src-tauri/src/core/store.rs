@@ -351,6 +351,7 @@ const DATA_MIGRATIONS: &[DataMigration] = &[
     ("0029_axiom_evolution", create_axiom_tables),
     ("0030_session_transcript_search", create_session_messages_fts),
     ("0031_axiom_audit_history", create_axiom_audits),
+    ("0032_identity_scope", backfill_identity_scope),
 ];
 
 /// 0029 — AXIOM's four tables: the version chain, the finding register, the eval results and the
@@ -1068,6 +1069,21 @@ fn backfill_memory_scope(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()>
     )
 }
 
+/// 0032 — L3 core facts are identity, and identity is the one category that must ride along
+/// everywhere. Existing rows were captured before scoping existed, so every one landed
+/// capture-only. Promoting the pinned L3 rows is the narrowest backfill that makes "who the
+/// user is" visible without promoting project internals.
+fn backfill_identity_scope(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute(
+        "UPDATE memories
+            SET scope_global = 1, scope_project = NULL, scope_agent = NULL
+          WHERE layer = 'L3' AND pinned = 1
+            AND scope_global = 0 AND scope_project IS NULL",
+        [],
+    )?;
+    Ok(())
+}
+
 /// Live context: sessions, a bounded ring of turns per session, and the state an agent pushes
 /// (open files, current plan). Design §3.2.
 ///
@@ -1540,6 +1556,56 @@ mod tests {
         assert_eq!(global, 0, "and unresolved is not injectable");
     }
 
+    /// 0032 promotes identity, not everything that happens to be pinned. A row is promoted only
+    /// when it is L3 (identity) *and* pinned *and* unscoped — a project's pinned core fact belongs
+    /// to that project, and an unpinned atom is not identity at all.
+    #[test]
+    fn identity_backfill_promotes_only_unscoped_pinned_l3_rows() {
+        let dir = std::env::temp_dir().join(format!("aip-identity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::open(&dir).expect("open+migrate");
+        {
+            let conn = s.conn.lock().unwrap();
+            for (id, layer, pinned, project) in [
+                ("pinned-l3", "L3", 1, None),
+                ("loose-l3", "L3", 0, None),
+                ("pinned-l1", "L1", 1, None),
+                ("project-l3", "L3", 1, Some("repo-a")),
+            ] {
+                conn.execute(
+                    "INSERT INTO memories (id, layer, text, pinned, scope_project, created_at, updated_at)
+                     VALUES (?1, ?2, 'fact', ?3, ?4, 1, 1)",
+                    rusqlite::params![id, layer, pinned, project],
+                )
+                .unwrap();
+            }
+            // Rewind the tail only: these rows are what a database captured before 0032 holds.
+            conn.execute("DELETE FROM schema_version WHERE version >= 32", []).unwrap();
+        }
+
+        s.migrate().expect("0032 re-applies to an existing database");
+
+        let conn = s.conn.lock().unwrap();
+        let scope = |id: &str| -> (i64, Option<String>) {
+            conn.query_row(
+                "SELECT scope_global, scope_project FROM memories WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(scope("pinned-l3"), (1, None), "identity is visible everywhere");
+        assert_eq!(scope("loose-l3"), (0, None), "an unpinned L3 row is not identity");
+        assert_eq!(scope("pinned-l1"), (0, None), "a pinned atom is not identity");
+        assert_eq!(
+            scope("project-l3"),
+            (0, Some("repo-a".to_string())),
+            "a project's core fact stays the project's, not everyone's"
+        );
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The ring has to be enforced by the schema, not by a caller remembering to prune: a turn
     /// table that grows without limit is the failure this design explicitly guards against.
     #[test]
@@ -1729,11 +1795,11 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0031 data migrations.
-        assert_eq!(info.schema_version, 31);
+        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0032 data migrations.
+        assert_eq!(info.schema_version, 32);
         // The two lists must stay numbered as one sequence: a data migration that reused a SQL
         // version number would be silently skipped on every database that already had it.
-        assert_eq!(31, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
+        assert_eq!(32, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
         // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
         // P6 agent-run, P7 memory and AXIOM evolution tables. `memories_fts` is a virtual table, so it shows up
         // in sqlite_master as a table too — assert it, because BM25 recall silently returns
@@ -1839,8 +1905,8 @@ mod tests {
             .unwrap();
         }
 
-        s.migrate().expect("re-migrate applies 0029..0031");
-        assert_eq!(s.info().unwrap().schema_version, 31);
+        s.migrate().expect("re-migrate applies 0029..0032");
+        assert_eq!(s.info().unwrap().schema_version, 32);
 
         let conn = s.conn.lock().unwrap();
         let runs: i64 = conn
