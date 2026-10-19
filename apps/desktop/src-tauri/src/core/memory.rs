@@ -645,7 +645,7 @@ pub fn list(store: &Store, layer: Option<&str>, limit: usize) -> Result<Vec<Memo
 ///
 /// Visibility mirrors `recall_inner` exactly: an explicit global mark, or a project
 /// match. An unresolved project sees pinned global rows only — never everything.
-/// `scope: None` keeps the old unscoped behaviour for the Memory screen.
+/// `scope: None` keeps unscoped visibility (no scope filter) for the Memory screen.
 pub fn list_scoped(
     store: &Store,
     scope: Option<&RecallScope>,
@@ -1772,6 +1772,69 @@ mod memory_tests {
         let rows = list_scoped(&s, Some(&scope_of(Some("p_next"), None)), 50, true).unwrap();
         let ids: Vec<&str> = rows.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["name"], "pinned_only narrows the manifest header");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// One rule, two readers. The session manifest and prompt injection must never disagree about
+    /// what a scope can see: a row the gateway would inject is a row the manifest shows, and no
+    /// other. Seeds one row per category so an edit to either predicate fails here.
+    ///
+    /// Recall gets the gateway's own layer filter (`context_scope::inject_context` asks for L1–L3)
+    /// because `recall_scoped(..., None, ...)` includes L0 while `list_scoped` never does. The L0
+    /// row is seeded anyway, and asserted absent, to pin the list side's exclusion.
+    #[test]
+    fn scoped_list_and_scoped_recall_agree_on_every_scope() {
+        let (s, d) = temp_store("scope-list-parity");
+        scoped(&s, "global-pinned", "L3", "fact global pinned", None, None, 1, 1);
+        scoped(&s, "global", "L1", "fact global", None, None, 1, 0);
+        scoped(&s, "alpha", "L1", "fact alpha", Some("alpha"), None, 0, 0);
+        scoped(&s, "beta", "L1", "fact beta", Some("beta"), None, 0, 0);
+        scoped(&s, "alpha-cursor", "L1", "fact alpha cursor", Some("alpha"), Some("cursor"), 0, 0);
+        scoped(&s, "unscoped", "L1", "fact unscoped", None, None, 0, 0);
+        scoped(&s, "raw", "L0", "fact verbatim turn", Some("alpha"), None, 0, 0);
+        scoped(&s, "replaced", "L1", "fact alpha replaced", Some("alpha"), None, 0, 0);
+        s.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE memories SET superseded_at = 1 WHERE id = 'replaced'", [])
+            .unwrap();
+
+        // The exclusions `list_scoped` owns outright: verbatim turns and superseded rows.
+        let alpha_ids: Vec<String> =
+            list_scoped(&s, Some(&scope_of(Some("alpha"), None)), 50, false)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect();
+        assert!(
+            !alpha_ids.contains(&"raw".to_string()),
+            "L0 is not manifest material: {alpha_ids:?}"
+        );
+        assert!(
+            !alpha_ids.contains(&"replaced".to_string()),
+            "a superseded row is out of the live set: {alpha_ids:?}"
+        );
+
+        let layers = ["L1".to_string(), "L2".to_string(), "L3".to_string()];
+        for (label, scope) in [
+            ("alpha", scope_of(Some("alpha"), None)),
+            ("beta", scope_of(Some("beta"), None)),
+            ("unresolved", scope_of(None, None)),
+        ] {
+            let mut listed: Vec<String> = list_scoped(&s, Some(&scope), 50, false)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect();
+            let mut recalled: Vec<String> = recall_scoped(&s, "fact", 50, Some(&layers), &scope)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect();
+            listed.sort();
+            recalled.sort();
+            assert_eq!(listed, recalled, "list and recall disagree for scope {label}");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 
