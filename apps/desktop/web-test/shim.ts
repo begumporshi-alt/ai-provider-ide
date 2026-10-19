@@ -410,14 +410,34 @@ const projectKey = (root: string): string => {
 const wireMemory = (m: Row): Row => ({ ...m, pinned: Boolean(m.pinned) });
 
 /**
- * 0033 metadata a row carries from birth. Mirrors the columns `add_memory_metadata` adds and the
- * conservative layer heuristic in `capture`: L3 is identity, L0 is conversation, the distilled
- * middle is a project fact until something classifies it better. A row that predates the columns
- * gets the same defaults filled in on touch.
+ * The webview-side mirror of `memory.rs::classify_kind`, including its order: capability before
+ * preference before decision. The order is load-bearing — an atom that mentions "git clone is not
+ * available" is a capability claim even if it also says "prefer" — and Task 7's contradicted
+ * capability path depends on the claim landing as `capability` rather than `project_fact`.
  */
-function memoryMetadata(layer: unknown): Row {
+function classifyKind(layer: unknown, text: unknown): string {
+  if (layer === "L0") return "conversation";
+  if (layer === "L3") return "identity";
+  const t = String(text ?? "").toLowerCase();
+  const CAPABILITY = [
+    "git clone", "git fetch", "cannot run", "can't run", "not available",
+    "no access", "unable to", "no real shell", "shell is available",
+  ];
+  if (CAPABILITY.some((p) => t.includes(p))) return "capability";
+  const PREFERENCE = ["prefers", "prefer ", "likes ", "wants ", "always use", "never use", "concise"];
+  if (PREFERENCE.some((p) => t.includes(p))) return "preference";
+  const DECISION = ["decided", "we will", "we'll", "chosen", "approved", "agreed"];
+  if (DECISION.some((p) => t.includes(p))) return "decision";
+  return "project_fact";
+}
+
+/**
+ * 0033 metadata a row carries from birth. A row that predates the columns gets the same defaults
+ * filled in on touch.
+ */
+function memoryMetadata(layer: unknown, text: unknown): Row {
   return {
-    kind: layer === "L3" ? "identity" : layer === "L0" ? "conversation" : "project_fact",
+    kind: classifyKind(layer, text),
     source: "inferred",
     verified: null,
     expires_at: null,
@@ -428,9 +448,14 @@ function memoryMetadata(layer: unknown): Row {
 
 /** Fill metadata columns on a row stored before 0033, without overwriting a real value. */
 function fillMemoryMetadata(row: Row): void {
-  for (const [k, v] of Object.entries(memoryMetadata(row.layer))) {
+  for (const [k, v] of Object.entries(memoryMetadata(row.layer, row.text))) {
     if (row[k] === undefined) row[k] = v;
   }
+}
+
+/** 0033: an expired row is kept but can no longer be injected. */
+function isExpired(row: Row, now = Date.now()): boolean {
+  return row.expires_at != null && Number(row.expires_at) <= now;
 }
 
 const STEP_KINDS = ["assistant", "tool_call", "tool_result", "done", "denied"];
@@ -2423,7 +2448,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         created_at: now, updated_at: now, pinned: args.pinned ? 1 : 0,
         scope: { ...DEFAULT_SCOPE },
         superseded_at: null,
-        ...memoryMetadata(layer),
+        ...memoryMetadata(layer, text),
       };
       memories.push(row);
       return wireMemory(row);
@@ -2468,7 +2493,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
             created_at: now, updated_at: now, pinned: it.pinned ? 1 : 0,
             scope: { ...DEFAULT_SCOPE },
             superseded_at: null,
-            ...memoryMetadata(it.layer),
+            ...memoryMetadata(it.layer, text),
           });
         }
         n += 1;
@@ -2491,6 +2516,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       const project = root ? projectKey(root) : null;
       const visible = memories.filter((m) => {
         if (m.superseded_at != null) return false;
+        if (isExpired(m)) return false;
         if (!project) return true; // the Memory screen's intentional global search
         const sc = (m.scope as Row | undefined) ?? DEFAULT_SCOPE;
         return Number(sc.global) === 1 || sc.project === project;
@@ -2536,6 +2562,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       return memories
         .filter((m) => m.layer !== "L0")
         .filter((m) => m.superseded_at == null)
+        .filter((m) => !isExpired(m))
         .filter((m) => {
           const sc = (m.scope as Row | undefined) ?? DEFAULT_SCOPE;
           return Number(sc.global) === 1 || sc.project === project;

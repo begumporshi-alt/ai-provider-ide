@@ -360,20 +360,27 @@ pub fn capture(store: &Store, input: &MemoryInput) -> Result<Memory, String> {
             .map_err(|e| e.to_string())?;
             // Re-recording refreshes text and timestamp but deliberately leaves scope alone — an
             // operator's decision about where a memory may be injected must survive a re-distill.
-            // Read it back rather than assuming the default, or the review surface would show a
-            // scoped row as unscoped.
-            let scope = tx
+            // The metadata columns are likewise untouched by the UPDATE, so read the whole row
+            // back rather than reporting defaults for values the database still holds.
+            let (scope, verified, expires_at, retrieval_count, last_retrieved_at) = tx
                 .query_row(
-                    "SELECT scope_user, scope_project, scope_agent, scope_global
+                    "SELECT scope_user, scope_project, scope_agent, scope_global,
+                            verified, expires_at, retrieval_count, last_retrieved_at
                      FROM memories WHERE id = ?1",
                     params![id],
                     |r| {
-                        Ok(MemoryScope {
-                            user: r.get(0)?,
-                            project: r.get(1)?,
-                            agent: r.get(2)?,
-                            global: r.get::<_, i64>(3)? != 0,
-                        })
+                        Ok((
+                            MemoryScope {
+                                user: r.get(0)?,
+                                project: r.get(1)?,
+                                agent: r.get(2)?,
+                                global: r.get::<_, i64>(3)? != 0,
+                            },
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                        ))
                     },
                 )
                 .map_err(|e| e.to_string())?;
@@ -391,10 +398,10 @@ pub fn capture(store: &Store, input: &MemoryInput) -> Result<Memory, String> {
                 superseded_at: None,
                 kind: input.kind.clone().or(existing_kind),
                 source: input.source.clone().unwrap_or(existing_source),
-                verified: None,
-                expires_at: None,
-                retrieval_count: 0,
-                last_retrieved_at: None,
+                verified,
+                expires_at,
+                retrieval_count,
+                last_retrieved_at,
             }
         }
         None => {
@@ -1088,13 +1095,15 @@ pub fn stats(store: &Store) -> Result<MemoryStats, String> {
     drop(stmt);
     // Same predicate `recall_scoped` gates on, so the count and the recall path can never disagree.
     // §6.4.3: a superseded row is scoped but no longer reachable, so counting it would report rows
-    // as injectable that recall will never return.
+    // as injectable that recall will never return. Expiry is the same kind of exclusion: the row
+    // survives, but it can no longer reach a prompt.
     s.injectable = conn
         .query_row(
             "SELECT COUNT(*) FROM memories
               WHERE superseded_at IS NULL
+                AND (expires_at IS NULL OR expires_at > ?1)
                 AND (scope_global = 1 OR scope_project IS NOT NULL)",
-            [],
+            params![now_ms()],
             |r| r.get::<_, i64>(0),
         )
         .map_err(|e| e.to_string())?;
@@ -2220,11 +2229,17 @@ mod memory_tests {
         let (s, d) = temp_store("expiry");
         scoped(&s, "live", "L1", "the gateway port is 8787", Some("alpha"), None, 0, 0);
         scoped(&s, "gone", "L1", "the gateway port is 9090", Some("alpha"), None, 0, 0);
+        assert_eq!(stats(&s).unwrap().injectable, 2, "both are injectable to start with");
         s.conn
             .lock()
             .unwrap()
             .execute("UPDATE memories SET expires_at = 1 WHERE id = 'gone'", [])
             .unwrap();
+        assert_eq!(
+            stats(&s).unwrap().injectable,
+            1,
+            "an expired row is not injectable — the stat must agree with recall"
+        );
 
         let hits =
             recall_scoped(&s, "gateway port", 10, None, &scope_of(Some("alpha"), None)).unwrap();
@@ -2275,6 +2290,33 @@ mod memory_tests {
         .unwrap();
         assert_eq!(again.kind.as_deref(), Some("decision"), "a re-record keeps the classification");
 
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A re-record does not touch the metadata columns in SQL, so the row it returns has to carry
+    /// what is actually still in the table — not the defaults a fresh row would have.
+    #[test]
+    fn re_recording_returns_the_metadata_it_preserved() {
+        let (s, d) = temp_store("rerecord-meta");
+        let m = capture(&s, &input("L1", "the gateway listens on 8787")).unwrap();
+        s.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE memories
+                    SET verified = 'live', expires_at = 123456789,
+                        retrieval_count = 7, last_retrieved_at = 42
+                  WHERE id = ?1",
+                params![m.id],
+            )
+            .unwrap();
+
+        let again = capture(&s, &input("L1", "the gateway listens on 8787")).unwrap();
+        assert_eq!(again.id, m.id, "the same row was refreshed");
+        assert_eq!(again.verified.as_deref(), Some("live"));
+        assert_eq!(again.expires_at, Some(123_456_789));
+        assert_eq!(again.retrieval_count, 7);
+        assert_eq!(again.last_retrieved_at, Some(42));
         let _ = std::fs::remove_dir_all(&d);
     }
 
