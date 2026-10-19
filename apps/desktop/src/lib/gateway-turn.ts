@@ -46,6 +46,28 @@ export interface GatewayGenerateRequest {
   onReasoning?: (text: string) => void;
   /** UsageTokens-compatible counts (the wire reports none, so `cached_tokens` stays unset). */
   onUsage?: (usage: { prompt_tokens: number; completion_tokens: number }) => void;
+  /** A retry the engine is about to perform; painted as a progress line, never as answer text. */
+  onRetry?: (notice: GatewayRetryNotice) => void;
+}
+
+/** The engine's retry progress frame (`aip_retry` on a contentless OpenAI chunk). */
+export interface GatewayRetryNotice {
+  provider?: string;
+  key?: string;
+  /** The upcoming dial, 1-based. */
+  attempt?: number;
+  /** Configured total dials for this candidate, including the original. */
+  max?: number;
+  delay_ms?: number;
+  reason?: string;
+}
+
+/** The one-line label the Assistant shows while a retry is pending. */
+export function retryNoticeLabel(n: GatewayRetryNotice): string {
+  const where = [n.provider, n.key].filter(Boolean).join(" · ");
+  const attempt = n.attempt && n.max ? `attempt ${n.attempt}/${n.max}` : "retrying";
+  const seconds = n.delay_ms && n.delay_ms > 0 ? Math.max(1, Math.round(n.delay_ms / 1000)) : 0;
+  return `Retrying ${where ? `${where} — ` : ""}${attempt}${seconds ? ` in ${seconds}s` : ""}…`;
 }
 
 /** Serving attribution, when the wire carries it (`served_by` on the terminal chunk). */
@@ -81,6 +103,8 @@ interface WireChunk {
     finish_reason?: string | null;
     usage?: { prompt_tokens?: number; completion_tokens?: number };
     served_by?: ServedBy;
+    /** Engine retry progress; not part of the OpenAI dialect, ignored by other clients. */
+    aip_retry?: GatewayRetryNotice;
   }>;
   error?: { message?: string };
 }
@@ -139,6 +163,7 @@ export async function gatewayGenerate(
             completion_tokens: u.completion_tokens ?? 0,
           })
       : undefined,
+    onRetry: req.onRetry,
   };
 
   const chunks = consumeSse(res.body, {
@@ -275,6 +300,7 @@ async function* consumeSse(
     onReasoning: (t: string) => void;
     onUsage?: (usage: { prompt_tokens?: number; completion_tokens?: number }) => void;
     onServed?: (s: ServedBy) => void;
+    onRetry?: (n: GatewayRetryNotice) => void;
   },
   _signal?: AbortSignal,
 ): AsyncGenerator<string> {
@@ -311,6 +337,7 @@ async function* consumeSse(
       }
       if (choice?.usage) handlers.onUsage?.(choice.usage);
       if (choice?.served_by) handlers.onServed?.(choice.served_by);
+      if (choice?.aip_retry) handlers.onRetry?.(choice.aip_retry);
       if (choice?.finish_reason) handlers.onFinish?.(choice.finish_reason);
       if (delta.content) return delta.content;
     }

@@ -496,6 +496,8 @@ pub(crate) async fn messages_h(
                     }
                     // Serving attribution is OpenAI-dialect-only for now (A1 Phase 2).
                     BridgeMsg::Served { .. } => {}
+                    // Progress only; this dialect has no client surface for it.
+                    BridgeMsg::Retry { .. } => {}
                 }
             }
             // A tool turn already closed the text block above; a plain text turn closes it here.
@@ -602,6 +604,8 @@ pub(crate) async fn messages_h(
             }
             // Serving attribution is OpenAI-dialect-only for now (A1 Phase 2).
             BridgeMsg::Served { .. } => {}
+            // Progress only; this dialect has no client surface for it.
+            BridgeMsg::Retry { .. } => {}
         }
     }
     drop(slot);

@@ -465,6 +465,19 @@ pub enum BridgeMsg {
     /// `ProseGate` — the gate holds *prose* back across tool-loop turns, and reasoning is not part
     /// of any turn's answer.
     Reasoning(String),
+    /// A retry the engine is about to perform, for the client's progress channel.
+    ///
+    /// Not a wire event in any dialect. The OpenAI-shaped gateway surfaces it as an `aip_retry`
+    /// field on a contentless chunk, which OpenAI clients ignore and the Assistant paints; the
+    /// other dialects drop it. It never counts as output and never disarms a disposition.
+    Retry {
+        provider: String,
+        key: String,
+        attempt: usize,
+        max: usize,
+        delay_ms: u64,
+        reason: String,
+    },
     /// Client-declared tool calls to hand back untouched (pass-through mode only).
     ToolCalls(Value),
     Result(Value),

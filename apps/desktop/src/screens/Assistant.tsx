@@ -3334,6 +3334,19 @@ function Chat({
                   {m.reasoning ? (
                     <ReasoningPanel text={m.reasoning} streaming={busy && i === msgs.length - 1} />
                   ) : null}
+                  {/* The engine's retry notice. Without it a slow gateway is an empty bubble for
+                      up to 44s; with it the wait reads as `attempt 2/2 in 2s`. Cleared on the
+                      first token and in the turn's `finally`, so it cannot outlive the turn. */}
+                  {m.retryStatus ? (
+                    <div
+                      role="status"
+                      aria-live="polite"
+                      className="mb-1 text-[12px] italic"
+                      style={{ color: "var(--text-faint)" }}
+                    >
+                      {m.retryStatus}
+                    </div>
+                  ) : null}
                   {/* A plan renders inside its tool call, not here (see `ToolCallRow`): the plan is
                       what `exit_plan_mode` presented, so the card hangs on the call that carried it
                       rather than being guessed from a message's text. */}

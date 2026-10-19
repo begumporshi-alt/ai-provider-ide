@@ -367,6 +367,8 @@ pub(crate) async fn responses_h(
                     }
                     // Serving attribution is OpenAI-dialect-only for now (A1 Phase 2).
                     BridgeMsg::Served { .. } => {}
+                    // Progress only; this dialect has no client surface for it.
+                    BridgeMsg::Retry { .. } => {}
                 }
             }
             if !tool_pending {
@@ -511,6 +513,8 @@ pub(crate) async fn responses_h(
             }
             // Serving attribution is OpenAI-dialect-only for now (A1 Phase 2).
             BridgeMsg::Served { .. } => {}
+            // Progress only; this dialect has no client surface for it.
+            BridgeMsg::Retry { .. } => {}
         }
     }
     drop(slot);

@@ -1999,6 +1999,7 @@ mod tests {
             on_usage: None,
             on_finish: None,
             on_reasoning: None,
+            on_retry: None,
             max_attempts: None,
             prompt_cache_enabled: false,
         }
@@ -2651,15 +2652,24 @@ mod tests {
     /// makes advancing 20s free.
     struct HeaderTimeoutThenServe {
         calls: std::sync::atomic::AtomicUsize,
+        seen: Mutex<Vec<String>>,
     }
 
     impl HeaderTimeoutThenServe {
         fn new() -> Arc<Self> {
-            Arc::new(Self { calls: std::sync::atomic::AtomicUsize::new(0) })
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                seen: Mutex::new(Vec::new()),
+            })
         }
 
         fn calls(&self) -> usize {
             self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// `"<secret_ref>|<model>"` per dial — which key the engine actually reached for.
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
         }
     }
 
@@ -2675,12 +2685,13 @@ mod tests {
 
         fn generate_text<'a>(
             &'a self,
-            _secret_ref: &'a str,
-            _args: TextArgs<'a>,
+            secret_ref: &'a str,
+            args: TextArgs<'a>,
             _cancel: &'a Cancel,
         ) -> BoxFuture<'a, Result<BoxStream<'a, Result<String, AttemptError>>, AttemptError>>
         {
             Box::pin(async move {
+                self.seen.lock().unwrap().push(format!("{secret_ref}|{}", args.model));
                 let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if n == 0 {
                     tokio::time::advance(crate::core::egress::UPSTREAM_HEADER_TIMEOUT).await;
@@ -2725,11 +2736,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_header_timeout_still_dials_the_next_candidate() {
-        // Ledger 7092/7099, 2026-10-19: `key-03` spent the whole 20s header budget and `key-04` —
-        // which had served the same provider and model seconds earlier — was never dialled. The
-        // engine advanced to it and the plan budget refused it. This is the whole path in one test:
-        // the first dial moves the paused clock exactly as the egress would, and the second must be
-        // reached, recorded, and serve.
+        // Ledger 7092/7099, 2026-10-19: `key-03` spent the whole 20s header budget and the next
+        // candidate was never dialled. The engine advanced to it and the plan budget refused it.
+        // This is the whole path in one test: the first dial moves the paused clock exactly as the
+        // egress would, and the next candidate — a *different provider*, the path the same-host
+        // retry must not shadow — is reached, recorded, and serves. The no-other-provider case is
+        // pinned separately by `a_network_timeout_reprobes_the_same_candidate_...`.
         let adapter = HeaderTimeoutThenServe::new();
         let health = HealthTracker::new();
         let (seen, mut on_chunk) = sink();
@@ -2738,18 +2750,121 @@ mod tests {
             &Always(adapter.clone()),
             &health,
             None,
-            text_args(vec![candidate("p1", "k1", "m1"), candidate("p1", "k2", "m1")]),
+            text_args(vec![candidate("p1", "k1", "m1"), candidate("p2", "k2", "m1")]),
             &Cancel::new(),
             &mut on_chunk,
         )
         .await
-        .expect("the second candidate serves after the first times out on headers");
+        .expect("the other provider serves after the first times out on headers");
 
         assert_eq!(adapter.calls(), 2, "both candidates were dialled");
-        assert_eq!(served.candidate.key.label, "k2", "the second candidate served");
+        assert_eq!(served.candidate.provider.id, "p2", "the different provider served");
+        assert_eq!(served.candidate.key.label, "k2", "the other provider's key served");
+        assert!(adapter.seen()[1].contains(":k2|"), "the next dial was the other provider");
         assert_eq!(served.attempts.len(), 1, "the timeout stays in the chain");
         assert_eq!(served.attempts[0].cls, ErrorClass::Network);
         assert_eq!(*seen.lock().unwrap(), vec!["recovered".to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pre_output_timeout_prefers_a_different_provider() {
+        // The measured case (2026-10-19, ledger 7160): two keys of agent-router stalled for 20s
+        // each while `vice` carried the same model. The plan is provider-by-provider, so the
+        // second key on the failed host was dialled next. A timeout is evidence about the host;
+        // the remaining candidates from another carrier go first.
+        let adapter = TextScripted::new(vec![
+            Err(AttemptError::Transport {
+                message: Some(
+                    "upstream sent no response headers for 20s — abandoning the request"
+                        .to_string(),
+                ),
+            }),
+            chunks_of(&["recovered"]),
+        ])
+        .shared();
+        let health = HealthTracker::new();
+        let (seen, mut on_chunk) = sink();
+
+        let served = execute_text(
+            &Always(adapter.clone()),
+            &health,
+            None,
+            text_args(vec![
+                candidate("p1", "k1", "m1"),
+                candidate("p1", "k2", "m1"),
+                candidate("p2", "k3", "m1"),
+            ]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect("the different provider serves");
+
+        assert_eq!(adapter.calls().len(), 2, "the second key on the failed host was never dialled");
+        assert!(
+            adapter.calls()[1].contains(":k3|"),
+            "the next dial must be the other provider's key: {:?}",
+            adapter.calls()
+        );
+        assert_eq!(served.candidate.provider.id, "p2", "the other carrier served");
+        assert_eq!(served.candidate.key.label, "k3");
+        assert_eq!(served.attempts.len(), 1);
+        assert_eq!(served.attempts[0].cls, ErrorClass::Network);
+        assert_eq!(*seen.lock().unwrap(), vec!["recovered".to_string()]);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_network_timeout_reprobes_the_same_candidate_when_no_other_provider_exists() {
+        // Borrowed from ZCode: when the plan has no different provider, a pre-output timeout gets
+        // one bounded roll of the *same* request after a pause instead of moving to another key on
+        // the same host. The paused clock advances exactly 20s on the first dial, and the retry
+        // must still fit the 44s plan: 20s + 2s + 20s = 42s.
+        let adapter = HeaderTimeoutThenServe::new();
+        let health = HealthTracker::new();
+        let (seen, mut on_chunk) = sink();
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let notice_sink = Arc::clone(&notices);
+        let mut on_retry = move |n: RetryNotice| notice_sink.lock().unwrap().push(n);
+        let mut args = text_args(vec![candidate("p1", "k1", "m1"), candidate("p1", "k2", "m1")]);
+        args.on_retry = Some(&mut on_retry);
+
+        let served = execute_text(
+            &Always(adapter.clone()),
+            &health,
+            None,
+            args,
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect("the same candidate serves on the retry");
+
+        assert_eq!(
+            adapter.seen(),
+            vec!["key:p1:k1|m1".to_string(), "key:p1:k1|m1".to_string()],
+            "the same key was retried; the provider's second key was never dialled"
+        );
+        assert_eq!(served.candidate.key.label, "k1");
+        assert_eq!(served.attempts.len(), 1);
+        assert_eq!(served.attempts[0].cls, ErrorClass::Network);
+        let notices = notices.lock().unwrap();
+        assert_eq!(notices.len(), 1, "one retry notice reached the progress channel");
+        assert_eq!(notices[0].provider, "p1");
+        assert_eq!(notices[0].key, "k1");
+        assert_eq!(notices[0].attempt, 2);
+        assert_eq!(notices[0].max, NETWORK_REPROBES_MAX + 1);
+        assert_eq!(notices[0].delay_ms, NETWORK_RETRY_BACKOFF.as_millis() as u64);
+        assert_eq!(*seen.lock().unwrap(), vec!["recovered".to_string()]);
+    }
+
+    #[test]
+    fn a_network_reprobe_fits_inside_the_plan_budget_after_a_full_timeout() {
+        use crate::core::egress::UPSTREAM_HEADER_TIMEOUT as ATTEMPT;
+
+        // The first attempt spent its whole header budget; the 2s wait plus a full second attempt
+        // still fits 44s. A *third* attempt does not, which is what keeps this bounded.
+        assert!(candidate_is_affordable(ATTEMPT + NETWORK_RETRY_BACKOFF, false));
+        assert!(!candidate_is_affordable(ATTEMPT + NETWORK_RETRY_BACKOFF + ATTEMPT, false));
     }
 
     struct Silent;

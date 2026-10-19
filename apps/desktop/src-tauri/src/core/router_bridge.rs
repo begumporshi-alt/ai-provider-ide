@@ -394,6 +394,24 @@ impl Job {
                         cancel.cancel();
                     }
                 };
+                // The retry/stall progress channel. It is the bridge's own disconnect check, like
+                // the two above: a client that stopped listening cancels the request instead of
+                // paying for a redial nobody will read.
+                let mut on_retry = |notice: crate::core::engine::RetryNotice| {
+                    if !replies.reply(
+                        id,
+                        BridgeMsg::Retry {
+                            provider: notice.provider,
+                            key: notice.key,
+                            attempt: notice.attempt,
+                            max: notice.max,
+                            delay_ms: notice.delay_ms,
+                            reason: notice.reason,
+                        },
+                    ) {
+                        cancel.cancel();
+                    }
+                };
 
                 // The client's thinking knob. Two spellings, and the order between them is the
                 // reference's own precedence: `reasoning.effort` is canonical (what a
@@ -428,6 +446,7 @@ impl Job {
                     on_usage: Some(&mut on_usage),
                     on_finish: Some(&mut on_finish),
                     on_reasoning: Some(&mut on_reasoning),
+                    on_retry: Some(&mut on_retry),
                     max_attempts: None,
                     prompt_cache_enabled: self.host.settings().prompt_cache_enabled,
                 };

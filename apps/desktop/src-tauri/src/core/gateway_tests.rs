@@ -112,6 +112,8 @@ struct SynthBridge {
     fallbacks: AtomicBool,
     /// Prepend a reasoning message — the upstream-gated pass-through channel.
     reasoning: AtomicBool,
+    /// Prepend a retry-progress frame — the engine's `model_retry_scheduled` equivalent.
+    retry: AtomicBool,
     /// Prepend an empty delta — the bridge's between-turns liveness probe.
     empty_delta: AtomicBool,
     /// Send one `Liveness` frame, then pause past any short first-message bound a test sets.
@@ -145,6 +147,7 @@ impl SynthBridge {
             served: AtomicBool::new(false),
             fallbacks: AtomicBool::new(false),
             reasoning: AtomicBool::new(false),
+            retry: AtomicBool::new(false),
             empty_delta: AtomicBool::new(false),
             liveness_then_pause: AtomicBool::new(false),
             silent: AtomicBool::new(false),
@@ -193,6 +196,10 @@ impl SynthBridge {
     fn answer_with_reasoning(&self, on: bool) {
         self.reasoning.store(on, Ordering::Relaxed);
     }
+    /// Emit a contentless retry-progress frame before the answer.
+    fn answer_with_retry(&self, on: bool) {
+        self.retry.store(on, Ordering::Relaxed);
+    }
     fn answer_with_empty_delta(&self, on: bool) {
         self.empty_delta.store(on, Ordering::Relaxed);
     }
@@ -236,6 +243,7 @@ impl Bridge for SynthBridge {
         let with_served = self.served.load(Ordering::Relaxed);
         let with_fallbacks = self.fallbacks.load(Ordering::Relaxed);
         let with_reasoning = self.reasoning.load(Ordering::Relaxed);
+        let with_retry = self.retry.load(Ordering::Relaxed);
         let with_empty = self.empty_delta.load(Ordering::Relaxed);
         let liveness_then_pause = self.liveness_then_pause.load(Ordering::Relaxed);
         let fail = self.fail_status.load(Ordering::Relaxed);
@@ -271,6 +279,21 @@ impl Bridge for SynthBridge {
                         // Before the prose — the order a reasoning model produces them in.
                         replies
                             .reply(req.request_id, BridgeMsg::Reasoning("Working it out".into()));
+                    }
+                    if with_retry {
+                        // A retry notice is progress, not answer text: the OpenAI client must
+                        // ignore the unknown field and the Assistant paints it.
+                        replies.reply(
+                            req.request_id,
+                            BridgeMsg::Retry {
+                                provider: "agent-router".into(),
+                                key: "key-03".into(),
+                                attempt: 2,
+                                max: 3,
+                                delay_ms: 2000,
+                                reason: "upstream sent no response headers for 20s".into(),
+                            },
+                        );
                     }
                     replies.reply(req.request_id, BridgeMsg::Delta("Hel".into()));
                     replies.reply(req.request_id, BridgeMsg::Delta("lo".into()));
@@ -498,6 +521,42 @@ async fn reasoning_streams_as_delta_reasoning_content_with_the_role_on_the_first
     // And the reasoning never leaked into the answer channel.
     assert!(acc.contains("\"content\":\"Hel\""), "the answer is unchanged: {acc}");
     assert!(!acc.contains("\"content\":\"Working"), "reasoning is not content: {acc}");
+}
+
+/// The retry progress frame: a contentless OpenAI chunk carrying `aip_retry`. It must not open the
+/// message or become answer text; it is the wire half of the Assistant's `attempt 2/3` line.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retry_frame_rides_the_openai_stream_without_becoming_content() {
+    let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+    let s = start(key).await;
+    s.bridge.answer_with_retry(true);
+
+    let res = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&chat_body(true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let mut acc = String::new();
+    let mut stream = res.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        if acc.contains("finish_reason") {
+            break;
+        }
+    }
+    assert!(acc.contains("\"aip_retry\""), "{acc}");
+    assert!(acc.contains("\"provider\":\"agent-router\""), "{acc}");
+    assert!(acc.contains("\"key\":\"key-03\""), "{acc}");
+    assert!(acc.contains("\"attempt\":2"), "{acc}");
+    assert!(acc.contains("\"max\":3"), "{acc}");
+    assert!(acc.contains("\"delay_ms\":2000"), "{acc}");
+    // The frame is progress, not output: the answer is still exactly the bridge's text.
+    assert!(!acc.contains("\"content\":\"Retrying"), "a retry notice is not content: {acc}");
+    assert!(acc.contains("\"content\":\"Hel\""), "the answer is unchanged: {acc}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

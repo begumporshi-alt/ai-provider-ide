@@ -43,6 +43,9 @@ export interface Msg {
    * listening for it.
    */
   reasoning?: string;
+  /** Transient progress line while the engine waits to redial (attempt N/M). Never persisted:
+   *  the durable transcript carries what the turn said, not the wire's retry notices. */
+  retryStatus?: string;
   /** Set on an assistant turn that requested tool calls, so the next turn can replay them. */
   tool_calls?: unknown;
   /** Set on a tool result turn, linking it to its originating call. */

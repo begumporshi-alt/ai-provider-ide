@@ -489,6 +489,32 @@ it, and `pnpm check-version-sync` fails the build when one does not.
   instead of 36 s, and a first key that stalls gets one more full attempt instead of failing at
   20 s.
 
+- **A pre-output timeout now reaches a different provider before the failed host's next key, and the
+  Assistant uses the bare model so a second provider is in the plan at all.** The plan is ordered
+  provider-by-provider, so after `agent-router/key-03` timed out the next candidate was
+  `agent-router/key-04` — the same host, which is exactly why the egress refuses to retry a header
+  timeout. The measured case (ledger 7160, 2026-10-19) had both keys stall for 20 s while `vice`
+  carried the same `deepseek-v4-flash`; the second key was dialled because the plan had no reason to
+  prefer a different carrier. The engine now reorders only the *remaining* candidates after a
+  `NETWORK` failure, moving other providers ahead of the failed one while preserving each group's
+  relative order; a plan with no other carrier is unchanged. The Assistant's stored model moves from
+  the qualified `agent-router/deepseek-v4-flash` to the bare `deepseek-v4-flash`, so the alias's
+  `vice` carrier is planned. Pinned by `a_pre_output_timeout_prefers_a_different_provider`; the
+  full suite is 1,684 green.
+
+- **A network timeout now gets a bounded same-request retry when the plan has no different
+  provider, and the Assistant paints the retry as it happens.** Borrowed from ZCode's AI-SDK
+  policy (`maxRetries 2`, 2 s initial delay): after a `NETWORK` failure with nothing emitted and no
+  other carrier left, the engine sleeps 2 s and re-dials the same candidate, at most twice. The
+  wait is priced by the same plan-budget rule, so after a full 20 s header timeout exactly one
+  retry fits (`20 + 2 + 20 = 42 <= 44`) and a third attempt does not. The notice travels the
+  bridge as a contentless OpenAI chunk carrying `aip_retry` (`provider`, `key`, `attempt`, `max`,
+  `delay_ms`, `reason`); the Assistant renders it as `Retrying agent-router · key-03 — attempt
+  2/2 in 2s…` and clears it on the first token or when the turn settles. Pinned by
+  `a_network_timeout_reprobes_the_same_candidate_when_no_other_provider_exists`, the budget
+  arithmetic test, `a_retry_frame_rides_the_openai_stream_without_becoming_content`, and the
+  gateway-turn parser test.
+
 - **The verification gate's own demand was being answered by the wrong branch of the test oracle, and
   it silently reverted the work under test (drift D121).** `92efa4a` added a gate that holds a turn
   which mutated the workspace, claimed completion, and verified nothing: it pushes an automated demand

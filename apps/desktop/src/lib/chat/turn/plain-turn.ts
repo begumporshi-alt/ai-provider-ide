@@ -8,7 +8,7 @@ import { replayHistory, recalledLight } from "./messages";
 import { clip } from "./graph-record";
 import type { TurnPorts, TurnRequestBase } from "./ports";
 import { attachmentMeta } from "./ports";
-import type { ServedBy } from "../../gateway-turn";
+import { retryNoticeLabel, type ServedBy } from "../../gateway-turn";
 
 /** The model's reasoning paints at most every 80 ms. Time-based rather than count-based: a fixed
  *  "every Nth delta" is wrong at both ends of the range — the measured failure carried **8197**
@@ -58,6 +58,11 @@ export async function runPlainTurn(req: PlainTurnRequest, ports: TurnPorts): Pro
   // the `finally` must see both.
   let turnUsage: { prompt_tokens: number; completion_tokens: number } | undefined;
   let turnServed: ServedBy | undefined;
+  /** The retry line is cleared once the first token arrives, not on every chunk. */
+  let retryCleared = false;
+  /** Only patch the clear when a retry line was actually painted — otherwise the clear becomes a
+   *  spurious final patch on turns that never retried. */
+  let retryPainted = false;
   try {
     // The same replay the agent path uses. Sharing it is the fix: this path used to map only
     // {role, content}, so a session that had used agent mode sent its tool results with no
@@ -111,10 +116,20 @@ export async function runPlainTurn(req: PlainTurnRequest, ports: TurnPorts): Pro
           turnUsage = u;
           ports.onLastUsage(u);
         },
+        // The engine's retry notice: paint `attempt N/M` in the assistant bubble so a 40s wait
+        // is visibly progress rather than a frozen screen.
+        onRetry: (n) => {
+          retryPainted = true;
+          ports.patchMsg(req.assistantMsgId, { retryStatus: retryNoticeLabel(n) });
+        },
       },
       { signal: req.signal },
     );
     for await (const chunk of exec.chunks) {
+      if (retryPainted && !retryCleared) {
+        retryCleared = true;
+        ports.patchMsg(req.assistantMsgId, { retryStatus: undefined });
+      }
       streamed += chunk;
       const now = ports.now();
       if (now - lastContentPaint >= CONTENT_PAINT_MS) {
@@ -178,6 +193,11 @@ export async function runPlainTurn(req: PlainTurnRequest, ports: TurnPorts): Pro
       ports.patchMsg(req.assistantMsgId, { content: recordedText });
     }
   } finally {
+    // A retry line must not outlive the turn: success, failure and stop all land here. Only when
+    // one was painted, so a turn that never retried leaves its last content patch untouched.
+    if (retryPainted && !retryCleared) {
+      ports.patchMsg(req.assistantMsgId, { retryStatus: undefined });
+    }
     // A stopped or failed stream may have left the last few deltas inside the paint interval.
     // The catch above patches the error text; this makes the successful/aborted tail visible too.
     if (recordedText && recordedText !== lastPaintedContent) {

@@ -324,6 +324,8 @@ pub(crate) async fn gemini_h(
                     }
                     // Serving attribution is OpenAI-dialect-only for now (A1 Phase 2).
                     BridgeMsg::Served { .. } => {}
+                    // Progress only; this dialect has no client surface for it.
+                    BridgeMsg::Retry { .. } => {}
                 }
             }
             drop(slot);
@@ -388,6 +390,8 @@ pub(crate) async fn gemini_h(
             }
             // Serving attribution is OpenAI-dialect-only for now (A1 Phase 2).
             BridgeMsg::Served { .. } => {}
+            // Progress only; this dialect has no client surface for it.
+            BridgeMsg::Retry { .. } => {}
         }
     }
     drop(slot);

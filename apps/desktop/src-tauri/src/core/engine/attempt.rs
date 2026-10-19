@@ -259,6 +259,46 @@ pub const SERVER_ERROR_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 /// engine a competent client through a flap without pretending it can outlast an outage.
 pub const SERVER_ERROR_REPROBES_MAX: usize = 3;
 
+/// How many times a pre-output `NETWORK` failure may re-dial the **same** candidate when the plan
+/// has no different provider left.
+///
+/// **Borrowed from ZCode's AI SDK retry**, which uses `maxRetries 2` with a 2 s initial delay and a
+/// factor of 2 (`retryWithExponentialBackoffRespectingRetryHeaders`, measured in the installed
+/// bundle). The engine still does not retry a header timeout while a different host is available —
+/// the egress's own argument is that the prompt and host are unchanged — but when the plan has
+/// nowhere else to go, a second roll after a pause is what a competent client does. The 2026-10-19
+/// incident lacked exactly this: both keys of `agent-router` stalled, the plan had no other
+/// carrier, and the request failed without ever pausing to let the upstream recover.
+///
+/// **The budget is still the bound.** A re-probe is priced by [`candidate_is_affordable`] with the
+/// wait added, so after a full 20 s header timeout exactly one retry fits (`20 + 2 + 20 = 42 <=
+/// 44`); a second does not. The count is 2 rather than 1 so a *fast* network failure can use the
+/// same policy without a second constant.
+pub const NETWORK_REPROBES_MAX: usize = 2;
+
+/// The wait before a network re-probe. 2 s is ZCode's initial AI-SDK delay and, at the measured
+/// cadence, the largest wait that still leaves room for a full 20 s attempt inside [`PLAN_BUDGET`]
+/// after the first one.
+pub const NETWORK_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+
+/// A retry the engine is about to perform, for the client's progress channel.
+///
+/// The bridge turns this into a wire frame the Assistant paints, so a 40 s wait shows
+/// `attempt 2/2` instead of a frozen bubble. It carries only what the UI needs — the provider and
+/// key it is about to redial, the attempt ordinal, the configured maximum, the wait, and the
+/// upstream's own reason when it gave one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryNotice {
+    pub provider: String,
+    pub key: String,
+    /// The upcoming dial, 1-based: the first re-probe is attempt 2.
+    pub attempt: usize,
+    /// The configured total dials for this candidate, including the original.
+    pub max: usize,
+    pub delay_ms: u64,
+    pub reason: String,
+}
+
 /// How many of a plan's candidates this request may actually try.
 ///
 /// `None` means "the caller named none" and takes [`MAX_ATTEMPTS_DEFAULT`]. `Some(0)` means

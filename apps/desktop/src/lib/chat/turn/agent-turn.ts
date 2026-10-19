@@ -17,6 +17,7 @@ import { clip, recordAgentTurn } from "./graph-record";
 import { attachmentMeta } from "./ports";
 import type { TurnRequestBase } from "./ports";
 import type { AgentTurnPorts, FallbackAttempt } from "./ports";
+import { retryNoticeLabel } from "../../gateway-turn";
 
 export interface AgentTurnRequest extends TurnRequestBase {
   /** The workspace root; blank refuses the run (the guard is the engine's, not the UI's). */
@@ -253,12 +254,18 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
         // as a zero-token one (see `chargeSessionUsage`).
         let callIn: number | undefined;
         let callOut: number | undefined;
+        /** Only clear a retry line that this call actually painted. */
+        let retryPainted = false;
         const p = ports.generate(
           {
             ...(req.thinking ? { reasoning: req.thinking } : {}),
             ...loopReq,
             ...(typeof req.temperature === "number" ? { temperature: req.temperature } : {}),
             ...(typeof req.maxTokens === "number" ? { maxTokens: req.maxTokens } : {}),
+            onRetry: (n) => {
+              retryPainted = true;
+              ports.patchMsg(req.assistantMsgId, { retryStatus: retryNoticeLabel(n) });
+            },
             onUsage: (u) => {
               loopReq.onUsage?.(u);
               ports.onLastUsage(u);
@@ -280,9 +287,19 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
           // stopped run still charges the usage it already received. Served ids only exist once
           // the stream ends, so pricing happens here rather than in `onUsage`.
           chunks: (async function* () {
+            let cleared = false;
             try {
-              for await (const chunk of exec.chunks) yield chunk;
+              for await (const chunk of exec.chunks) {
+                if (retryPainted && !cleared) {
+                  cleared = true;
+                  ports.patchMsg(req.assistantMsgId, { retryStatus: undefined });
+                }
+                yield chunk;
+              }
             } finally {
+              if (retryPainted && !cleared) {
+                ports.patchMsg(req.assistantMsgId, { retryStatus: undefined });
+              }
               const s = exec.served();
               ports.chargeUsage(callIn, callOut, s?.provider, s?.model);
               if (s?.fallbacks) chain.push(...s.fallbacks);
