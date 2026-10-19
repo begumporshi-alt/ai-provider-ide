@@ -2522,6 +2522,46 @@ mod tests {
         assert_eq!(adapter.calls().len(), 4, "first dial + three re-probes, never a fifth");
     }
 
+    /// PROBE (temporary): does a caller's `max_attempts` bound the re-dials, or only the plan?
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn probe_max_attempts_one_still_dials_four_times() {
+        let adapter = TextScripted::new(vec![
+            refused(503),
+            refused(503),
+            refused(503),
+            refused(503),
+            refused(503),
+        ])
+        .shared();
+        let health = HealthTracker::new();
+        let (_seen, mut on_chunk) = sink();
+        let mut args = text_args(vec![candidate("p1", "k1", "m1")]);
+        args.max_attempts = Some(1);
+
+        let failure = execute_text(
+            &Always(adapter.clone()),
+            &health,
+            None,
+            args,
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect_err("every round 500'd");
+
+        match failure {
+            TextFailure::AllAttemptsFailed { error, .. } => {
+                assert_eq!(error.chain.len(), adapter.calls().len(), "chain shows every dial");
+            }
+            other => panic!("expected AllAttemptsFailed, got {other:?}"),
+        }
+        assert_eq!(
+            adapter.calls().len(),
+            4,
+            "PROBE RESULT: max_attempts=1 still dials the single candidate four times"
+        );
+    }
+
     /// The count above is only meaningful if the *budget* can fund it — and for a day it could not.
     ///
     /// `the_reprobe_budget_is_three_rounds_and_no_fourth_redial` runs on a paused clock, so its
@@ -2797,6 +2837,63 @@ mod tests {
             // candidate's ref spells p1 even though its provider id is p2.
             vec!["key:p1:k1|m1".to_string(), "key:p1:k2|m2".to_string()],
             "one dial per candidate — p1 was not re-dialled",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_plan_that_runs_out_on_its_last_key_reprobes_only_that_key() {
+        // The production shape of 2026-10-19 (`agent-router` / `deepseek-v4-flash`): two keys, both
+        // 500ing. The chain read `key-03` once and `key-04` four times, which reads like a retry
+        // storm and is not one — it is the failover of the test above composed with the re-probe of
+        // `the_reprobe_budget_is_three_rounds_and_no_fourth_redial`. The first key is never
+        // re-dialled, because a next candidate existed behind it; the last key gets its first dial
+        // plus `SERVER_ERROR_REPROBES_MAX` rounds, because by then failover had nothing left to do.
+        //
+        // Pinned here because the rule lives in `plan.is_empty()` and the shape only shows up in a
+        // *failed* request's chain: without this, the five-dial chain has to be re-derived from
+        // `text.rs` every time somebody reads one and suspects the engine is stuck on a dead key.
+        let adapter = TextScripted::new(vec![
+            refused(500),
+            refused(500),
+            refused(500),
+            refused(500),
+            refused(500),
+        ])
+        .shared();
+        let health = HealthTracker::new();
+        let (_seen, mut on_chunk) = sink();
+
+        let failure = execute_text(
+            &Always(adapter.clone()),
+            &health,
+            None,
+            text_args(vec![candidate("p1", "k1", "m1"), candidate("p2", "k2", "m2")]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect_err("every key 500'd");
+
+        match failure {
+            TextFailure::AllAttemptsFailed { error, .. } => {
+                // All five dials are in the chain, in order — the re-probes are not hidden.
+                let classes: Vec<ErrorClass> = error.chain.iter().map(|a| a.cls).collect();
+                assert_eq!(classes, vec![ErrorClass::ServerError; 5]);
+            }
+            other => panic!("expected AllAttemptsFailed, got {other:?}"),
+        }
+        assert_eq!(
+            adapter.calls(),
+            vec![
+                // The first key: one dial, then failover — never a re-probe.
+                "key:p1:k1|m1".to_string(),
+                // The last key: its first dial, then three re-probes. Never a fifth.
+                "key:p1:k2|m2".to_string(),
+                "key:p1:k2|m2".to_string(),
+                "key:p1:k2|m2".to_string(),
+                "key:p1:k2|m2".to_string(),
+            ],
+            "one dial of the first key and four of the last — failover, then re-probe",
         );
     }
 
