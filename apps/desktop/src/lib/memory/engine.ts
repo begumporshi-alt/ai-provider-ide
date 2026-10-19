@@ -425,7 +425,12 @@ export async function recallContext(
 ): Promise<Memory[]> {
   const limit = Math.max(1, opts.limit ?? 8);
   try {
+    // A root *option* present but blank is a caller that has no workspace — the Assistant on a
+    // host with no default root. That must fail closed: no project facts, never the whole corpus.
+    // Absence of the option is the legacy/Memory-screen path, which keeps the unscoped read.
+    const scoped = typeof opts.root === "string";
     const root = opts.root?.trim() || undefined;
+    if (scoped && !root) return [];
     // Scoped: ask for the pinned, in-scope rows directly. The old `listMemories` scan saw
     // every workspace's pinned rows, which is the contamination this path exists to stop.
     const pinned = root

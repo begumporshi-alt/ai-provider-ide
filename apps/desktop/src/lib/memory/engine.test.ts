@@ -459,17 +459,17 @@ describe("memory engine", () => {
       expect(got.map((m) => m.id)).toEqual(["identity"]);
     });
 
-    it("never sends a scope when the root is blank", async () => {
-      await recallContext("q", { root: "   " });
+    it("fails closed when the root option is present but blank", async () => {
+      // A blank root is the Assistant with no workspace — not "no scope". Treating it as unscoped
+      // would read every workspace's facts, so the contract is no facts at all.
+      listMemories.mockResolvedValue([mem("p", "L1", "pinned", true)]);
+      recallMemories.mockResolvedValue([mem("a", "L1", "relevant")]);
 
-      // The scoped endpoint answers 400 to a blank root, and the catch below would turn that into
-      // an empty, silent recall. A whitespace root is no root: keep the Memory screen's unscoped
-      // read rather than pretending it is a workspace.
+      await expect(recallContext("q", { root: "   " })).resolves.toEqual([]);
+
       expect(listScopedMemories).not.toHaveBeenCalled();
-      expect(listMemories).toHaveBeenCalledWith(null, 50);
-      for (const call of recallMemories.mock.calls) {
-        expect(call[3]).toBeUndefined();
-      }
+      expect(listMemories).not.toHaveBeenCalled();
+      expect(recallMemories).not.toHaveBeenCalled();
     });
   });
 

@@ -2506,6 +2506,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       const pinnedOnly = args.pinned_only === true;
       const limit = (args.limit as number) ?? 200;
       return memories
+        .filter((m) => m.layer !== "L0")
         .filter((m) => m.superseded_at == null)
         .filter((m) => {
           const sc = (m.scope as Row | undefined) ?? DEFAULT_SCOPE;
@@ -3413,6 +3414,10 @@ async function routeMemory(method: string, segs: string[], q: URLSearchParams, b
     case "scoped": {
       if (method === "POST") {
         const b = (body ?? {}) as Row;
+        // The host answers a blank root with 400 `scope_required` — never with a read. Matching
+        // that here keeps the harness from being more permissive than the code it stands in for.
+        const root = typeof b.project_root === "string" ? b.project_root.trim() : "";
+        if (!root) refuse(400, "project_root is required", "scope_required");
         return dispatch("memory_scoped", {
           project_root: b.project_root ?? null,
           pinned_only: b.pinned_only ?? false,
