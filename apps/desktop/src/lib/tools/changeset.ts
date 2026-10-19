@@ -201,6 +201,10 @@ export function createCheckpointingHost(inner: ToolHost, checkpoint: RunCheckpoi
           checkpoint.noteUntracked(
             `saved a browser screenshot${path ? ` to ${path}` : " into images/"} — a new capture, never an overwrite of tracked content`,
           );
+        } else if (name === "browser_print") {
+          checkpoint.noteUntracked(
+            `rendered a print PDF${path ? ` to ${path}` : " into documents/"} — a new render, never an overwrite of tracked content`,
+          );
         }
         return inner.run(name, args, opts);
       }

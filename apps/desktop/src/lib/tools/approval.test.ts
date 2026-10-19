@@ -30,6 +30,7 @@ describe("toolEffect", () => {
       "browser_click",
       "browser_fill",
       "browser_navigate",
+      "browser_print",
       "browser_screenshot",
       "browser_start",
       "edit_file",

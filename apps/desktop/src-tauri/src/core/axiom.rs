@@ -1191,10 +1191,7 @@ mod axiom_tests {
         let one = super::audit(&s, "a1").unwrap().expect("a1 exists");
         assert_eq!(one["report"]["totalHits"], 2, "the report is parsed, not a JSON string");
         let refused_one = super::audit(&s, "a2").unwrap().expect("a2 exists");
-        assert_eq!(
-            refused_one["report"],
-            serde_json::json!({ "runsExamined": 3, "runsClean": 2 })
-        );
+        assert_eq!(refused_one["report"], serde_json::json!({ "runsExamined": 3, "runsClean": 2 }));
         let _ = std::fs::remove_dir_all(&d);
     }
 

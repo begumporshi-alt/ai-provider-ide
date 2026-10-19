@@ -4,6 +4,8 @@ node_modules/
 dist/
 *.tsbuildinfo
 coverage/
+# Generated verification output (compiled test copies), not source.
+.verify-build/
 
 # Rust / Tauri
 target/

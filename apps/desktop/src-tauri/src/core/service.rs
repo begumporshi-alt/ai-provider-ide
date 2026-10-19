@@ -345,10 +345,7 @@ pub fn install(
     // failure is cheap — no launchd state has been touched yet.
     if let Err(e) = verify_executable(&temp) {
         let _ = std::fs::remove_file(&temp);
-        return Err(ServiceError(format!(
-            "cannot install {}: {e}",
-            p.binary.display()
-        )));
+        return Err(ServiceError(format!("cannot install {}: {e}", p.binary.display())));
     }
     if let Err(e) = std::fs::rename(&temp, &p.binary) {
         let _ = std::fs::remove_file(&temp);

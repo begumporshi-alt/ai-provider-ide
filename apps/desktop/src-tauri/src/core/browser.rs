@@ -8,10 +8,11 @@
 //! # What is here, and what is deliberately not
 //!
 //! - [`browser_navigate`] / [`browser_snapshot`] / [`browser_click`] / [`browser_fill`] /
-//!   [`browser_screenshot`] are the tool surface (`tool_run` dispatches to them). Snapshot is the
-//!   hub: it tags the interactive elements with `data-__cdpidx` attributes and returns a text
-//!   outline, and click/fill address elements by those indexes — the same shape browser-use
-//!   popularised, because the model can only point at what a previous tool result named.
+//!   [`browser_screenshot`] and [`browser_print`] are the tool surface (`tool_run` dispatches to
+//!   them). Snapshot is the hub: it tags the interactive elements with `data-__cdpidx` attributes
+//!   and returns a text outline, and click/fill address elements by those indexes — the same shape
+//!   browser-use popularised, because the model can only point at what a previous tool result
+//!   named.
 //! - The connection to the debugger endpoint is kept open across calls in [`CONN`]: a
 //!   snapshot-click-fill sequence is three calls against one tab, and re-handshaking per call
 //!   would race the page's own navigations. A dead connection (tab closed, Chrome quit) is
@@ -1092,6 +1093,48 @@ pub fn capture_screenshot(args: &Value) -> Result<String, String> {
     out
 }
 
+/// Render the connected page as a base64 PDF with print media emulated.
+///
+/// `browser_screenshot` captures the screen; `Page.printToPDF` is the only path that lays out
+/// `@media print` and `@page`, which is the whole reason a print check exists. Media emulation is
+/// restored to `screen` before the call returns: the connection is cached across tool calls, and
+/// a page left in print mode would corrupt every later screenshot and snapshot on that tab.
+pub fn print_to_pdf(args: &Value) -> Result<String, String> {
+    let port = port_of(args);
+    let landscape = args.get("landscape").and_then(|v| v.as_bool()).unwrap_or(false);
+    let out: Result<String, String> = runtime()?.block_on(with_page(port, |conn| {
+        Box::pin(async move {
+            command(conn, "Emulation.setEmulatedMedia", json!({ "media": "print" })).await?;
+            let printed = command(
+                conn,
+                "Page.printToPDF",
+                json!({
+                    "printBackground": true,
+                    "preferCSSPageSize": true,
+                    "landscape": landscape,
+                }),
+            )
+            .await;
+            // Restore the screen media even when printing failed: a cached connection must not
+            // keep the next tool call in print mode.
+            let restored =
+                command(conn, "Emulation.setEmulatedMedia", json!({ "media": "screen" })).await;
+            if let Err(e) = restored {
+                return Err(format!("print media could not be restored: {e}"));
+            }
+            let res = printed?;
+            res.get("data")
+                .and_then(|d| d.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| "printToPDF returned no PDF data".to_string())
+        })
+    }));
+    if out.is_err() {
+        forget_conn(port);
+    }
+    out
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1291,7 +1334,7 @@ mod tests {
     /// by what the page itself reports. This is the test that says the CDP client works, not
     /// merely that it compiles.
     #[test]
-    fn navigate_snapshot_click_fill_screenshot_round_trips_against_chrome() {
+    fn navigate_snapshot_click_fill_screenshot_and_print_round_trip_against_chrome() {
         let tmp = std::env::temp_dir().join(format!("aiprovider-chrome-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let Some((port, mut child)) = launch_headless_chrome(&tmp) else { return };
@@ -1337,10 +1380,45 @@ mod tests {
                 after_fill.output
             );
 
-            let png = capture_screenshot(&serde_json::json!({ "port": port })).unwrap();
-            use base64::Engine as _;
-            let bytes = base64::engine::general_purpose::STANDARD.decode(png.as_bytes()).unwrap();
-            assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G']), "a real PNG comes back");
+            // The tool, not just the capture: a new timestamped path must reach the workspace,
+            // including a directory that does not exist yet (the screenshot regression).
+            let root = tmp.to_string_lossy().to_string();
+            let shot = crate::core::tools::tool_run(crate::core::tools::ToolRunRequest {
+                name: "browser_screenshot".into(),
+                arguments: serde_json::json!({
+                    "port": port,
+                    "path": "images/round-trip.png",
+                }),
+                root: root.clone(),
+            });
+            assert!(shot.ok, "screenshot tool: {:?}", shot.error);
+            assert!(
+                std::fs::read(tmp.join("images/round-trip.png"))
+                    .unwrap()
+                    .starts_with(&[0x89, b'P', b'N', b'G']),
+                "the tool must write a real PNG into a directory that did not exist"
+            );
+
+            // Print media is the point: the screen-only marker must be absent from the PDF and
+            // the print-only marker present. A screen capture cannot prove either.
+            let print_page = "data:text/html,<title>print-test</title><style>.print{display:none}@media print{.screen{display:none}.print{display:block}}</style><div class=\"screen\">SCREENONLY</div><div class=\"print\">PRINTONLY</div>";
+            let nav = browser_navigate(&serde_json::json!({ "url": print_page, "port": port }));
+            assert!(nav.ok, "print navigate: {:?}", nav.error);
+            let printed = crate::core::tools::tool_run(crate::core::tools::ToolRunRequest {
+                name: "browser_print".into(),
+                arguments: serde_json::json!({
+                    "port": port,
+                    "path": "documents/round-trip.pdf",
+                }),
+                root,
+            });
+            assert!(printed.ok, "print tool: {:?}", printed.error);
+            let pdf_path = tmp.join("documents/round-trip.pdf");
+            let pdf = std::fs::read(&pdf_path).expect("the PDF must be written");
+            assert!(pdf.starts_with(b"%PDF"), "a real PDF comes back");
+            let text = pdf_extract::extract_text(&pdf_path).expect("the PDF text must be readable");
+            assert!(text.contains("PRINTONLY"), "print media must be rendered: {text}");
+            assert!(!text.contains("SCREENONLY"), "screen-only content must be hidden: {text}");
         }));
         stop_chrome(&mut child);
         let _ = std::fs::remove_dir_all(&tmp);

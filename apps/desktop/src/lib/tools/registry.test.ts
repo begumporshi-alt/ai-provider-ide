@@ -28,6 +28,7 @@ const ASSISTANT_MUTATING = [
   "browser_click",
   "browser_fill",
   "browser_navigate",
+  "browser_print",
   "browser_screenshot",
   // Launches a browser process with the debugger port — an action on the machine, not the
   // workspace, but the approval gate is where "the app started something" belongs.
@@ -156,6 +157,7 @@ describe("AGENT_TOOLS", () => {
     expect(AGENT_TOOLS.some((t) => t.name === "browser_click")).toBe(true);
     expect(AGENT_TOOLS.some((t) => t.name === "browser_fill")).toBe(true);
     expect(AGENT_TOOLS.some((t) => t.name === "browser_screenshot")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "browser_print")).toBe(true);
     // The observers read the same app-session endpoint the drivers do — same reason, same side.
     expect(AGENT_TOOLS.some((t) => t.name === "browser_console")).toBe(true);
     expect(AGENT_TOOLS.some((t) => t.name === "browser_network")).toBe(true);

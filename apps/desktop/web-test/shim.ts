@@ -2277,6 +2277,14 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         virtualFs.set(rel, TINY_PNG);
         return ok(`READ_IMAGE:image/png;base64,${TINY_PNG}\npath: ${rel}\nbytes: 70`);
       }
+      if (name === "browser_print") {
+        if (!vBrowser.title) return fail("no browser answered on 127.0.0.1:9222 — start Chrome (or Chromium/Edge) with --remote-debugging-port=9222 and open a tab");
+        // The smallest bytes that are honestly a PDF ("%PDF-1.4\n%%EOF").
+        const TINY_PDF = "JVBERi0xLjQKJSVFT0Y=";
+        const rel = String(toolArgs["path"] ?? "documents/print-fixture.pdf");
+        virtualFs.set(rel, TINY_PDF);
+        return ok(`printed the page to ${rel} (1 KB) with print media — read_document can read its text`);
+      }
       if (name === "read_image") {
         const p = String(toolArgs["path"] ?? "");
         const data = virtualFs.get(p);

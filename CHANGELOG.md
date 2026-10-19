@@ -293,6 +293,16 @@ it, and `pnpm check-version-sync` fails the build when one does not.
   report there is noise that trains the reader to skip the line that matters. See
   `docs/dev-book/07-drift-register.md` D110, which this closes the *diagnosability* half of.
 
+- **The Assistant can render print output.** `browser_print` drives the same CDP page as the other
+  browser tools with `Emulation.setEmulatedMedia` set to `print`, calls `Page.printToPDF`, and saves
+  the result into the workspace (`documents/` by default). This is the only path that applies
+  `@media print` and `@page`: `browser_screenshot` captures screen media, so a print stylesheet could
+  be confirmed as served but never seen. The emulation is restored to `screen` before the call
+  returns, because the connection is cached across tool calls. The model reads the PDF's text back
+  with `read_document`; the tool is approval-gated like the other browser drivers. The real-Chrome
+  round trip navigates to a page with distinct screen/print markers, renders it, and asserts the PDF
+  contains `PRINTONLY` and not `SCREENONLY`.
+
 ### Changed
 
 - **The assistant can build, test and lint Rust — and `pnpm` works too.** Two independent defects
@@ -464,6 +474,21 @@ it, and `pnpm check-version-sync` fails the build when one does not.
   form *absent*.
 
 ### Fixed
+
+- **`browser_screenshot` could not save a new capture, which made screenshots unavailable in
+  practice.** `do_browser_screenshot` resolved its target with `resolve_within(root, &rel, false)`;
+  that argument means "the target must already exist", and every default capture is a fresh
+  `images/browser-<timestamp>.png`, so the tool failed with "no such file or directory" before the
+  write. The dead `create_dir_all` below it showed the intended behaviour. Binary tool output now
+  goes through `save_tool_binary`, which resolves with `create_parents = true` (the same discipline
+  `write_file` uses), checks the extension, and writes; the real-Chrome round trip captures into a
+  directory that does not exist yet and asserts a real PNG lands there.
+
+- **The package test suites no longer count generated `.verify-build/` copies as empty tests.**
+  `pnpm --filter @aiprovider/axiom-core test` reported 11 "No test suite found" failures beside the
+  252 passing cases because Vitest's default exclude covers `build`/`dist` but not the compiled
+  verification copies. The three package configs append `**/.verify-build/**` to
+  `configDefaults.exclude` (still no `include` glob), and `.gitignore` covers the directory.
 
 - **A pre-headers timeout had no failover: the plan budget refused the next candidate, so the
   router reported `all attempts failed` after one attempt (drift D123).** `PLAN_BUDGET` was 36 s,

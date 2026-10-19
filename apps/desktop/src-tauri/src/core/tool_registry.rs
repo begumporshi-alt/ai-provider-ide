@@ -444,7 +444,8 @@ mod tests {
     /// The mutating set is exactly what the gateway gates, in both directions: a tool that is
     /// neither listed nor read-only is a tool that writes without being gated.
     #[test]
-    fn the_mutating_set_is_exactly_what_the_gateway_gates() {        let names: Vec<&str> = agent_tools().iter().map(|t| t.name).collect();
+    fn the_mutating_set_is_exactly_what_the_gateway_gates() {
+        let names: Vec<&str> = agent_tools().iter().map(|t| t.name).collect();
         for m in MUTATING_TOOLS {
             assert!(names.contains(&m), "{m} is gated by the gateway but absent from the registry");
         }

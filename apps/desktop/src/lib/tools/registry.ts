@@ -248,6 +248,26 @@ export const AGENT_TOOLS: ToolSpec[] = [
     },
   },
   {
+    name: "browser_print",
+    effect: "mutate",
+    description:
+      "Render the connected page to PDF with print media emulated — the only tool that applies @media print and @page — and save it into the workspace (documents/ by default). Use it to verify a print layout; browser_screenshot captures the screen instead. Read the result back with read_document.",
+    parameters: {
+      properties: {
+        path: {
+          type: "string",
+          description: "Optional workspace-relative .pdf save path. Defaults to documents/print-<timestamp>.pdf.",
+        },
+        port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+        landscape: {
+          type: "boolean",
+          description: "Optional. true renders landscape pages. Defaults to portrait.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
     name: "browser_console",
     effect: "read",
     description:

@@ -2049,6 +2049,27 @@ fn do_read_image(args: &serde_json::Value, root: &Path) -> ToolResult {
     }
 }
 
+/// Save a tool-produced binary into the workspace.
+///
+/// Captures are always *new* files — a timestamped screenshot, a freshly rendered PDF — so the
+/// resolver must be allowed to create the parent directory. `resolve_within(..., false)` refuses
+/// a target that does not exist yet, which made every default screenshot path fail before the
+/// write (the timestamp is always new). `create_parents = true` is the same discipline
+/// `write_file` uses.
+fn save_tool_binary(root: &Path, rel: &str, bytes: &[u8], ext: &str) -> Result<PathBuf, String> {
+    if Path::new(rel)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| !e.eq_ignore_ascii_case(ext))
+        .unwrap_or(true)
+    {
+        return Err(format!("\"{rel}\" must be a .{ext} path — the output is {ext}"));
+    }
+    let path = resolve_within(root, rel, true)?;
+    fs::write(&path, bytes).map_err(|e| format!("cannot write {rel}: {e}"))?;
+    Ok(path)
+}
+
 /// `browser_screenshot`: capture the connected page (core::browser) and save it into the
 /// workspace, then hand back the same READ_IMAGE marker `read_image` returns — the agent loop
 /// turns that into an image part, so a vision model sees the page in the turn that took it.
@@ -2071,20 +2092,42 @@ fn do_browser_screenshot(args: &serde_json::Value, root: &Path) -> ToolResult {
                     .unwrap_or(0)
             ),
         };
-        let path = resolve_within(root, &rel, false)?;
-        if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| !e.eq_ignore_ascii_case("png"))
-            .unwrap_or(true)
-        {
-            return Err(format!("\"{rel}\" must be a .png path — the capture is a PNG"));
-        }
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir).map_err(|e| format!("cannot create {rel}'s directory: {e}"))?;
-        }
-        fs::write(&path, &bytes).map_err(|e| format!("cannot write {rel}: {e}"))?;
+        save_tool_binary(root, &rel, &bytes, "png")?;
         Ok(format!("READ_IMAGE:image/png;base64,{b64}\npath: {rel}\nbytes: {}", bytes.len()))
+    })() {
+        Ok(text) => ToolResult::ok(text),
+        Err(e) => ToolResult::err(e),
+    }
+}
+
+/// `browser_print`: render the connected page with print media emulated and save the PDF into
+/// the workspace. `browser_screenshot` captures screen media, so it cannot show `@media print`
+/// or `@page`; this is the only tool that lays the page out the way a printer would. The PDF is
+/// a document, not an image the model can see — `read_document` reads its text back.
+fn do_browser_print(args: &serde_json::Value, root: &Path) -> ToolResult {
+    match (|| -> Result<String, String> {
+        let b64 = crate::core::browser::print_to_pdf(args)?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .map_err(|e| format!("the PDF was not valid base64: {e}"))?;
+        if bytes.len() > MAX_WRITE_BYTES_BINARY {
+            return Err("the PDF is over the 8 MB document cap".into());
+        }
+        let rel = match args.get("path").and_then(|v| v.as_str()) {
+            Some(p) if !p.is_empty() => p.to_string(),
+            _ => format!(
+                "documents/print-{}.pdf",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            ),
+        };
+        save_tool_binary(root, &rel, &bytes, "pdf")?;
+        Ok(format!(
+            "printed the page to {rel} ({} KB) with print media — read_document can read its text",
+            bytes.len().div_ceil(1024)
+        ))
     })() {
         Ok(text) => ToolResult::ok(text),
         Err(e) => ToolResult::err(e),
@@ -2347,8 +2390,9 @@ pub fn tool_run_with_call(req: ToolRunRequest, call_id: Option<&str>) -> ToolRes
         "apply_patch" => do_apply_patch(&args, &root),
         "glob" => do_glob(&args, &root),
         // The browser tools talk to the user's own Chrome over CDP (core::browser). Screenshot
-        // is the only one that touches the workspace: the PNG lands in it and returns the same
-        // READ_IMAGE marker read_image uses, so a vision model sees what the page looks like.
+        // and print are the only two that touch the workspace: each saves its output there, and
+        // screenshot returns the same READ_IMAGE marker read_image uses so a vision model sees
+        // the page.
         "browser_navigate" => crate::core::browser::browser_navigate(&args),
         "browser_snapshot" => crate::core::browser::browser_snapshot(&args),
         "browser_click" => crate::core::browser::browser_click(&args),
@@ -2359,6 +2403,7 @@ pub fn tool_run_with_call(req: ToolRunRequest, call_id: Option<&str>) -> ToolRes
         "browser_expect" => crate::core::browser::browser_expect(&args),
         "browser_start" => crate::core::browser::browser_start(&args),
         "browser_screenshot" => do_browser_screenshot(&args, &root),
+        "browser_print" => do_browser_print(&args, &root),
         other => ToolResult::err(format!("unknown tool \"{other}\"")),
     }
 }
@@ -3939,6 +3984,27 @@ diff --git a/a.txt b/a.txt
             root: r.to_string_lossy().to_string(),
         });
         assert!(!res.ok);
+    }
+
+    #[test]
+    fn a_binary_capture_can_start_from_a_missing_path() {
+        // The regression: `browser_screenshot` resolved its timestamped PNG with
+        // `create_parents = false`, which refuses a target that does not exist yet. Every
+        // capture is a new file, so that made the tool fail before the write. The helper must
+        // create the directories and the file from nothing.
+        let r = root();
+        let bytes = [0x89, b'P', b'N', b'G'];
+        save_tool_binary(&r, "images/browser-new.png", &bytes, "png")
+            .expect("a fresh capture path must resolve");
+        assert_eq!(fs::read(r.join("images/browser-new.png")).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_binary_capture_keeps_the_extension_honest() {
+        let r = root();
+        let err = save_tool_binary(&r, "images/browser-new.jpg", b"x", "png").unwrap_err();
+        assert!(err.contains(".png"), "got: {err}");
+        assert!(!r.join("images/browser-new.jpg").exists(), "a refused write must not land");
     }
 
     #[test]
