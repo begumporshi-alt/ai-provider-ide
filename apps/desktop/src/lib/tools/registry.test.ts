@@ -33,6 +33,8 @@ const ASSISTANT_MUTATING = [
   // Launches a browser process with the debugger port — an action on the machine, not the
   // workspace, but the approval gate is where "the app started something" belongs.
   "browser_start",
+  "device_open_url",
+  "device_screenshot",
   "edit_notebook",
   "generate_image",
   "process_kill",
@@ -81,6 +83,7 @@ describe("AGENT_TOOLS", () => {
       "browser_network",
       "browser_snapshot",
       "browser_wait_for",
+      "device_list",
       "dispatch_agent",
       "enter_plan_mode",
       "exit_plan_mode",
@@ -164,6 +167,9 @@ describe("AGENT_TOOLS", () => {
     expect(AGENT_TOOLS.some((t) => t.name === "browser_wait_for")).toBe(true);
     expect(AGENT_TOOLS.some((t) => t.name === "browser_expect")).toBe(true);
     expect(AGENT_TOOLS.some((t) => t.name === "browser_start")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "device_list")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "device_open_url")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "device_screenshot")).toBe(true);
   });
 
   it("the sub-agent registry is the read-only tools minus delegation, todos and the plan pair", () => {

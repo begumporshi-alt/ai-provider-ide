@@ -23,7 +23,13 @@ export const AGENT_SYSTEM =
   "create a whole file, mkdir to make a directory, run_command for allowlisted commands. " +
   "Run a project's own toolchain through run_command rather than asserting a change is correct: " +
   "cargo build / cargo test / cargo clippy / cargo fmt in a Rust project, npm or pnpm test and " +
-  "npm run for a JavaScript one. " +
+  "npm run for a JavaScript one. If there is no test script, run the checks the project does " +
+  "define — typecheck, lint, build — and name which ones ran; never say \"nothing to run\" when " +
+  "those exist. " +
+  "For print output, render at the paper sizes and viewports that matter — browser_print takes " +
+  "paper (a4/letter/legal or custom inches), margin_in, and viewport_width/viewport_height with " +
+  "mobile — instead of only Chrome's default. For a connected Android device or emulator, use " +
+  "device_list, device_open_url (10.0.2.2 is the host from the emulator), and device_screenshot. " +
   "For the public web, web_search (keyless, with fallback backends) finds pages, web_fetch reads one, " +
   "and web_ask answers a question about a page without loading it into this conversation. " +
   "read_document reads PDFs and Word files; read_image shows you an image if you support vision. " +

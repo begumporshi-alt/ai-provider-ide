@@ -561,6 +561,110 @@ fn port_of(args: &Value) -> u16 {
     args.get("port").and_then(|v| v.as_u64()).map(|p| p as u16).unwrap_or(DEFAULT_PORT)
 }
 
+/// The device-metrics override a browser tool asks for, if any.
+///
+/// `viewport_width`/`viewport_height` are CSS pixels. Both must be present and positive: a width
+/// with no height is a typo, not a request for a zero-height page. `mobile` turns on Chrome's
+/// mobile emulation (meta-viewport handling) and `device_scale_factor` sets the pixel ratio.
+fn device_metrics(args: &Value) -> Result<Option<Value>, String> {
+    let width = args.get("viewport_width").and_then(|v| v.as_u64());
+    let height = args.get("viewport_height").and_then(|v| v.as_u64());
+    match (width, height) {
+        (None, None) => Ok(None),
+        (Some(w), Some(h)) if w > 0 && h > 0 => Ok(Some(json!({
+            "width": w,
+            "height": h,
+            "deviceScaleFactor": args
+                .get("device_scale_factor")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0),
+            "mobile": args.get("mobile").and_then(|v| v.as_bool()).unwrap_or(false),
+        }))),
+        _ => Err("viewport_width and viewport_height must be positive and set together".into()),
+    }
+}
+
+async fn apply_device_metrics(conn: &mut Conn, metrics: Option<Value>) -> Result<bool, String> {
+    match metrics {
+        Some(metrics) => {
+            command(conn, "Emulation.setDeviceMetricsOverride", metrics).await?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+async fn clear_device_metrics(conn: &mut Conn, overridden: bool) -> Result<(), String> {
+    if overridden {
+        command(conn, "Emulation.clearDeviceMetricsOverride", json!({})).await?;
+    }
+    Ok(())
+}
+
+/// The `Page.printToPDF` parameters a print call asks for.
+///
+/// With no paper request, `preferCSSPageSize` is true and the page's own `@page` wins (Chrome's
+/// default when a stylesheet sets only margins is US Letter). `paper` or explicit inches switch
+/// to an explicit paper size; `margin_in` is then applied uniformly, because Chrome cannot combine
+/// a `@page` margin with an overridden paper size.
+fn print_params(args: &Value) -> Result<Value, String> {
+    let landscape = args.get("landscape").and_then(|v| v.as_bool()).unwrap_or(false);
+    let paper = args.get("paper").and_then(|v| v.as_str()).map(|s| s.to_ascii_lowercase());
+    let custom = match (
+        args.get("paper_width_in").and_then(|v| v.as_f64()),
+        args.get("paper_height_in").and_then(|v| v.as_f64()),
+    ) {
+        (Some(w), Some(h)) if w > 0.0 && h > 0.0 => Some((w, h)),
+        (None, None) => None,
+        _ => {
+            return Err(
+                "paper_width_in and paper_height_in must be positive and set together".into()
+            )
+        }
+    };
+    let dimensions = match custom {
+        Some(d) => Some(d),
+        None => match paper.as_deref() {
+            None => None,
+            Some("a4") => Some((8.27, 11.69)),
+            Some("letter") => Some((8.5, 11.0)),
+            Some("legal") => Some((8.5, 14.0)),
+            Some(other) => {
+                return Err(format!(
+                    "unknown paper \"{other}\" — use a4, letter, legal, or paper_width_in/paper_height_in"
+                ))
+            }
+        },
+    };
+    let margin = args.get("margin_in").and_then(|v| v.as_f64());
+    if let Some(m) = margin {
+        if m < 0.0 {
+            return Err("margin_in cannot be negative".into());
+        }
+        if dimensions.is_none() {
+            return Err(
+                "margin_in needs paper or paper_width_in/paper_height_in — CSS @page margins are used otherwise"
+                    .into(),
+            );
+        }
+    }
+    let mut params = json!({ "printBackground": true, "landscape": landscape });
+    match dimensions {
+        Some((w, h)) => {
+            params["paperWidth"] = json!(w);
+            params["paperHeight"] = json!(h);
+            params["preferCSSPageSize"] = json!(false);
+            if let Some(m) = margin {
+                for key in ["marginTop", "marginBottom", "marginLeft", "marginRight"] {
+                    params[key] = json!(m);
+                }
+            }
+        }
+        None => params["preferCSSPageSize"] = json!(true),
+    }
+    Ok(params)
+}
+
 /// The snapshot's element-census expression. Tags every visible interactive element with an
 /// index and returns the outline the model reads. A constant — the model never writes JS here
 /// (see the module doc).
@@ -1078,9 +1182,20 @@ fn browser_start_with(candidates: &[&str], port: u16) -> crate::core::tools::Too
 /// Capture the connected page as a base64 PNG for `browser_screenshot` to save.
 pub fn capture_screenshot(args: &Value) -> Result<String, String> {
     let port = port_of(args);
-    let out: Result<String, String> = runtime()?.block_on(with_page(port, |conn| {
+    let metrics = device_metrics(args)?;
+    let out: Result<String, String> = runtime()?.block_on(with_page(port, move |conn| {
+        let metrics = metrics.clone();
         Box::pin(async move {
-            let res = command(conn, "Page.captureScreenshot", json!({ "format": "png" })).await?;
+            let overridden = apply_device_metrics(conn, metrics).await?;
+            let shot = command(conn, "Page.captureScreenshot", json!({ "format": "png" })).await;
+            let cleared = clear_device_metrics(conn, overridden).await;
+            let res = match (shot, cleared) {
+                (Ok(res), Ok(())) => res,
+                (Ok(_), Err(e)) => {
+                    return Err(format!("the device viewport could not be restored: {e}"))
+                }
+                (Err(e), _) => return Err(e),
+            };
             res.get("data")
                 .and_then(|d| d.as_str())
                 .map(|s| s.to_string())
@@ -1101,26 +1216,27 @@ pub fn capture_screenshot(args: &Value) -> Result<String, String> {
 /// a page left in print mode would corrupt every later screenshot and snapshot on that tab.
 pub fn print_to_pdf(args: &Value) -> Result<String, String> {
     let port = port_of(args);
-    let landscape = args.get("landscape").and_then(|v| v.as_bool()).unwrap_or(false);
-    let out: Result<String, String> = runtime()?.block_on(with_page(port, |conn| {
+    let params = print_params(args)?;
+    let metrics = device_metrics(args)?;
+    let out: Result<String, String> = runtime()?.block_on(with_page(port, move |conn| {
+        let params = params.clone();
+        let metrics = metrics.clone();
         Box::pin(async move {
-            command(conn, "Emulation.setEmulatedMedia", json!({ "media": "print" })).await?;
-            let printed = command(
-                conn,
-                "Page.printToPDF",
-                json!({
-                    "printBackground": true,
-                    "preferCSSPageSize": true,
-                    "landscape": landscape,
-                }),
-            )
+            let overridden = apply_device_metrics(conn, metrics).await?;
+            let printed = async {
+                command(conn, "Emulation.setEmulatedMedia", json!({ "media": "print" })).await?;
+                let res = command(conn, "Page.printToPDF", params).await;
+                // Restore the screen media even when printing failed: a cached connection must
+                // not keep the next tool call in print mode.
+                let restored =
+                    command(conn, "Emulation.setEmulatedMedia", json!({ "media": "screen" })).await;
+                restored?;
+                res
+            }
             .await;
-            // Restore the screen media even when printing failed: a cached connection must not
-            // keep the next tool call in print mode.
-            let restored =
-                command(conn, "Emulation.setEmulatedMedia", json!({ "media": "screen" })).await;
-            if let Err(e) = restored {
-                return Err(format!("print media could not be restored: {e}"));
+            let cleared = clear_device_metrics(conn, overridden).await;
+            if let Err(e) = cleared {
+                return Err(format!("the device viewport could not be restored: {e}"));
             }
             let res = printed?;
             res.get("data")
@@ -1145,6 +1261,43 @@ mod tests {
     fn the_debugger_url_guard_is_loopback_only() {
         assert!(check_debugger_url(9222).is_ok());
         assert!(check_debugger_url(0).is_err());
+    }
+
+    #[test]
+    fn print_paper_selects_an_explicit_size_and_margins() {
+        let a4 = print_params(&serde_json::json!({ "paper": "a4", "margin_in": 0.63 })).unwrap();
+        assert_eq!(a4["paperWidth"], serde_json::json!(8.27));
+        assert_eq!(a4["paperHeight"], serde_json::json!(11.69));
+        assert_eq!(a4["preferCSSPageSize"], serde_json::json!(false));
+        assert_eq!(a4["marginTop"], serde_json::json!(0.63));
+        // No paper request leaves the page's own @page in charge.
+        let css = print_params(&serde_json::json!({})).unwrap();
+        assert_eq!(css["preferCSSPageSize"], serde_json::json!(true));
+        // A margin without a paper size cannot be applied, and a typo in the name is not a size.
+        assert!(print_params(&serde_json::json!({ "margin_in": 0.5 })).is_err());
+        assert!(print_params(&serde_json::json!({ "paper": "tabloid" })).is_err());
+        assert!(print_params(&serde_json::json!({ "paper_width_in": 8.5 })).is_err());
+    }
+
+    #[test]
+    fn a_device_viewport_needs_both_dimensions() {
+        assert!(device_metrics(&serde_json::json!({ "viewport_width": 390 })).is_err());
+        assert!(device_metrics(
+            &serde_json::json!({ "viewport_width": 390, "viewport_height": 0 })
+        )
+        .is_err());
+        let metrics = device_metrics(&serde_json::json!({
+            "viewport_width": 390,
+            "viewport_height": 844,
+            "mobile": true,
+            "device_scale_factor": 2,
+        }))
+        .unwrap()
+        .expect("a complete viewport");
+        assert_eq!(metrics["width"], serde_json::json!(390));
+        assert_eq!(metrics["height"], serde_json::json!(844));
+        assert_eq!(metrics["mobile"], serde_json::json!(true));
+        assert_eq!(metrics["deviceScaleFactor"], serde_json::json!(2.0));
     }
 
     /// The ledger's classification, fed hand-built CDP frames — no browser needed. This is the
@@ -1408,17 +1561,47 @@ mod tests {
                 name: "browser_print".into(),
                 arguments: serde_json::json!({
                     "port": port,
-                    "path": "documents/round-trip.pdf",
+                    "path": "documents/round-trip-a4.pdf",
+                    "paper": "a4",
+                    "margin_in": 0.63,
+                    "viewport_width": 390,
+                    "viewport_height": 844,
+                    "mobile": true,
                 }),
                 root,
             });
             assert!(printed.ok, "print tool: {:?}", printed.error);
-            let pdf_path = tmp.join("documents/round-trip.pdf");
+            let pdf_path = tmp.join("documents/round-trip-a4.pdf");
             let pdf = std::fs::read(&pdf_path).expect("the PDF must be written");
             assert!(pdf.starts_with(b"%PDF"), "a real PDF comes back");
+            let pdf_raw = String::from_utf8_lossy(&pdf);
+            assert!(
+                pdf_raw.contains("/MediaBox [0 0 595"),
+                "A4 must be the page size, not Letter: {}",
+                pdf_raw.lines().find(|l| l.contains("MediaBox")).unwrap_or("<no MediaBox>")
+            );
             let text = pdf_extract::extract_text(&pdf_path).expect("the PDF text must be readable");
             assert!(text.contains("PRINTONLY"), "print media must be rendered: {text}");
             assert!(!text.contains("SCREENONLY"), "screen-only content must be hidden: {text}");
+
+            // The same override drives a mobile capture: the PNG's own IHDR must report the
+            // emulated viewport, not the browser window's size.
+            let mobile = crate::core::tools::tool_run(crate::core::tools::ToolRunRequest {
+                name: "browser_screenshot".into(),
+                arguments: serde_json::json!({
+                    "port": port,
+                    "path": "images/round-trip-mobile.png",
+                    "viewport_width": 390,
+                    "viewport_height": 844,
+                    "mobile": true,
+                }),
+                root: tmp.to_string_lossy().to_string(),
+            });
+            assert!(mobile.ok, "mobile screenshot: {:?}", mobile.error);
+            let png = std::fs::read(tmp.join("images/round-trip-mobile.png")).unwrap();
+            let width = u32::from_be_bytes([png[16], png[17], png[18], png[19]]);
+            let height = u32::from_be_bytes([png[20], png[21], png[22], png[23]]);
+            assert_eq!((width, height), (390, 844), "the emulated viewport is the capture size");
         }));
         stop_chrome(&mut child);
         let _ = std::fs::remove_dir_all(&tmp);

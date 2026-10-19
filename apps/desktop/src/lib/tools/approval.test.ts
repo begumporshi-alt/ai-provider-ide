@@ -33,6 +33,8 @@ describe("toolEffect", () => {
       "browser_print",
       "browser_screenshot",
       "browser_start",
+      "device_open_url",
+      "device_screenshot",
       "edit_file",
       "edit_notebook",
       "generate_image",

@@ -2056,7 +2056,12 @@ fn do_read_image(args: &serde_json::Value, root: &Path) -> ToolResult {
 /// a target that does not exist yet, which made every default screenshot path fail before the
 /// write (the timestamp is always new). `create_parents = true` is the same discipline
 /// `write_file` uses.
-fn save_tool_binary(root: &Path, rel: &str, bytes: &[u8], ext: &str) -> Result<PathBuf, String> {
+pub(crate) fn save_tool_binary(
+    root: &Path,
+    rel: &str,
+    bytes: &[u8],
+    ext: &str,
+) -> Result<PathBuf, String> {
     if Path::new(rel)
         .extension()
         .and_then(|e| e.to_str())
@@ -2404,6 +2409,11 @@ pub fn tool_run_with_call(req: ToolRunRequest, call_id: Option<&str>) -> ToolRes
         "browser_start" => crate::core::browser::browser_start(&args),
         "browser_screenshot" => do_browser_screenshot(&args, &root),
         "browser_print" => do_browser_print(&args, &root),
+        // Device verification reaches an already-connected Android device or emulator over adb
+        // (core::device). It never installs, runs arbitrary shell commands, or starts an AVD.
+        "device_list" => crate::core::device::device_list(&args),
+        "device_open_url" => crate::core::device::device_open_url(&args),
+        "device_screenshot" => crate::core::device::device_screenshot(&args, &root),
         other => ToolResult::err(format!("unknown tool \"{other}\"")),
     }
 }

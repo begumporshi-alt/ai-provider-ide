@@ -1720,19 +1720,24 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     const imageMessages: ChatMessage[] = [];
     for (let i = 0; i < executed.length; i++) {
       const r = executed[i]!;
-      // `read_image`, `generate_image` and `browser_screenshot` return their payload under the
-      // same marker: the tool message itself stays a short text receipt, and the image rides as a
-      // real content part on a following user message — the same wire shape chat attachments use.
-      // Without this, the base64 would flood the transcript as text no model can see.
-      // (browser_screenshot joined late — its captures used to flood exactly like that.)
+      // `read_image`, `generate_image`, `browser_screenshot` and `device_screenshot` return their
+      // payload under the same marker: the tool message itself stays a short text receipt, and the
+      // image rides as a real content part on a following user message — the same wire shape chat
+      // attachments use. Without this, the base64 would flood the transcript as text no model can
+      // see. (browser_screenshot joined late — its captures used to flood exactly like that.)
       const imageData =
-        (r.name === "read_image" || r.name === "generate_image" || r.name === "browser_screenshot") && r.ok
+        (r.name === "read_image" ||
+          r.name === "generate_image" ||
+          r.name === "browser_screenshot" ||
+          r.name === "device_screenshot") &&
+        r.ok
           ? extractReadImage(r.resultText)
           : null;
       if (imageData) {
         const verb =
           r.name === "generate_image" ? "generated and saved"
           : r.name === "browser_screenshot" ? "captured and saved"
+          : r.name === "device_screenshot" ? "captured from the device and saved"
           : "loaded";
         // A second copy, app-side: the workspace file is the primary source, but it is exactly the
         // thing a revert or a clean takes away — and a replayed transcript's preview had nothing

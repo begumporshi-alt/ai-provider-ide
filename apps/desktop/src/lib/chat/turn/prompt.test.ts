@@ -6,6 +6,17 @@ import { PROMPT_CAP, countPatches } from "@aiprovider/axiom-core";
 import type { ChatMessage } from "@aiprovider/router-core";
 
 describe("buildAgentSystem", () => {
+  it("names the checks to run when a project has no test script, and how to verify print and devices", () => {
+    // The failure this pins: a project with only dev/build/start/typecheck was reported as
+    // "nothing to run", and print verification stopped at Chrome's default Letter paper. The
+    // prompt has to name the fallback checks and the tools that reach real paper sizes/devices.
+    expect(AGENT_SYSTEM).toContain("no test script");
+    expect(AGENT_SYSTEM).toContain("typecheck");
+    expect(AGENT_SYSTEM).toContain("nothing to run");
+    expect(AGENT_SYSTEM).toContain("paper");
+    expect(AGENT_SYSTEM).toContain("device_screenshot");
+  });
+
   it("concatenates base → skills → memory → plan mode → per-turn, omitting absent pieces", () => {
     const out = buildAgentSystem({
       root: "/tmp/ws",

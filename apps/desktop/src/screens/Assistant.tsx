@@ -3936,7 +3936,10 @@ function ToolCallRow({
   // the same flooding the loop's receipt protocol stops on the wire (browser_screenshot joined
   // that protocol late; before it did, its rows were megabytes of unreadable text).
   const shotPath =
-    (step.name === "browser_screenshot" || step.name === "read_image" || step.name === "generate_image") &&
+    (step.name === "browser_screenshot" ||
+      step.name === "device_screenshot" ||
+      step.name === "read_image" ||
+      step.name === "generate_image") &&
     typeof step.result === "string"
       ? imagePathFromResult(step.result)
       : null;
@@ -4132,7 +4135,11 @@ function ToolResultBubble({
   // An image-carrying call renders the picture above its bubble — the persisted transcript keeps
   // the short receipt (the loop's marker protocol), so the path is what the result names.
   const shotPath =
-    call && (call.name === "browser_screenshot" || call.name === "read_image" || call.name === "generate_image")
+    call &&
+    (call.name === "browser_screenshot" ||
+      call.name === "device_screenshot" ||
+      call.name === "read_image" ||
+      call.name === "generate_image")
       ? imagePathFromResult(content)
       : null;
   if (shotPath && root) {

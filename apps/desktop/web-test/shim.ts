@@ -2285,6 +2285,20 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         virtualFs.set(rel, TINY_PDF);
         return ok(`printed the page to ${rel} (1 KB) with print media — read_document can read its text`);
       }
+      if (name === "device_list") {
+        return ok("adb: /fixtures/platform-tools/adb\nemulator-5554  device  model:fixture");
+      }
+      if (name === "device_open_url") {
+        const url = String(toolArgs["url"] ?? "");
+        if (!/^https?:\/\//.test(url)) return fail('"url" must start with http:// or https://');
+        return ok(`opened ${url} on emulator-5554`);
+      }
+      if (name === "device_screenshot") {
+        const TINY_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        const rel = String(toolArgs["path"] ?? "images/device-fixture.png");
+        virtualFs.set(rel, TINY_PNG);
+        return ok(`READ_IMAGE:image/png;base64,${TINY_PNG}\npath: ${rel}\nbytes: 70`);
+      }
       if (name === "read_image") {
         const p = String(toolArgs["path"] ?? "");
         const data = virtualFs.get(p);

@@ -43,6 +43,7 @@ pub mod code_adapter;
 pub mod compress;
 pub mod context;
 pub mod crash_report;
+pub mod device;
 pub mod dialect_shaping;
 pub mod drift;
 pub mod egress;

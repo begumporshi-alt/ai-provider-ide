@@ -205,6 +205,13 @@ export function createCheckpointingHost(inner: ToolHost, checkpoint: RunCheckpoi
           checkpoint.noteUntracked(
             `rendered a print PDF${path ? ` to ${path}` : " into documents/"} — a new render, never an overwrite of tracked content`,
           );
+        } else if (name === "device_screenshot") {
+          checkpoint.noteUntracked(
+            `saved a device screenshot${path ? ` to ${path}` : " into images/"} — a new capture, never an overwrite of tracked content`,
+          );
+        } else if (name === "device_open_url") {
+          const url = typeof args.url === "string" ? args.url : "a URL";
+          checkpoint.noteUntracked(`opened ${url} in the connected Android device's browser`);
         }
         return inner.run(name, args, opts);
       }

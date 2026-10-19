@@ -298,10 +298,26 @@ it, and `pnpm check-version-sync` fails the build when one does not.
   the result into the workspace (`documents/` by default). This is the only path that applies
   `@media print` and `@page`: `browser_screenshot` captures screen media, so a print stylesheet could
   be confirmed as served but never seen. The emulation is restored to `screen` before the call
-  returns, because the connection is cached across tool calls. The model reads the PDF's text back
-  with `read_document`; the tool is approval-gated like the other browser drivers. The real-Chrome
-  round trip navigates to a page with distinct screen/print markers, renders it, and asserts the PDF
-  contains `PRINTONLY` and not `SCREENONLY`.
+  returns, because the connection is cached across tool calls. Paper is selectable too — `paper:
+  a4|letter|legal`, custom inches and `margin_in` — and both print and screenshot accept an emulated
+  `viewport_width`/`viewport_height` with `mobile`, so A4 and phone/tablet layouts can be rendered
+  instead of only Chrome's default Letter. The model reads the PDF's text back with
+  `read_document`; the tool is approval-gated like the other browser drivers. The real-Chrome round
+  trip navigates to a page with distinct screen/print markers, renders it at A4 with a phone
+  viewport, and asserts the PDF contains `PRINTONLY` and not `SCREENONLY` and that the mobile PNG's
+  IHDR is the emulated 390×844.
+
+- **The Assistant verifies the checks a project actually has, and can see a real Android device.**
+  `AGENT_SYSTEM` now names `typecheck`/`lint`/`build` as the fallback when a project has no `test`
+  script — never "nothing to run" when those exist — and points print verification at paper sizes
+  and phone/tablet viewports instead of Chrome's default alone. Three Assistant-only tools drive an
+  already-running Android emulator or USB device over adb: `device_list` reports serial, state and
+  model; `device_open_url` opens a URL in the device browser (`10.0.2.2` is the host from the
+  emulator); `device_screenshot` saves a PNG into the workspace and returns the same `READ_IMAGE`
+  marker the vision path already handles. All three are approval-gated for mutations, never install
+  apps or run arbitrary shell commands, and every failure names the missing adb/device precondition.
+  Verified against the Pixel 6 AVD: `device_list` sees `emulator-5554`, and `device_screenshot`
+  returns a real 1080×2400 PNG.
 
 ### Changed
 

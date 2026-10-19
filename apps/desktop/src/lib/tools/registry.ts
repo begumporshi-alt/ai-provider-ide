@@ -243,6 +243,22 @@ export const AGENT_TOOLS: ToolSpec[] = [
           description: "Optional workspace-relative save path. Defaults to images/browser-<timestamp>.png.",
         },
         port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+        viewport_width: {
+          type: "number",
+          description: "Optional emulated viewport width in CSS px for a mobile/tablet capture. Requires viewport_height.",
+        },
+        viewport_height: {
+          type: "number",
+          description: "Optional emulated viewport height in CSS px. Requires viewport_width.",
+        },
+        mobile: {
+          type: "boolean",
+          description: "Optional. true enables mobile emulation (meta viewport handling). Defaults to false.",
+        },
+        device_scale_factor: {
+          type: "number",
+          description: "Optional device pixel ratio for the emulated viewport. Defaults to 1.",
+        },
       },
       required: [],
     },
@@ -259,9 +275,42 @@ export const AGENT_TOOLS: ToolSpec[] = [
           description: "Optional workspace-relative .pdf save path. Defaults to documents/print-<timestamp>.pdf.",
         },
         port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+        paper: {
+          type: "string",
+          enum: ["a4", "letter", "legal"],
+          description: "Optional paper size. Without it Chrome uses the page's CSS @page size (Letter when unspecified).",
+        },
+        paper_width_in: {
+          type: "number",
+          description: "Optional custom paper width in inches. Requires paper_height_in.",
+        },
+        paper_height_in: {
+          type: "number",
+          description: "Optional custom paper height in inches. Requires paper_width_in.",
+        },
+        margin_in: {
+          type: "number",
+          description: "Optional uniform margin in inches; requires paper or custom paper dimensions. Without paper, CSS @page margins apply.",
+        },
         landscape: {
           type: "boolean",
           description: "Optional. true renders landscape pages. Defaults to portrait.",
+        },
+        viewport_width: {
+          type: "number",
+          description: "Optional emulated viewport width in CSS px for mobile/tablet print. Requires viewport_height.",
+        },
+        viewport_height: {
+          type: "number",
+          description: "Optional emulated viewport height in CSS px. Requires viewport_width.",
+        },
+        mobile: {
+          type: "boolean",
+          description: "Optional. true enables mobile emulation (meta viewport handling). Defaults to false.",
+        },
+        device_scale_factor: {
+          type: "number",
+          description: "Optional device pixel ratio for the emulated viewport. Defaults to 1.",
         },
       },
       required: [],
@@ -331,6 +380,55 @@ export const AGENT_TOOLS: ToolSpec[] = [
     parameters: {
       properties: {
         port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "device_list",
+    effect: "read",
+    description:
+      "List the Android devices and emulators adb can see, with serial and state. Use it before device_open_url or device_screenshot; it says so when adb or a device is missing.",
+    parameters: {
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: "device_open_url",
+    effect: "mutate",
+    description:
+      "Open a URL in the connected Android device's browser and wait briefly for it to load. From the standard emulator, 10.0.2.2 reaches the host. Use device_list first if unsure.",
+    parameters: {
+      properties: {
+        url: { type: "string", description: "http:// or https:// URL to open." },
+        serial: {
+          type: "string",
+          description: "Optional adb serial from device_list. Defaults to the first ready device.",
+        },
+        wait_ms: {
+          type: "number",
+          description: "Optional wait after launching, in ms (default 1500, max 10000).",
+        },
+      },
+      required: ["url"],
+    },
+  },
+  {
+    name: "device_screenshot",
+    effect: "mutate",
+    description:
+      "Capture the connected Android device's screen as a PNG saved into the workspace (images/ by default) and attach it, so a vision model sees the real device. Use device_list first; pair with device_open_url.",
+    parameters: {
+      properties: {
+        serial: {
+          type: "string",
+          description: "Optional adb serial from device_list. Defaults to the first ready device.",
+        },
+        path: {
+          type: "string",
+          description: "Optional workspace-relative .png save path. Defaults to images/device-<serial>-<timestamp>.png.",
+        },
       },
       required: [],
     },
