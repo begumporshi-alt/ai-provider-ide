@@ -33,6 +33,7 @@ const captureMemories = vi.spyOn(store, "captureMemories");
 const captureMemory = vi.spyOn(store, "captureMemory");
 const recallMemories = vi.spyOn(store, "recallMemories");
 const listMemories = vi.spyOn(store, "listMemories");
+const listScopedMemories = vi.spyOn(store, "listScopedMemories");
 const sessionMemories = vi.spyOn(store, "sessionMemories");
 const updateMemory = vi.spyOn(store, "updateMemory");
 const recordContext = vi.spyOn(store, "recordContext");
@@ -54,6 +55,7 @@ describe("memory engine", () => {
     captureMemory.mockReset();
     recallMemories.mockReset();
     listMemories.mockReset();
+    listScopedMemories.mockReset();
     sessionMemories.mockReset();
     updateMemory.mockReset();
     recordContext.mockReset();
@@ -435,6 +437,39 @@ describe("memory engine", () => {
     it("returns nothing instead of throwing when recall fails", async () => {
       recallMemories.mockRejectedValue(new Error("fts corrupt"));
       await expect(recallContext("q")).resolves.toEqual([]);
+    });
+
+    it("scopes both the pinned prefetch and the query recall to the workspace root", async () => {
+      listScopedMemories.mockResolvedValue([mem("identity", "L3", "I am Tushu", true)]);
+      recallMemories.mockResolvedValue([]);
+
+      const got = await recallContext("fix the build", { root: "/tmp/next-app" });
+
+      expect(listScopedMemories).toHaveBeenCalledWith({
+        projectRoot: "/tmp/next-app",
+        pinnedOnly: true,
+        limit: 50,
+      });
+      expect(recallMemories).toHaveBeenCalledWith("fix the build", 4, ["L3", "L2"], {
+        projectRoot: "/tmp/next-app",
+      });
+      expect(recallMemories).toHaveBeenCalledWith("fix the build", 8, ["L1"], {
+        projectRoot: "/tmp/next-app",
+      });
+      expect(got.map((m) => m.id)).toEqual(["identity"]);
+    });
+
+    it("never sends a scope when the root is blank", async () => {
+      await recallContext("q", { root: "   " });
+
+      // The scoped endpoint answers 400 to a blank root, and the catch below would turn that into
+      // an empty, silent recall. A whitespace root is no root: keep the Memory screen's unscoped
+      // read rather than pretending it is a workspace.
+      expect(listScopedMemories).not.toHaveBeenCalled();
+      expect(listMemories).toHaveBeenCalledWith(null, 50);
+      for (const call of recallMemories.mock.calls) {
+        expect(call[3]).toBeUndefined();
+      }
     });
   });
 

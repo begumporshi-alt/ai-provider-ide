@@ -1604,14 +1604,40 @@ export async function captureMemories(
   return res.captured;
 }
 
-/** BM25 recall. `layers` narrows the search; omit it to search all four. */
+/**
+ * BM25 recall. `layers` narrows the search; omit it to search all four.
+ *
+ * `scope.projectRoot` is resolved host-side to the same project key the gateway uses. Omit it
+ * only for the Memory screen's intentional unscoped search; the Assistant always passes a root,
+ * because a missing root is not "everything", it is "this caller chose not to scope".
+ */
 export async function recallMemories(
-  query: string, limit = 8, layers?: MemoryLayer[],
+  query: string,
+  limit = 8,
+  layers?: MemoryLayer[],
+  scope?: { projectRoot?: string },
 ): Promise<Memory[]> {
   return fetchAdminAs("POST", "/admin/memory/recall", arrayOf(isMemory), {
     query,
     limit,
     layers: layers ?? null,
+    project_root: scope?.projectRoot ?? null,
+  });
+}
+
+export interface MemoryListScope {
+  /** Workspace root. Resolved host-side to the same project key the gateway uses. */
+  projectRoot: string;
+  limit?: number;
+  pinnedOnly?: boolean;
+}
+
+/** Scoped listing: the Assistant's read surface. No query, so always-on rows are included. */
+export async function listScopedMemories(scope: MemoryListScope): Promise<Memory[]> {
+  return fetchAdminAs("POST", "/admin/memory/scoped", arrayOf(isMemory), {
+    project_root: scope.projectRoot,
+    limit: scope.limit ?? 200,
+    pinned_only: scope.pinnedOnly ?? false,
   });
 }
 

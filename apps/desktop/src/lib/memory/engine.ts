@@ -14,6 +14,7 @@ import {
   captureMemories,
   captureMemory,
   listMemories,
+  listScopedMemories,
   recallMemories,
   sessionMemories,
   updateMemory,
@@ -399,27 +400,46 @@ export function parseScenarios(
     .slice(0, MAX_SCENARIOS_PER_PASS);
 }
 
+/** Options for {@link recallContext}. */
+export interface RecallOptions {
+  limit?: number;
+  layers?: MemoryLayer[];
+  /** Workspace root. When set, every read is scoped to that workspace. */
+  root?: string;
+}
+
 /**
  * Layered recall: abstract layers first, then specifics, pinned always.
  *
  * Pinned memories are prepended because pinning is the operator saying "this must never be
  * dropped", and BM25 has no notion of importance — only of relevance to this query.
+ *
+ * `root` is the workspace the caller is reading for. When it is set, **every** read is scoped:
+ * the pinned prefetch goes through the scoped list endpoint and each recall forwards the root.
+ * This is the difference between "the assistant knows its workspace" and "the assistant knows
+ * every workspace the operator has ever opened" — the latter is contamination, not context.
  */
 export async function recallContext(
   query: string,
-  opts: { limit?: number; layers?: MemoryLayer[] } = {},
+  opts: RecallOptions = {},
 ): Promise<Memory[]> {
   const limit = Math.max(1, opts.limit ?? 8);
   try {
-    const pinned = (await listMemories(null, 50)).filter((m) => m.pinned).slice(0, 4);
+    const root = opts.root?.trim() || undefined;
+    // Scoped: ask for the pinned, in-scope rows directly. The old `listMemories` scan saw
+    // every workspace's pinned rows, which is the contamination this path exists to stop.
+    const pinned = root
+      ? (await listScopedMemories({ projectRoot: root, pinnedOnly: true, limit: 50 })).slice(0, 4)
+      : (await listMemories(null, 50)).filter((m) => m.pinned).slice(0, 4);
 
     let hits: Memory[];
     if (opts.layers && opts.layers.length > 0) {
-      hits = await recallMemories(query, limit, opts.layers);
+      hits = await recallMemories(query, limit, opts.layers, root ? { projectRoot: root } : undefined);
     } else {
       // Half the budget is reserved for the distilled layers; whatever they do not use is
       // given to the specific ones, so neither tier can starve the other.
-      const abstract = await recallMemories(query, Math.ceil(limit / 2), ["L3", "L2"]);
+      const scope = root ? { projectRoot: root } : undefined;
+      const abstract = await recallMemories(query, Math.ceil(limit / 2), ["L3", "L2"], scope);
       const remaining = limit - abstract.length;
       // L0 is deliberately NOT recalled here. It is verbatim conversation and this path applies no
       // session filter, so an L0 hit can be another session's turns — the privacy inversion the
@@ -427,7 +447,7 @@ export async function recallContext(
       // dropping it: `replayHistory` already puts this session's turns in the request verbatim, so
       // an L0 recall of the current session only duplicates them.
       const specific =
-        remaining > 0 ? await recallMemories(query, remaining, ["L1"]) : [];
+        remaining > 0 ? await recallMemories(query, remaining, ["L1"], scope) : [];
       hits = [...abstract, ...specific];
     }
 
