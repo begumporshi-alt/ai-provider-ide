@@ -1529,6 +1529,10 @@ export async function agentRunSteps(runId: string): Promise<AgentStep[]> {
 
 export type MemoryLayer = "L0" | "L1" | "L2" | "L3";
 
+/** What a row is. `conversation` is L0 verbatim turns; the rest are distilled material. */
+export type MemoryKind =
+  | "identity" | "preference" | "decision" | "project_fact" | "capability" | "conversation";
+
 /**
  * Where a memory may be injected. A row with neither a project nor an explicit global mark is
  * capture-only — it will never be injected into a request, no matter which agent asks.
@@ -1553,6 +1557,16 @@ export interface Memory {
   score?: number;
   /** §6.4.3: when this row was superseded, or null while it is live. Kept, not deleted. */
   superseded_at: number | null;
+  /** What the row is; `null` only for a row written before 0033 and never re-classified. */
+  kind: MemoryKind | null;
+  /** How it got here: user_stated, inferred, probe. Defaults to inferred. */
+  source: string;
+  /** Capability rows only: live, unverified, contradicted. Null for everything else. */
+  verified: "live" | "unverified" | "contradicted" | null;
+  /** Stop injecting after this instant. Null means no expiry. The row is kept, not deleted. */
+  expires_at: number | null;
+  retrieval_count: number;
+  last_retrieved_at: number | null;
 }
 
 /** §6.4.5: one contradiction a human has to settle. */
@@ -1644,6 +1658,23 @@ export async function listScopedMemories(scope: MemoryListScope): Promise<Memory
 export async function listMemories(layer?: MemoryLayer | null, limit = 200): Promise<Memory[]> {
   const qs = layer ? `?layer=${layer}&limit=${limit}` : `?limit=${limit}`;
   return fetchAdminAs("GET", `/admin/memory${qs}`, arrayOf(isMemory));
+}
+
+/**
+ * Account for the rows a turn actually recalled.
+ *
+ * Fire-and-forget at the call site: a usage counter must never delay or fail a turn. The host
+ * writes these after the request is already in flight, never on the gateway's read path.
+ */
+export async function markMemoriesRetrieved(ids: string[]): Promise<number> {
+  if (ids.length === 0) return 0;
+  const res = expectShapeOr(
+    await fetchAdmin("POST", "/admin/memory/retrieved", { ids }),
+    (v): v is { updated: number } =>
+      typeof v === "object" && v !== null && typeof (v as { updated?: unknown }).updated === "number",
+    { updated: 0 },
+  );
+  return res.updated;
 }
 
 export async function forgetMemory(id: string): Promise<boolean> {

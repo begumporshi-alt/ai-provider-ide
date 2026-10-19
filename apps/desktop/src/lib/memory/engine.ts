@@ -16,6 +16,7 @@ import {
   captureMemory,
   listMemories,
   listScopedMemories,
+  markMemoriesRetrieved,
   recallMemories,
   sessionMemories,
   updateMemory,
@@ -463,6 +464,11 @@ export async function recallContext(
       if (seen.has(m.id)) continue;
       seen.add(m.id);
       merged.push(m);
+    }
+    if (merged.length > 0) {
+      // Fire-and-forget: a usage counter must never delay or fail a turn. This is also why the
+      // blank-root early return above runs before any read — there is nothing to account for.
+      void markMemoriesRetrieved(merged.map((m) => m.id)).catch(() => 0);
     }
     return merged;
   } catch {

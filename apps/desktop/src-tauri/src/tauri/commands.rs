@@ -443,7 +443,15 @@ pub fn memory_capture(
 ) -> Result<memory::Memory, CommandError> {
     memory::capture(
         &store,
-        &memory::MemoryInput { layer, text, session_id, subject, pinned: pinned.unwrap_or(false) },
+        &memory::MemoryInput {
+            layer,
+            text,
+            session_id,
+            subject,
+            pinned: pinned.unwrap_or(false),
+            kind: None,
+            source: None,
+        },
     )
     .map_err(CommandError)
 }

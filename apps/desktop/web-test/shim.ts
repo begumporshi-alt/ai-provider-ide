@@ -409,6 +409,30 @@ const projectKey = (root: string): string => {
  */
 const wireMemory = (m: Row): Row => ({ ...m, pinned: Boolean(m.pinned) });
 
+/**
+ * 0033 metadata a row carries from birth. Mirrors the columns `add_memory_metadata` adds and the
+ * conservative layer heuristic in `capture`: L3 is identity, L0 is conversation, the distilled
+ * middle is a project fact until something classifies it better. A row that predates the columns
+ * gets the same defaults filled in on touch.
+ */
+function memoryMetadata(layer: unknown): Row {
+  return {
+    kind: layer === "L3" ? "identity" : layer === "L0" ? "conversation" : "project_fact",
+    source: "inferred",
+    verified: null,
+    expires_at: null,
+    retrieval_count: 0,
+    last_retrieved_at: null,
+  };
+}
+
+/** Fill metadata columns on a row stored before 0033, without overwriting a real value. */
+function fillMemoryMetadata(row: Row): void {
+  for (const [k, v] of Object.entries(memoryMetadata(row.layer))) {
+    if (row[k] === undefined) row[k] = v;
+  }
+}
+
 const STEP_KINDS = ["assistant", "tool_call", "tool_result", "done", "denied"];
 /** context.rs caps a repeated edge's weight so one hot pair cannot swamp the layout. */
 const MAX_WEIGHT = 50;
@@ -2390,6 +2414,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         // them in on touch so the Memory screen's `ScopeSelect` doesn't read `.global` of undefined.
         if (!seen.scope) seen.scope = { ...DEFAULT_SCOPE };
         if (seen.superseded_at === undefined) seen.superseded_at = null;
+        fillMemoryMetadata(seen);
         return wireMemory(seen);
       }
       const row: Row = {
@@ -2398,6 +2423,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         created_at: now, updated_at: now, pinned: args.pinned ? 1 : 0,
         scope: { ...DEFAULT_SCOPE },
         superseded_at: null,
+        ...memoryMetadata(layer),
       };
       memories.push(row);
       return wireMemory(row);
@@ -2434,6 +2460,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         const seen = memories.find((m) => m.layer === it.layer && m.text === text);
         if (seen) {
           seen.updated_at = now;
+          fillMemoryMetadata(seen);
         } else {
           memories.push({
             id: `m-${it.layer}-${memories.length + 1}-${now}`, layer: it.layer, text,
@@ -2441,6 +2468,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
             created_at: now, updated_at: now, pinned: it.pinned ? 1 : 0,
             scope: { ...DEFAULT_SCOPE },
             superseded_at: null,
+            ...memoryMetadata(it.layer),
           });
         }
         n += 1;
@@ -2561,6 +2589,18 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         .sort((a, b) => (a.created_at as number) - (b.created_at as number))
         .slice(0, limit)
         .map(wireMemory);
+    }
+    case "memory_mark_retrieved": {
+      const ids = (args.ids as string[] | undefined) ?? [];
+      let n = 0;
+      for (const id of ids) {
+        const m = memories.find((x) => x.id === id);
+        if (!m) continue;
+        m.retrieval_count = Number(m.retrieval_count ?? 0) + 1;
+        m.last_retrieved_at = Date.now();
+        n += 1;
+      }
+      return n;
     }
     case "memory_clear":
       memories.length = 0;
@@ -3408,6 +3448,17 @@ async function routeMemory(method: string, segs: string[], q: URLSearchParams, b
           query: b.query ?? "", limit: b.limit ?? 8, layers: b.layers ?? null,
           project_root: b.project_root ?? null,
         });
+      }
+      break;
+    }
+    case "retrieved": {
+      if (method === "POST") {
+        const b = (body ?? {}) as Row;
+        return {
+          updated: await dispatch("memory_mark_retrieved", {
+            ids: Array.isArray(b.ids) ? b.ids.map(String) : [],
+          }),
+        };
       }
       break;
     }

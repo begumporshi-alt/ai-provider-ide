@@ -366,6 +366,12 @@ describe("runPlainTurn", () => {
       scope: { user: "local", project: null, agent: null, global: false },
       score: -1,
       superseded_at: null,
+      kind: "project_fact",
+      source: "inferred",
+      verified: null,
+      expires_at: null,
+      retrieval_count: 0,
+      last_retrieved_at: null,
     };
     const { ports, patches, appended } = makePorts({ chunks: ["got it"], recalled: [remembered] });
     await runPlainTurn(makeRequest(), ports);

@@ -1151,6 +1151,37 @@ pub async fn memory_scoped_list_h(
     }
 }
 
+/// `POST /admin/memory/retrieved` — bump the usage counters for the rows a turn recalled.
+///
+/// The gateway's read path is deliberately read-only; the webview reports what it actually
+/// injected after the request is already in flight, so a counter write can never delay a turn.
+#[derive(Deserialize)]
+pub struct RetrievedBody {
+    pub ids: Vec<String>,
+}
+
+pub async fn memory_retrieved_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Json(body): Json<RetrievedBody>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers).await {
+        return *r;
+    }
+    let store = match require_store(&core, "POST /admin/memory/retrieved") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    match memory::mark_retrieved(store, &body.ids) {
+        Ok(n) => (StatusCode::OK, Json(serde_json::json!({ "updated": n }))).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not mark retrieved: {e}"),
+            Some("memory_retrieved_failed"),
+        ),
+    }
+}
+
 /// `DELETE /admin/memory/{id}` — forget one.
 pub async fn memory_forget_h(
     State(core): State<Arc<GatewayCore>>,

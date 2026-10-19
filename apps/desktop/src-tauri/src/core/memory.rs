@@ -58,7 +58,7 @@ const RELEVANCE_BAND: f64 = 0.15;
 /// reorder what it is shown, so the shortlist has to be wider than the answer.
 const CANDIDATE_FACTOR: usize = 4;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Memory {
     pub id: String,
     /// One of `LAYERS`.
@@ -84,6 +84,26 @@ pub struct Memory {
     /// only `unsupersede` clears it; pruning never touches it.
     #[serde(default)]
     pub superseded_at: Option<i64>,
+    /// What the row is: identity, preference, decision, project_fact, capability, conversation.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// How it got here: user_stated, inferred, probe. Defaults to inferred.
+    #[serde(default = "default_memory_source")]
+    pub source: String,
+    /// Capability rows only: live, unverified, contradicted. NULL for everything else.
+    #[serde(default)]
+    pub verified: Option<String>,
+    /// Stop injecting after this instant. NULL means no expiry.
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    #[serde(default)]
+    pub retrieval_count: i64,
+    #[serde(default)]
+    pub last_retrieved_at: Option<i64>,
+}
+
+fn default_memory_source() -> String {
+    "inferred".into()
 }
 
 /// The scope a memory is bound to. Mirrors `context_scope::Scope`, minus `session`: a session is a
@@ -147,6 +167,10 @@ pub struct MemoryInput {
     pub subject: Option<String>,
     #[serde(default)]
     pub pinned: bool,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default, PartialEq)]
@@ -174,6 +198,42 @@ fn now_ms() -> i64 {
 
 fn valid_layer(l: &str) -> bool {
     LAYERS.contains(&l)
+}
+
+/// The one-time classifier used by the 0033 backfill and by `capture` when the caller supplies
+/// no kind. Deliberately conservative: a mis-typed row is a worse failure than an untyped one.
+pub(crate) fn classify_kind(layer: &str, text: &str) -> &'static str {
+    if layer == "L0" {
+        return "conversation";
+    }
+    if layer == "L3" {
+        return "identity";
+    }
+    let t = text.to_ascii_lowercase();
+    const CAPABILITY: &[&str] = &[
+        "git clone",
+        "git fetch",
+        "cannot run",
+        "can't run",
+        "not available",
+        "no access",
+        "unable to",
+        "no real shell",
+        "shell is available",
+    ];
+    if CAPABILITY.iter().any(|p| t.contains(p)) {
+        return "capability";
+    }
+    const PREFERENCE: &[&str] =
+        &["prefers", "prefer ", "likes ", "wants ", "always use", "never use", "concise"];
+    if PREFERENCE.iter().any(|p| t.contains(p)) {
+        return "preference";
+    }
+    const DECISION: &[&str] = &["decided", "we will", "we'll", "chosen", "approved", "agreed"];
+    if DECISION.iter().any(|p| t.contains(p)) {
+        return "decision";
+    }
+    "project_fact"
 }
 
 fn clamp_text(s: &str) -> String {
@@ -210,6 +270,37 @@ pub(crate) fn match_expr(query: &str) -> Option<String> {
     }
 }
 
+/// Column order shared by `list`, `list_scoped` and `session_atoms`:
+/// 0 id, 1 layer, 2 text, 3 session_id, 4 subject, 5 created_at, 6 updated_at, 7 pinned,
+/// 8 scope_user, 9 scope_project, 10 scope_agent, 11 scope_global, 12 superseded_at,
+/// 13 kind, 14 source, 15 verified, 16 expires_at, 17 retrieval_count, 18 last_retrieved_at.
+fn memory_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
+    Ok(Memory {
+        id: r.get(0)?,
+        layer: r.get(1)?,
+        text: r.get(2)?,
+        session_id: r.get(3)?,
+        subject: r.get(4)?,
+        created_at: r.get(5)?,
+        updated_at: r.get(6)?,
+        pinned: r.get::<_, i64>(7)? != 0,
+        scope: MemoryScope {
+            user: r.get(8)?,
+            project: r.get(9)?,
+            agent: r.get(10)?,
+            global: r.get::<_, i64>(11)? != 0,
+        },
+        superseded_at: r.get(12)?,
+        kind: r.get(13)?,
+        source: r.get(14)?,
+        verified: r.get(15)?,
+        expires_at: r.get(16)?,
+        retrieval_count: r.get(17)?,
+        last_retrieved_at: r.get(18)?,
+        score: None,
+    })
+}
+
 /// Record one memory. Re-recording identical `(layer, text)` refreshes the timestamp instead
 /// of inserting — extraction runs repeatedly over overlapping turns and would otherwise
 /// accumulate the same atom once per run.
@@ -229,22 +320,42 @@ pub fn capture(store: &Store, input: &MemoryInput) -> Result<Memory, String> {
     let mut conn = store.conn.lock().map_err(|e| e.to_string())?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
 
-    let existing: Option<(String, i64, i64, bool)> = tx
+    let existing: Option<(String, i64, i64, bool, Option<String>, String)> = tx
         .query_row(
-            "SELECT id, created_at, updated_at, pinned FROM memories WHERE layer = ?1 AND text = ?2",
+            "SELECT id, created_at, updated_at, pinned, kind, source
+               FROM memories WHERE layer = ?1 AND text = ?2",
             params![input.layer, text],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get::<_, i64>(3)? != 0,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
         )
         .ok();
 
     let row = match existing {
-        Some((id, created_at, _updated_at, pinned)) => {
+        Some((id, created_at, _updated_at, pinned, existing_kind, existing_source)) => {
             let keep_pinned = pinned || input.pinned;
+            // Re-record: refresh the timestamp without erasing a classification someone set.
             tx.execute(
                 "UPDATE memories SET updated_at = ?1, pinned = ?2,
-                        session_id = COALESCE(?3, session_id), subject = COALESCE(?4, subject)
-                 WHERE id = ?5",
-                params![now, keep_pinned as i64, input.session_id, input.subject, id],
+                        session_id = COALESCE(?3, session_id), subject = COALESCE(?4, subject),
+                        kind = COALESCE(?5, kind), source = COALESCE(?6, source)
+                  WHERE id = ?7",
+                params![
+                    now,
+                    keep_pinned as i64,
+                    input.session_id,
+                    input.subject,
+                    input.kind,
+                    input.source,
+                    id
+                ],
             )
             .map_err(|e| e.to_string())?;
             // Re-recording refreshes text and timestamp but deliberately leaves scope alone — an
@@ -278,13 +389,25 @@ pub fn capture(store: &Store, input: &MemoryInput) -> Result<Memory, String> {
                 scope,
                 score: None,
                 superseded_at: None,
+                kind: input.kind.clone().or(existing_kind),
+                source: input.source.clone().unwrap_or(existing_source),
+                verified: None,
+                expires_at: None,
+                retrieval_count: 0,
+                last_retrieved_at: None,
             }
         }
         None => {
             let id = format!("m-{}-{}", input.layer, uuid_like());
+            let kind = input
+                .kind
+                .clone()
+                .unwrap_or_else(|| classify_kind(&input.layer, &text).to_string());
+            let source = input.source.clone().unwrap_or_else(default_memory_source);
             tx.execute(
-                "INSERT INTO memories (id, layer, text, session_id, subject, created_at, updated_at, pinned)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                "INSERT INTO memories
+                    (id, layer, text, session_id, subject, created_at, updated_at, pinned, kind, source)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                 params![
                     id,
                     input.layer,
@@ -293,7 +416,9 @@ pub fn capture(store: &Store, input: &MemoryInput) -> Result<Memory, String> {
                     input.subject,
                     now,
                     now,
-                    input.pinned as i64
+                    input.pinned as i64,
+                    kind,
+                    source
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -316,6 +441,14 @@ pub fn capture(store: &Store, input: &MemoryInput) -> Result<Memory, String> {
                 },
                 score: None,
                 superseded_at: None,
+                kind: Some(kind),
+                source,
+                // A claim is only verified by a probe, and nothing captured from a turn is given
+                // an expiry by default.
+                verified: None,
+                expires_at: None,
+                retrieval_count: 0,
+                last_retrieved_at: None,
             }
         }
     };
@@ -520,7 +653,8 @@ fn recall_inner(
     let fetch = limit.saturating_mul(CANDIDATE_FACTOR).max(limit);
     let sql = format!(
         "SELECT m.id, m.layer, m.text, m.session_id, m.subject, m.created_at, m.updated_at, m.pinned,
-                m.scope_user, m.scope_project, m.scope_agent, m.scope_global,
+                m.scope_user, m.scope_project, m.scope_agent, m.scope_global, m.superseded_at,
+                m.kind, m.source, m.verified, m.expires_at, m.retrieval_count, m.last_retrieved_at,
                 bm25(memories_fts) AS score
          FROM memories_fts
          JOIN memories m ON m.rowid = memories_fts.rowid
@@ -565,8 +699,14 @@ fn recall_inner(
                     agent: r.get(10)?,
                     global: r.get::<_, i64>(11)? != 0,
                 },
-                score: Some(r.get(12)?),
-                superseded_at: None, // the WHERE clause already excluded them
+                score: Some(r.get(19)?),
+                superseded_at: r.get(12)?,
+                kind: r.get(13)?,
+                source: r.get(14)?,
+                verified: r.get(15)?,
+                expires_at: r.get(16)?,
+                retrieval_count: r.get(17)?,
+                last_retrieved_at: r.get(18)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -575,7 +715,12 @@ fn recall_inner(
     drop(stmt);
     drop(conn);
 
-    rerank(&mut rows, now_ms());
+    // Expiry means "stop injecting", not "delete" — the row stays in the table for the Memory
+    // screen; it just cannot reach a prompt any more.
+    let now = now_ms();
+    rows.retain(|m| m.expires_at.map_or(true, |e| e > now));
+
+    rerank(&mut rows, now);
     rows.truncate(limit);
     Ok(rows)
 }
@@ -592,7 +737,8 @@ pub fn list(store: &Store, layer: Option<&str>, limit: usize) -> Result<Vec<Memo
     let (sql, args): (String, Vec<String>) = match layer {
         Some(l) => (
             "SELECT id, layer, text, session_id, subject, created_at, updated_at, pinned,
-                    scope_user, scope_project, scope_agent, scope_global, superseded_at
+                    scope_user, scope_project, scope_agent, scope_global, superseded_at,
+                    kind, source, verified, expires_at, retrieval_count, last_retrieved_at
              FROM memories WHERE layer = ?1
              ORDER BY pinned DESC, updated_at DESC LIMIT ?2"
                 .into(),
@@ -600,7 +746,8 @@ pub fn list(store: &Store, layer: Option<&str>, limit: usize) -> Result<Vec<Memo
         ),
         None => (
             "SELECT id, layer, text, session_id, subject, created_at, updated_at, pinned,
-                    scope_user, scope_project, scope_agent, scope_global, superseded_at
+                    scope_user, scope_project, scope_agent, scope_global, superseded_at,
+                    kind, source, verified, expires_at, retrieval_count, last_retrieved_at
              FROM memories
              ORDER BY pinned DESC, updated_at DESC LIMIT ?1"
                 .into(),
@@ -609,26 +756,7 @@ pub fn list(store: &Store, layer: Option<&str>, limit: usize) -> Result<Vec<Memo
     };
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map(rusqlite::params_from_iter(args.iter()), |r| {
-            Ok(Memory {
-                id: r.get(0)?,
-                layer: r.get(1)?,
-                text: r.get(2)?,
-                session_id: r.get(3)?,
-                subject: r.get(4)?,
-                created_at: r.get(5)?,
-                updated_at: r.get(6)?,
-                pinned: r.get::<_, i64>(7)? != 0,
-                scope: MemoryScope {
-                    user: r.get(8)?,
-                    project: r.get(9)?,
-                    agent: r.get(10)?,
-                    global: r.get::<_, i64>(11)? != 0,
-                },
-                score: None,
-                superseded_at: r.get(12)?,
-            })
-        })
+        .query_map(rusqlite::params_from_iter(args.iter()), memory_from_row)
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
@@ -655,7 +783,8 @@ pub fn list_scoped(
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     let mut sql = String::from(
         "SELECT id, layer, text, session_id, subject, created_at, updated_at, pinned,
-                scope_user, scope_project, scope_agent, scope_global, superseded_at
+                scope_user, scope_project, scope_agent, scope_global, superseded_at,
+                kind, source, verified, expires_at, retrieval_count, last_retrieved_at
          FROM memories WHERE layer <> 'L0' AND superseded_at IS NULL",
     );
     let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -684,31 +813,16 @@ pub fn list_scoped(
     if pinned_only {
         sql.push_str(" AND pinned = 1");
     }
+    // Expiry is a read filter, not a retention policy: the row survives, it just stops being
+    // injected. Applied to both the manifest list and `recall_inner` so the two cannot disagree.
+    args.push(Box::new(now_ms()));
+    sql.push_str(&format!(" AND (expires_at IS NULL OR expires_at > ?{})", args.len()));
     args.push(Box::new(limit as i64));
     sql.push_str(&format!(" ORDER BY pinned DESC, updated_at DESC LIMIT ?{}", args.len()));
 
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map(rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())), |r| {
-            Ok(Memory {
-                id: r.get(0)?,
-                layer: r.get(1)?,
-                text: r.get(2)?,
-                session_id: r.get(3)?,
-                subject: r.get(4)?,
-                created_at: r.get(5)?,
-                updated_at: r.get(6)?,
-                pinned: r.get::<_, i64>(7)? != 0,
-                scope: MemoryScope {
-                    user: r.get(8)?,
-                    project: r.get(9)?,
-                    agent: r.get(10)?,
-                    global: r.get::<_, i64>(11)? != 0,
-                },
-                score: None,
-                superseded_at: r.get(12)?,
-            })
-        })
+        .query_map(rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())), memory_from_row)
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
@@ -905,37 +1019,42 @@ pub fn session_atoms(
     let mut stmt = conn
         .prepare(
             "SELECT id, layer, text, session_id, subject, created_at, updated_at, pinned,
-                    scope_user, scope_project, scope_agent, scope_global, superseded_at
+                    scope_user, scope_project, scope_agent, scope_global, superseded_at,
+                    kind, source, verified, expires_at, retrieval_count, last_retrieved_at
              FROM memories
              WHERE session_id = ?1 AND layer = ?2 AND superseded_at IS NULL
              ORDER BY created_at ASC LIMIT ?3",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map(params![session_id, layer, limit as i64], |r| {
-            Ok(Memory {
-                id: r.get(0)?,
-                layer: r.get(1)?,
-                text: r.get(2)?,
-                session_id: r.get(3)?,
-                subject: r.get(4)?,
-                created_at: r.get(5)?,
-                updated_at: r.get(6)?,
-                pinned: r.get::<_, i64>(7)? != 0,
-                scope: MemoryScope {
-                    user: r.get(8)?,
-                    project: r.get(9)?,
-                    agent: r.get(10)?,
-                    global: r.get::<_, i64>(11)? != 0,
-                },
-                score: None,
-                superseded_at: r.get(12)?,
-            })
-        })
+        .query_map(params![session_id, layer, limit as i64], memory_from_row)
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
     Ok(rows)
+}
+
+/// Bump the usage counters for the rows a turn actually recalled. Called after the request is
+/// already in flight, never on the gateway's hot read path.
+pub fn mark_retrieved(store: &Store, ids: &[String]) -> Result<usize, String> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let mut conn = store.conn.lock().map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let now = now_ms();
+    let mut n = 0;
+    for id in ids {
+        n += tx
+            .execute(
+                "UPDATE memories SET retrieval_count = retrieval_count + 1, last_retrieved_at = ?1
+                  WHERE id = ?2",
+                params![now, id],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(n)
 }
 
 pub fn clear(store: &Store) -> Result<(), String> {
@@ -1012,10 +1131,16 @@ fn row_at(r: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<Memory> {
         },
         score: None,
         superseded_at: r.get(off + 12)?,
+        kind: r.get(off + 13)?,
+        source: r.get(off + 14)?,
+        verified: r.get(off + 15)?,
+        expires_at: r.get(off + 16)?,
+        retrieval_count: r.get(off + 17)?,
+        last_retrieved_at: r.get(off + 18)?,
     })
 }
 
-/// The 13 `memories` columns `row_at` reads, in order, qualified by an alias so a self-join can
+/// The 19 `memories` columns `row_at` reads, in order, qualified by an alias so a self-join can
 /// carry two memories in one row without ambiguity.
 fn memory_columns(alias: &str) -> String {
     [
@@ -1032,6 +1157,12 @@ fn memory_columns(alias: &str) -> String {
         "scope_agent",
         "scope_global",
         "superseded_at",
+        "kind",
+        "source",
+        "verified",
+        "expires_at",
+        "retrieval_count",
+        "last_retrieved_at",
     ]
     .iter()
     .map(|c| format!("{alias}.{c}"))
@@ -1119,7 +1250,7 @@ pub fn conflicts(store: &Store) -> Result<Vec<Conflict>, String> {
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([], |r| Ok(Conflict { held: row_at(r, 0)?, newer: row_at(r, 13)? }))
+        .query_map([], |r| Ok(Conflict { held: row_at(r, 0)?, newer: row_at(r, 19)? }))
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
@@ -1151,6 +1282,8 @@ mod memory_tests {
             session_id: Some("s1".into()),
             subject: None,
             pinned: false,
+            kind: None,
+            source: None,
         }
     }
 
@@ -1500,6 +1633,7 @@ mod memory_tests {
             },
             score: Some(-1.0),
             superseded_at: None,
+            ..Memory::default()
         };
         let mut rows = vec![mk("m-3"), mk("m-1"), mk("m-2")];
         rerank(&mut rows, 1_000_000);
@@ -2066,6 +2200,84 @@ mod memory_tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    // ---- 0033: manifest metadata and usage accounting ------------------------------------
+
+    #[test]
+    fn marking_retrieved_bumps_the_counter_once_per_id() {
+        let (s, d) = temp_store("retrieved");
+        scoped(&s, "a", "L1", "alpha uses Postgres", Some("alpha"), None, 0, 0);
+        assert_eq!(mark_retrieved(&s, &["a".into(), "a".into()]).unwrap(), 2);
+        let row = list(&s, None, 10).unwrap().into_iter().find(|m| m.id == "a").unwrap();
+        assert_eq!(row.retrieval_count, 2);
+        assert!(row.last_retrieved_at.is_some());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Expiry means "stop injecting", not "delete": the row drops out of both read paths the
+    /// gateway and the manifest use, and is still in the table for the Memory screen.
+    #[test]
+    fn an_expired_row_is_not_injected_but_is_still_listed() {
+        let (s, d) = temp_store("expiry");
+        scoped(&s, "live", "L1", "the gateway port is 8787", Some("alpha"), None, 0, 0);
+        scoped(&s, "gone", "L1", "the gateway port is 9090", Some("alpha"), None, 0, 0);
+        s.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE memories SET expires_at = 1 WHERE id = 'gone'", [])
+            .unwrap();
+
+        let hits =
+            recall_scoped(&s, "gateway port", 10, None, &scope_of(Some("alpha"), None)).unwrap();
+        let ids: Vec<&str> = hits.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["live"], "an expired row is not injected");
+
+        let listed = list_scoped(&s, Some(&scope_of(Some("alpha"), None)), 50, false).unwrap();
+        let ids: Vec<&str> = listed.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["live"], "and the manifest does not see it either");
+
+        assert!(
+            list(&s, None, 50).unwrap().iter().any(|m| m.id == "gone"),
+            "but the Memory screen still shows it — expiry is not deletion"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Capture is where a new row gets its classification; an explicit kind wins, and a
+    /// re-record must not erase a classification someone set.
+    #[test]
+    fn capture_classifies_new_rows_and_preserves_an_explicit_kind() {
+        let (s, d) = temp_store("classify");
+
+        let inferred = capture(&s, &input("L1", "Tushu prefers concise answers")).unwrap();
+        assert_eq!(inferred.kind.as_deref(), Some("preference"));
+        assert_eq!(inferred.source, "inferred");
+        assert_eq!(inferred.retrieval_count, 0);
+        assert_eq!(inferred.verified, None);
+        assert_eq!(inferred.expires_at, None);
+
+        let explicit = capture(
+            &s,
+            &MemoryInput {
+                kind: Some("decision".into()),
+                ..input("L1", "we decided to use SQLite")
+            },
+        )
+        .unwrap();
+        assert_eq!(explicit.kind.as_deref(), Some("decision"));
+
+        let again = capture(
+            &s,
+            &MemoryInput {
+                kind: Some("decision".into()),
+                ..input("L1", "we decided to use SQLite")
+            },
+        )
+        .unwrap();
+        assert_eq!(again.kind.as_deref(), Some("decision"), "a re-record keeps the classification");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     // ---- recency in ranking --------------------------------------------------------------
 
     /// A candidate as `rerank` sees it: no store needed, because ranking is a pure function of
@@ -2084,6 +2296,7 @@ mod memory_tests {
             scope: MemoryScope { user: "local".into(), project: None, agent: None, global: false },
             score: Some(bm25),
             superseded_at: None,
+            ..Memory::default()
         }
     }
 

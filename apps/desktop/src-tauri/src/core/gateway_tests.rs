@@ -4011,6 +4011,8 @@ async fn start_with_memory() -> (TestServer, std::path::PathBuf) {
             session_id: None,
             subject: None,
             pinned: false,
+            kind: None,
+            source: None,
         },
     )
     .unwrap();
@@ -4586,6 +4588,7 @@ async fn admin_routes_refuse_without_the_master_key() {
         ("POST", "/admin/memory/batch", json!([])),
         ("POST", "/admin/memory/recall", json!({ "query": "x" })),
         ("POST", "/admin/memory/scoped", json!({ "project_root": "/tmp/x" })),
+        ("POST", "/admin/memory/retrieved", json!({ "ids": ["m1"] })),
         ("GET", "/admin/memory/stats", json!(null)),
         ("GET", "/admin/memory/conflicts", json!(null)),
         // The master switch. Listed with the memory statics because it is one, and because a reader
