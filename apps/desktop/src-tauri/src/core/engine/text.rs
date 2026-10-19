@@ -488,8 +488,9 @@ pub async fn execute_text(
                         // floored like every other named wait, and the flat backoff otherwise.
                         // Flat, not growing, and that is measured: the admission rule below
                         // reserves a full `UPSTREAM_HEADER_TIMEOUT` behind every wait, so an 8 s
-                        // third round never fits under `PLAN_BUDGET` while a flat 2 s keeps every
-                        // round affordable (see `SERVER_ERROR_RETRY_BACKOFF`). **Admission is
+                        // third round fits only narrowly under `PLAN_BUDGET` (41.3 s of 44 s)
+                        // while a flat 2 s keeps every configured round comfortable (see
+                        // `SERVER_ERROR_RETRY_BACKOFF`). **Admission is
                         // the plan budget's own rule**: a re-probe is a candidate start, so it is
                         // priced by `candidate_is_affordable` with the wait added to the elapsed
                         // time — one full `UPSTREAM_HEADER_TIMEOUT` must still fit, which is what

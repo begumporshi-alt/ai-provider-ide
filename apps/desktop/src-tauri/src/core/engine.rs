@@ -919,11 +919,18 @@ mod tests {
             "one millisecond later it no longer fits, and admitting it would overrun the plan"
         );
 
-        // The production timeline, stated as the case rather than as arithmetic: entry 1 spent a
-        // full header budget timing out, so entry 2 must be refused rather than cut off.
+        // **Inverted 2026-10-19.** This used to assert the opposite — "entry 1 burned a whole
+        // attempt, so entry 2 must be refused rather than cut off" — and that reading is what made
+        // the egress's recovery unreachable. A pre-headers timeout is exactly when the next
+        // candidate is worth dialling: `egress::stream` says the engine advances to it, and ledger
+        // rows 7092/7099 (2026-10-19) show a request failing with a one-entry chain while the
+        // provider's other key was serving the same model seconds earlier. A candidate that cannot
+        // be funded in full is still refused; the budget is now large enough that one which spent
+        // a whole header budget leaves room for one more.
         assert!(
-            !candidate_is_affordable(ATTEMPT, false),
-            "entry 2 after entry 1 burned a whole attempt is exactly requests 22/25/26/27"
+            candidate_is_affordable(ATTEMPT, false),
+            "entry 2 after entry 1 burned a whole attempt must still be fundable — otherwise a \
+             header timeout has no failover and `all attempts failed` names one attempt"
         );
 
         // A *fast* failure leaves room, so a genuinely different provider still gets its chance —
@@ -2604,11 +2611,19 @@ mod tests {
             );
         }
 
-        // The budget is still a bound, not a formality — at this cadence the would-be fourth
-        // round is past it, so the *count* is what stops the loop rather than an accident.
+        // The budget still has to be a bound, but at this cadence it is no longer the limit that
+        // stops the re-probe loop: the configured three rounds fit with room to spare, so the
+        // *count* is what stops it. That is the reachability claim D104 was about — the budget
+        // must not silently deliver fewer rounds than the constant advertises. A hypothetical
+        // sixth round would not fit, which is all this needs to prove: the budget is finite.
         assert!(
-            !candidate_is_affordable(decide(rounds + 1) + wait, false),
-            "a fourth round must not be affordable at the measured cadence"
+            candidate_is_affordable(decide(rounds + 1) + wait, false),
+            "the budget now funds more rounds than the configured count; if this fails the \
+             budget has become the binding limit again"
+        );
+        assert!(
+            !candidate_is_affordable(decide(rounds + 3) + wait, false),
+            "the budget is still a real bound — six rounds at the measured cadence cannot fit"
         );
 
         // And the regression, stated as the numbers: the window is what `PLAN_BUDGET` leaves after
@@ -2616,7 +2631,7 @@ mod tests {
         // a 4 s window, so round two (decided at 7.49 s) could never fit — which is why raising the
         // count alone changed nothing.
         let window = PLAN_BUDGET - (wait + ATTEMPT);
-        assert_eq!(window, Duration::from_secs(14), "the window the current budget leaves");
+        assert_eq!(window, Duration::from_secs(22), "the window the current budget leaves");
         assert!(
             decide(1) < Duration::from_secs(4) && decide(2) > Duration::from_secs(4),
             "round one fits the old 4 s window and round two does not; if this stops holding the \
@@ -2627,6 +2642,116 @@ mod tests {
     /// An adapter whose text stream never yields and never ends — the keep-alive-only stall of
     /// ledger rows 3949/3968, with the selector-unmatched delta folded into the silence (the
     /// interpreter sees nothing either way).
+    /// A first dial that burns the whole pre-headers budget and fails, then a second dial that
+    /// serves.
+    ///
+    /// **The clock movement is the instrument.** A header timeout is *time spent*, and the plan
+    /// budget reads elapsed time; a double that fails instantly cannot reproduce ledger 7092/7099,
+    /// where the first candidate consumed 20s and the second was refused for it. `start_paused`
+    /// makes advancing 20s free.
+    struct HeaderTimeoutThenServe {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl HeaderTimeoutThenServe {
+        fn new() -> Arc<Self> {
+            Arc::new(Self { calls: std::sync::atomic::AtomicUsize::new(0) })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl AdapterInstance for HeaderTimeoutThenServe {
+        fn generate_image<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _args: ImageArgs,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, Result<ImageReply, AttemptError>> {
+            Box::pin(async { Err(AttemptError::Transport { message: None }) })
+        }
+
+        fn generate_text<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _args: TextArgs<'a>,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, Result<BoxStream<'a, Result<String, AttemptError>>, AttemptError>>
+        {
+            Box::pin(async move {
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    tokio::time::advance(crate::core::egress::UPSTREAM_HEADER_TIMEOUT).await;
+                    return Err(AttemptError::Transport {
+                        message: Some(
+                            "upstream sent no response headers for 20s — abandoning the request"
+                                .to_string(),
+                        ),
+                    });
+                }
+                Ok(Box::pin(futures_util::stream::iter(vec![Ok("recovered".to_string())]))
+                    as BoxStream<'a, Result<String, AttemptError>>)
+            })
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities { text: true, image: false }
+        }
+
+        fn tag_modality(&self, _entry: &ModelEntry) -> &'static str {
+            "text"
+        }
+
+        fn list_models<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, Result<Vec<ModelEntry>, AttemptError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn ping_key<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, PingResult> {
+            Box::pin(async {
+                PingResult { ok: false, status: 0, rate_limited: false, message: None }
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_header_timeout_still_dials_the_next_candidate() {
+        // Ledger 7092/7099, 2026-10-19: `key-03` spent the whole 20s header budget and `key-04` —
+        // which had served the same provider and model seconds earlier — was never dialled. The
+        // engine advanced to it and the plan budget refused it. This is the whole path in one test:
+        // the first dial moves the paused clock exactly as the egress would, and the second must be
+        // reached, recorded, and serve.
+        let adapter = HeaderTimeoutThenServe::new();
+        let health = HealthTracker::new();
+        let (seen, mut on_chunk) = sink();
+
+        let served = execute_text(
+            &Always(adapter.clone()),
+            &health,
+            None,
+            text_args(vec![candidate("p1", "k1", "m1"), candidate("p1", "k2", "m1")]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect("the second candidate serves after the first times out on headers");
+
+        assert_eq!(adapter.calls(), 2, "both candidates were dialled");
+        assert_eq!(served.candidate.key.label, "k2", "the second candidate served");
+        assert_eq!(served.attempts.len(), 1, "the timeout stays in the chain");
+        assert_eq!(served.attempts[0].cls, ErrorClass::Network);
+        assert_eq!(*seen.lock().unwrap(), vec!["recovered".to_string()]);
+    }
+
     struct Silent;
 
     impl AdapterInstance for Silent {

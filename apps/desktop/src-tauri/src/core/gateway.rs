@@ -1434,15 +1434,16 @@ impl GatewayCore {
 /// Only the FIRST message is bounded. Once the bridge is demonstrably working on the request, a
 /// slow stream is a slow stream, and cutting it off would break long answers.
 ///
-/// **40s, raised from 30s on 2026-10-13 to keep this strictly above the engine's plan budget.** The
-/// two are one ordering — `PLAN_BUDGET (36s) < FIRST_MSG_TIMEOUT (40s)` — and it is load-bearing in
+/// **48s, raised from 40s on 2026-10-19 to keep this strictly above the engine's plan budget.** The
+/// two are one ordering — `PLAN_BUDGET (44s) < FIRST_MSG_TIMEOUT (48s)` — and it is load-bearing in
 /// one direction only: the engine must give up *first*, so the request carries the real error class
 /// from the attempt chain instead of being cancelled here and filed `CANCELLED`. The plan budget had
-/// to grow to make the re-probe rounds reachable (see `engine::SERVER_ERROR_REPROBES_MAX`), so this
-/// grew with it. The cost is honest and bounded: a bridge that never speaks at all now fails after
-/// 40s rather than 30s. It does not lengthen a normal request — this bounds the wait for the *first*
-/// message, and a provider that answers starts the stream long before it.
-pub const FIRST_MSG_TIMEOUT: Duration = Duration::from_secs(40);
+/// to grow to make a second full attempt reachable after a pre-headers timeout (see
+/// `engine::PLAN_BUDGET`), so this grew with it. The cost is honest and bounded: a bridge that never
+/// speaks at all now fails after 48s rather than 40s. It does not lengthen a normal request — this
+/// bounds the wait for the *first* message, and a provider that answers starts the stream long
+/// before it.
+pub const FIRST_MSG_TIMEOUT: Duration = Duration::from_secs(48);
 
 /// RAII slot: permit + registration + receiver, all released on drop — including on client
 /// disconnect mid-stream, which is what makes §3.5 cancellation work.

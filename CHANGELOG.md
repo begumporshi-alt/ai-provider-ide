@@ -465,6 +465,30 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 
 ### Fixed
 
+- **A pre-headers timeout had no failover: the plan budget refused the next candidate, so the
+  router reported `all attempts failed` after one attempt (drift D123).** `PLAN_BUDGET` was 36 s,
+  and `candidate_is_affordable` admits a later candidate only when
+  `elapsed + UPSTREAM_HEADER_TIMEOUT <= PLAN_BUDGET`. One candidate spending its whole 20 s header
+  budget therefore left `20 s + 20 s > 36 s`, so the second candidate was refused by construction.
+  `egress::stream` states that the engine is the recovery for this arm and `attempt_disposition`
+  does return `Next`, but `engine::text` ended the plan `Spent` before the next dial — the chain
+  showed one entry and the message named one attempt while the plan had two. Ledger rows
+  7092/7099 (2026-10-19) are the case: `agent-router/key-03` timed out at 20 056/20 072 ms and was
+  the only entry, while `key-04` served the same provider and model at 14:54:00 and 15:02:15. The
+  positive control is row 5198 (2026-10-15): a first attempt that failed in ~12.7 s left
+  `12.7 + 20 <= 36`, and `vice/key-01` was dialled. The arithmetic, not the provider, decided
+  whether failover happened.
+
+  The missing invariant is now asserted: `2 × UPSTREAM_FIRST_BYTE_TIMEOUT <= PLAN_BUDGET <
+  FIRST_MSG_TIMEOUT`. `PLAN_BUDGET` moves 36 s → 44 s and `gateway::FIRST_MSG_TIMEOUT` 40 s → 48 s
+  together, so the engine still fails before the gateway and the real class survives. The
+  `the_plan_budget_fits_inside_the_gateway_bound` test gained the two-attempt clause; the
+  per-attempt test that pinned entry 2's refusal is inverted; and
+  `a_header_timeout_still_dials_the_next_candidate` drives the path on a paused clock, advancing the
+  first dial by exactly 20 s. The stated cost: a genuinely dead request now surfaces at up to 44 s
+  instead of 36 s, and a first key that stalls gets one more full attempt instead of failing at
+  20 s.
+
 - **The verification gate's own demand was being answered by the wrong branch of the test oracle, and
   it silently reverted the work under test (drift D121).** `92efa4a` added a gate that holds a turn
   which mutated the workspace, claimed completion, and verified nothing: it pushes an automated demand

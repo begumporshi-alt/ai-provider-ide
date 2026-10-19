@@ -140,8 +140,8 @@ One "request timeout" cannot serve every phase, so the budget is per phase.
 | Upstream headers | 20 s (`UPSTREAM_HEADER_TIMEOUT`) |
 | Upstream first byte | 20 s (`UPSTREAM_FIRST_BYTE_TIMEOUT`) |
 | Upstream idle stream | 120 s, reset on every chunk — long generations are not "timed out" |
-| Gateway first message | 30 s (`FIRST_MSG_TIMEOUT`) — bounds the wait for the bridge's first frame, then `503` |
-| Max attempts per request | 6, across the whole plan (`PLAN_BUDGET` 26 s bounds the whole chain) |
+| Gateway first message | 48 s (`FIRST_MSG_TIMEOUT`) — bounds the wait for the bridge's first frame, then `503` |
+| Max attempts per request | 6, across the whole plan (`PLAN_BUDGET` 44 s bounds the whole chain) |
 | Upstream transport retries | 1, pre-header transport errors only — a header stall is deliberately *not* retried |
 | Backoff | Jittered exponential, honouring `Retry-After` |
 | Per-provider concurrency cap | 4 (`PER_PROVIDER_DEFAULT`), with a bounded queue |
