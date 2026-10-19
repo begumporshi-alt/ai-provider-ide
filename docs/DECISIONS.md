@@ -1869,7 +1869,8 @@ that is not drift (then the rethrown path needs its own health record).
   The `withinTaskSpread()` function groups attempts by `taskId` before computing pooled variance.
 - **Measured impact:** the old gate (0.500 → 0.470 floor) refused a 0.250 delta fix on `passRate` as
   noise; the new gate clears it. The specific test that had to keep failing was the "measures spread
-  within a task" test in `compareMetric` describe block. Gates: `axiom-core` 250/0 vitest, `pnpm -r
+  within a task" test in `compareMetric` describe block. Gates: `axiom-core` 252/0 vitest (250 `it(`
+  declarations plus the 2 rows of the one `it.each` table, which is what the runner counts), `pnpm -r
   typecheck` clean.
 - **Deliberately not done:** adding a paired sign-test gate across tasks. That would require measuring
   whether each task improved individually rather than using a variance threshold. The `r ≥ 3`
