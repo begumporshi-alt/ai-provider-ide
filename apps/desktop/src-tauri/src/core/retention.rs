@@ -5,14 +5,14 @@
 //! where one never does: the headless daemon serves `/admin/memory/prune` and
 //! `/admin/context/prune` but nothing ever called them, so both tables grew without limit for
 //! as long as the daemon ran (2026-10-04 audit, P2). This module is the fix: one task per core,
-//! one interval, two gated jobs.
+//! one interval, two jobs.
 //!
-//! **What runs, and what gates it.** `memory::prune_step` + `session_context::prune_step`, in
-//! bounded chunks, gated on the memory master toggle (`core.memory_enabled()`), the same rule
-//! the webview's `pruneOnce` applies: with the layer off the request path writes neither table,
-//! and the off-by-default guarantee is that the layer performs no writes at all — which has to
-//! include deletes. A user's memories are not touched because a feature they never switched on
-//! is doing housekeeping.
+//! **What runs, and why nothing gates it.** `memory::prune_step` + `session_context::prune_step`,
+//! in bounded chunks. Pruning is deliberately **ungated**: the Assistant writes memories
+//! independently of the gateway memory switch (it defaults memory on), so `memories` has two
+//! writers with different switches, and gating housekeeping on the gateway switch would let the
+//! Assistant's rows grow without limit under the default configuration. Pruning only removes
+//! rows past their TTL or ring/recency caps, which is safe whichever writer created them.
 //!
 //! **Why the pass is budgeted.** Every request and every prune share the store's one writer
 //! lock, and SQLite has no statement timeout — the thing that bounds a prune is the statement
@@ -82,13 +82,10 @@ impl PassBudget {
 
 #[derive(Debug, Default)]
 pub struct RetentionPass {
-    /// Memory retention, when the layer was on.
+    /// Memory retention stats for this pass.
     pub memory: Option<MemoryPruneStats>,
-    /// Live-context retention, when the layer was on.
+    /// Live-context retention stats for this pass.
     pub context: Option<PruneStats>,
-    /// The memory layer's master switch was off: memory and live context were untouched, the
-    /// same rule the webview scheduler applies.
-    pub memory_layer_skipped: bool,
     /// Drift triggers raised this pass (A1 follow-up: the Rust half of the drift monitor).
     pub drift_triggers: usize,
     /// The pass stopped with work left on the table because the wall-clock budget ran out; the
@@ -99,11 +96,7 @@ pub struct RetentionPass {
 
 /// One retention pass. Split from the scheduler so it can be tested without a runtime, and so
 /// a host that wants to drive it synchronously can.
-pub fn pass(
-    store: Option<&Arc<Store>>,
-    memory_enabled: bool,
-    budget: &PassBudget,
-) -> Result<RetentionPass, String> {
+pub fn pass(store: Option<&Arc<Store>>, budget: &PassBudget) -> Result<RetentionPass, String> {
     let mut out = RetentionPass::default();
     let Some(store) = store else {
         return Ok(out);
@@ -114,11 +107,6 @@ pub fn pass(
     // the Rust half of the drift monitor (A1 follow-up): the TS monitor went blind when
     // generation moved to the gateway, and this pass is what keeps the repair flow fed.
     out.drift_triggers = drift::evaluate(store, now_ms())?.len();
-
-    if !memory_enabled {
-        out.memory_layer_skipped = true;
-        return Ok(out);
-    }
 
     loop {
         // The clock is checked *between* batches, never mid-statement: a batch is one bounded
@@ -303,7 +291,7 @@ pub async fn interval(core: Arc<GatewayCore>) {
 
 fn run_pass(core: &GatewayCore) {
     let budget = PassBudget::new(PASS_BUDGET);
-    match pass(core.store(), core.memory_enabled(), &budget) {
+    match pass(core.store(), &budget) {
         Ok(p) => {
             tracing::debug!(?p, "memory retention pass ran");
             if something_removed(&p) || p.budget_exhausted {
@@ -353,14 +341,16 @@ mod retention_tests {
     }
 
     #[test]
-    fn with_the_layer_off_the_pass_takes_nothing_and_skips() {
+    fn a_pass_prunes_even_when_the_gateway_toggle_is_off() {
         let (store, d) = temp_store("off");
+        seed_stale_memories(&store, 5);
         let budget = PassBudget::new(Duration::from_secs(60));
-        let p = pass(Some(&store), false, &budget).unwrap();
-        assert!(p.memory_layer_skipped);
-        assert!(p.memory.is_none());
-        assert!(p.context.is_none());
-        assert!(!something_removed(&p));
+        let p = pass(Some(&store), &budget).unwrap();
+        // The Assistant writes memories independently of the gateway switch, so housekeeping
+        // cannot be gated on that switch or the tables grow forever.
+        assert!(p.memory.is_some());
+        assert!(p.context.is_some());
+        assert!(something_removed(&p));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -370,8 +360,7 @@ mod retention_tests {
         // No rows anywhere: a pass over an empty store removed nothing, which is neither an
         // error nor a skip.
         let budget = PassBudget::new(Duration::from_secs(60));
-        let p = pass(Some(&store), true, &budget).unwrap();
-        assert!(!p.memory_layer_skipped);
+        let p = pass(Some(&store), &budget).unwrap();
         assert!(p.memory.is_some());
         assert!(p.context.is_some());
         assert!(!something_removed(&p));
@@ -382,8 +371,7 @@ mod retention_tests {
     #[test]
     fn a_pass_without_a_store_removes_nothing_and_fails_nothing() {
         let budget = PassBudget::new(Duration::from_secs(60));
-        let p = pass(None, true, &budget).unwrap();
-        assert!(!p.memory_layer_skipped);
+        let p = pass(None, &budget).unwrap();
         assert!(p.memory.is_none());
         assert!(p.context.is_none());
     }
@@ -393,7 +381,7 @@ mod retention_tests {
         let (store, d) = temp_store("expired");
         seed_stale_memories(&store, 5);
         let budget = PassBudget::new(Duration::ZERO);
-        let p = pass(Some(&store), true, &budget).unwrap();
+        let p = pass(Some(&store), &budget).unwrap();
         // The clock is checked before the first batch, so an expired budget runs zero batches —
         // and reports the fact instead of a silent no-op.
         assert!(p.budget_exhausted);
@@ -432,9 +420,9 @@ mod retention_tests {
 
         // Tick one: no budget to spend. Tick two: a real budget — the same rows, now drained.
         let empty = PassBudget::new(Duration::ZERO);
-        pass(Some(&store), true, &empty).unwrap();
+        pass(Some(&store), &empty).unwrap();
         let next = PassBudget::new(Duration::from_secs(60));
-        let p = pass(Some(&store), true, &next).unwrap();
+        let p = pass(Some(&store), &next).unwrap();
         assert!(!p.budget_exhausted);
         assert_eq!(memory_total(&p), 5, "the second pass drains what the first deferred");
         let conn = store.conn.lock().unwrap();
