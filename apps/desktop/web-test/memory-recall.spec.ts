@@ -34,6 +34,9 @@ async function seedL1(page: Page, text: string): Promise<string> {
     const m = await host.invoke("memory_capture", {
       layer: "L1", text: t, sessionId: "s-recall", subject: null, pinned: false,
     });
+    await host.invoke("memory_assign_scope", {
+      id: m.id, scope: { kind: "global", project: null, agent: null },
+    });
     return (m as { id: string }).id;
   }, text);
 }

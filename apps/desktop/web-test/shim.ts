@@ -390,6 +390,16 @@ const MEMORY_LAYERS = ["L0", "L1", "L2", "L3"];
  */
 const DEFAULT_SCOPE = { user: "", project: null, agent: null, global: false };
 
+/** Matches context_scope::project_key_from_root in Rust: FNV-1a over the trimmed root. */
+const projectKey = (root: string): string => {
+  let hash = 0xcbf29ce484222325n;
+  for (const byte of new TextEncoder().encode(root.trim())) {
+    hash ^= BigInt(byte);
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+  }
+  return `p${hash.toString(16).padStart(16, "0")}`;
+};
+
 /**
  * The real host sends `Memory.pinned` as a boolean (Rust `bool`), but this shim stores it as the
  * SQL-ish 0/1 its SQLite emulation uses — so the app's `isMemory` guard, which requires a bool,
@@ -2449,7 +2459,15 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         .split(/[^A-Za-z0-9]+/)
         .filter((w) => w.length > 0);
       if (words.length === 0) return [];
-      const scored = memories
+      const root = typeof args.project_root === "string" ? args.project_root.trim() : "";
+      const project = root ? projectKey(root) : null;
+      const visible = memories.filter((m) => {
+        if (m.superseded_at != null) return false;
+        if (!project) return true; // the Memory screen's intentional global search
+        const sc = (m.scope as Row | undefined) ?? DEFAULT_SCOPE;
+        return Number(sc.global) === 1 || sc.project === project;
+      });
+      const scored = visible
         .filter((m) => !layers || layers.includes(String(m.layer)))
         .map((m) => {
           const hay = String(m.text).toLowerCase();
@@ -2480,6 +2498,24 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         recencyOf(b) - recencyOf(a) ||
         (rank[String(a.m.layer)] ?? 9) - (rank[String(b.m.layer)] ?? 9));
       return scored.slice(0, limit).map((x) => wireMemory({ ...x.m, score: x.score }));
+    }
+    case "memory_scoped": {
+      const root = String(args.project_root ?? "").trim();
+      if (!root) throw new Error("project_root is required");
+      const project = projectKey(root);
+      const pinnedOnly = args.pinned_only === true;
+      const limit = (args.limit as number) ?? 200;
+      return memories
+        .filter((m) => m.superseded_at == null)
+        .filter((m) => {
+          const sc = (m.scope as Row | undefined) ?? DEFAULT_SCOPE;
+          return Number(sc.global) === 1 || sc.project === project;
+        })
+        .filter((m) => !pinnedOnly || Number(m.pinned) === 1)
+        .sort((a, b) =>
+          Number(b.pinned) - Number(a.pinned) || Number(b.updated_at) - Number(a.updated_at))
+        .slice(0, limit)
+        .map(wireMemory);
     }
     case "memory_list": {
       const limit = (args.limit as number) ?? 200;
@@ -3369,6 +3405,18 @@ async function routeMemory(method: string, segs: string[], q: URLSearchParams, b
         const b = (body ?? {}) as Row;
         return dispatch("memory_recall", {
           query: b.query ?? "", limit: b.limit ?? 8, layers: b.layers ?? null,
+          project_root: b.project_root ?? null,
+        });
+      }
+      break;
+    }
+    case "scoped": {
+      if (method === "POST") {
+        const b = (body ?? {}) as Row;
+        return dispatch("memory_scoped", {
+          project_root: b.project_root ?? null,
+          pinned_only: b.pinned_only ?? false,
+          limit: b.limit ?? 200,
         });
       }
       break;
