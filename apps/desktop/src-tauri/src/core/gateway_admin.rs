@@ -1061,6 +1061,16 @@ pub struct MemoryRecallBody {
     pub query: String,
     pub limit: Option<usize>,
     pub layers: Option<Vec<String>>,
+    /// Workspace root; resolved host-side to the same project key the gateway uses.
+    /// Omitted means the Memory screen's intentional global search.
+    pub project_root: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ScopedListBody {
+    pub project_root: Option<String>,
+    pub limit: Option<usize>,
+    pub pinned_only: Option<bool>,
 }
 
 pub async fn memory_recall_h(
@@ -1075,12 +1085,68 @@ pub async fn memory_recall_h(
         Ok(s) => s,
         Err(r) => return *r,
     };
-    match memory::recall(store, &body.query, body.limit.unwrap_or(8), body.layers.as_deref()) {
+    let scope = body
+        .project_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .and_then(crate::core::gateway::context_scope::project_key_from_root)
+        .map(|project| memory::RecallScope { user: None, project: Some(project), agent: None });
+    let limit = body.limit.unwrap_or(8);
+    let result = match scope {
+        Some(sc) => memory::recall_scoped(store, &body.query, limit, body.layers.as_deref(), &sc),
+        None => memory::recall(store, &body.query, limit, body.layers.as_deref()),
+    };
+    match result {
         Ok(rows) => (StatusCode::OK, Json(rows)).into_response(),
         Err(e) => admin_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("could not recall: {e}"),
             Some("memory_recall_failed"),
+        ),
+    }
+}
+
+/// `POST /admin/memory/scoped` — rows visible to one workspace. This is the Assistant's
+/// read surface: the same predicate `recall_scoped` applies, without the FTS query, so
+/// identity/preferences can ride along even when the user's turn shares no words with them.
+pub async fn memory_scoped_list_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Json(body): Json<ScopedListBody>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers).await {
+        return *r;
+    }
+    let store = match require_store(&core, "POST /admin/memory/scoped") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    let Some(project) = body
+        .project_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .and_then(crate::core::gateway::context_scope::project_key_from_root)
+    else {
+        return admin_error(
+            StatusCode::BAD_REQUEST,
+            "project_root is required and must resolve to a workspace",
+            Some("scope_required"),
+        );
+    };
+    let scope = memory::RecallScope { user: None, project: Some(project), agent: None };
+    match memory::list_scoped(
+        store,
+        Some(&scope),
+        body.limit.unwrap_or(200),
+        body.pinned_only.unwrap_or(false),
+    ) {
+        Ok(rows) => (StatusCode::OK, Json(rows)).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not list scoped memories: {e}"),
+            Some("memory_scope_list_failed"),
         ),
     }
 }

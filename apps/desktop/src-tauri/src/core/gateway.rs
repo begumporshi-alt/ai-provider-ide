@@ -2458,6 +2458,7 @@ pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, St
         )
         .route("/admin/memory/batch", post(admin::memory_capture_batch_h))
         .route("/admin/memory/recall", post(admin::memory_recall_h))
+        .route("/admin/memory/scoped", post(admin::memory_scoped_list_h))
         .route("/admin/memory/stats", get(admin::memory_stats_h))
         .route("/admin/memory/conflicts", get(admin::memory_conflicts_h))
         .route("/admin/memory/prune", post(admin::memory_prune_h))

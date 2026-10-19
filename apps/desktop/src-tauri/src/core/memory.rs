@@ -635,6 +635,86 @@ pub fn list(store: &Store, layer: Option<&str>, limit: usize) -> Result<Vec<Memo
     Ok(rows)
 }
 
+/// Rows visible to `scope`, newest first. The Assistant uses this for its always-on
+/// prefetch and for the session manifest; `pinned_only` narrows it to the operator's
+/// hard constraints.
+///
+/// L0 is excluded unconditionally. It is verbatim conversation, and a 200-row window dominated
+/// by L0 rows would starve the distilled layers the manifest is built from. The gateway's read
+/// path makes the same exclusion for the same reason.
+///
+/// Visibility mirrors `recall_inner` exactly: an explicit global mark, or a project
+/// match. An unresolved project sees pinned global rows only — never everything.
+/// `scope: None` keeps the old unscoped behaviour for the Memory screen.
+pub fn list_scoped(
+    store: &Store,
+    scope: Option<&RecallScope>,
+    limit: usize,
+    pinned_only: bool,
+) -> Result<Vec<Memory>, String> {
+    let conn = store.conn.lock().map_err(|e| e.to_string())?;
+    let mut sql = String::from(
+        "SELECT id, layer, text, session_id, subject, created_at, updated_at, pinned,
+                scope_user, scope_project, scope_agent, scope_global, superseded_at
+         FROM memories WHERE layer <> 'L0' AND superseded_at IS NULL",
+    );
+    let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    if let Some(sc) = scope {
+        if let Some(u) = &sc.user {
+            args.push(Box::new(u.clone()));
+            sql.push_str(&format!(" AND scope_user = ?{}", args.len()));
+        }
+        match &sc.project {
+            Some(p) => {
+                args.push(Box::new(p.clone()));
+                let project = args.len();
+                if let Some(a) = &sc.agent {
+                    args.push(Box::new(a.clone()));
+                    let agent = args.len();
+                    sql.push_str(&format!(
+                        " AND (scope_global = 1 OR (scope_project = ?{project} AND (scope_agent IS NULL OR scope_agent = ?{agent})))"
+                    ));
+                } else {
+                    sql.push_str(&format!(" AND (scope_global = 1 OR scope_project = ?{project})"));
+                }
+            }
+            None => sql.push_str(" AND scope_global = 1 AND pinned = 1"),
+        }
+    }
+    if pinned_only {
+        sql.push_str(" AND pinned = 1");
+    }
+    args.push(Box::new(limit as i64));
+    sql.push_str(&format!(" ORDER BY pinned DESC, updated_at DESC LIMIT ?{}", args.len()));
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())), |r| {
+            Ok(Memory {
+                id: r.get(0)?,
+                layer: r.get(1)?,
+                text: r.get(2)?,
+                session_id: r.get(3)?,
+                subject: r.get(4)?,
+                created_at: r.get(5)?,
+                updated_at: r.get(6)?,
+                pinned: r.get::<_, i64>(7)? != 0,
+                scope: MemoryScope {
+                    user: r.get(8)?,
+                    project: r.get(9)?,
+                    agent: r.get(10)?,
+                    global: r.get::<_, i64>(11)? != 0,
+                },
+                score: None,
+                superseded_at: r.get(12)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
 /// Drop one memory. Returns false when there was nothing to drop.
 pub fn forget(store: &Store, id: &str) -> Result<bool, String> {
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
@@ -1656,6 +1736,42 @@ mod memory_tests {
         scoped(&s, "b", "L1", "beta uses Sqlite", Some("beta"), None, 0, 0);
         // The Assistant's Memory screen must keep working unchanged.
         assert_eq!(recall(&s, "Postgres Sqlite", 10, None).unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn scoped_list_returns_only_global_identity_for_a_foreign_project() {
+        let (s, d) = temp_store("scope-list-foreign");
+        scoped(&s, "name", "L3", "I am Tushu", None, None, 1, 1);
+        scoped(&s, "role", "L3", "I am a Software Engineer", None, None, 1, 1);
+        scoped(
+            &s,
+            "tauri",
+            "L1",
+            "context graph engine lives at apps/desktop/src/lib/context/engine.ts",
+            Some("p_tauri"),
+            None,
+            0,
+            0,
+        );
+        scoped(&s, "stale", "L1", "git clone and git fetch are unavailable", None, None, 0, 0);
+
+        let rows = list_scoped(&s, Some(&scope_of(Some("p_next"), None)), 50, false).unwrap();
+        let mut ids: Vec<&str> = rows.iter().map(|m| m.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["name", "role"], "only global identity survives a foreign project");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn scoped_pinned_list_is_the_always_on_header() {
+        let (s, d) = temp_store("scope-list-pinned");
+        scoped(&s, "name", "L3", "I am Tushu", None, None, 1, 1);
+        scoped(&s, "pref", "L1", "prefers terse replies", None, None, 1, 0);
+
+        let rows = list_scoped(&s, Some(&scope_of(Some("p_next"), None)), 50, true).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["name"], "pinned_only narrows the manifest header");
         let _ = std::fs::remove_dir_all(&d);
     }
 
