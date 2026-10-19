@@ -4,6 +4,7 @@
  */
 import { create } from "zustand";
 import type { RecalledMemory } from "./lib/chat/turn/memory-refs";
+import type { AttachmentMeta } from "./lib/chat/turn/messages";
 
 export type ScreenId = "providers" | "models" | "assistant" | "axiom" | "compare" | "activity" | "context" | "history" | "skills" | "agents" | "subagents" | "memory" | "settings" | "gateway" | "control" | "onboarding";
 
@@ -35,6 +36,8 @@ export type ResumeMsg = {
   content: string;
   /** The model's own reasoning, restored from the durable row when it was recorded. */
   reasoning?: string;
+  /** Attachment names/sizes restored from disk; the bytes are not stored. */
+  attachmentMeta?: AttachmentMeta[];
   tool_calls?: unknown;
   tool_call_id?: string;
   /** The memories this answer drew on (0028's `memory_refs` column), for the recall card. */

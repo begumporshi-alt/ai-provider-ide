@@ -11,8 +11,9 @@
 //! is not listed here, so the gateway never advertises it; the sandbox still carries a refusal
 //! arm in case a call arrives by name anyway.
 //!
-//! `write_file`, `edit_file`, `mkdir` and `run_command` are **mutating** — the four the gateway
-//! refuses unless mutation is explicitly enabled ([`crate::core::gateway::MUTATING_TOOLS`]), and the
+//! `write_file`, `edit_file`, `mkdir`, `run_command`, `http_request`, `apply_patch`, `web_fetch`
+//! and `web_search` are **gated** — the eight the gateway refuses unless mutation is explicitly
+//! enabled ([`crate::core::gateway::MUTATING_TOOLS`]) — and the rest are advertised as read-only.
 //! four the Assistant confirms one call at a time. `todo_write` mutates only the Assistant's
 //! progress panel, never the workspace, and `web_fetch`/`web_search` reach the public internet
 //! without writing anywhere; none of them is gated. The other four only read, and are always
@@ -27,15 +28,15 @@
 //! until a model tries to use it — so the checks are asserted in the test module instead.
 //!
 //! The mutating set is asserted against [`crate::core::gateway::MUTATING_TOOLS`]. That constant is
-//! what keeps gateway mutation opt-in; a rename on one side without a rename on the other would
-//! silently un-gate a writing tool, so the names are pinned in both places.
+//! what keeps gateway mutation and egress opt-in; a rename on one side without a rename on the
+//! other would silently un-gate a writing or network tool, so the names are pinned in both places.
 //!
 //! # Why the gateway advertises fewer tools than the Assistant
 //!
 //! [`gateway_tool_set`] narrows the registry when mutation is off, which is the default. A tool that
 //! is advertised and then refused is not merely wasted tokens — the model calls it, reads a refusal
 //! and spends a turn discovering that. Measured on a short request: the eight schemas cost ~1,187
-//! prompt tokens of a 1,721-token prompt, and the mutating four are about half of that.
+//! prompt tokens of a 1,721-token prompt, and the eight gated schemas are about half of that.
 //!
 //! One divergence: the reference returns `undefined` for an empty registry, which becomes `None`
 //! here. Both mean "omit `tools`/`tool_choice` entirely", which is the only correct rendering of
@@ -452,9 +453,10 @@ mod tests {
         read_only.sort_unstable();
         // `todo_write` mutates only the Assistant's progress panel, never the workspace, so it
         // is on the read-only side even though its name says "write". The web tools reach the
-        // public internet but write nothing anywhere, so they read too. `http_request` and
-        // `apply_patch` are the opposite case: names that sound read-adjacent ("request",
-        // "patch") but which send data out or rewrite files, so they are gated.
+        // public internet and can carry data out, so they are gated with the writers — a fetch
+        // is egress even though it stores nothing locally. `http_request` and `apply_patch` are
+        // the opposite case: names that sound read-adjacent ("request", "patch") but which send
+        // data out or rewrite files, so they are gated.
         assert_eq!(
             read_only,
             vec![
@@ -465,9 +467,7 @@ mod tests {
                 "read_file",
                 "read_image",
                 "search_files",
-                "todo_write",
-                "web_fetch",
-                "web_search"
+                "todo_write"
             ]
         );
     }
@@ -495,10 +495,10 @@ mod tests {
     /// The whole point: with mutation off (the default) the gateway must not advertise a tool it
     /// will refuse. Falsified by dropping the filter — the set goes back to sixteen.
     #[test]
-    fn gateway_tool_set_omits_the_mutating_four_when_mutation_is_off() {
+    fn gateway_tool_set_omits_the_gated_tools_when_mutation_is_off() {
         let set = gateway_tool_set(false);
         let names: Vec<&str> = set.iter().map(|t| t.name).collect();
-        assert_eq!(names.len(), 10, "expected the ten read-only tools, got {names:?}");
+        assert_eq!(names.len(), 8, "expected the eight read-only tools, got {names:?}");
         for m in MUTATING_TOOLS {
             assert!(!names.contains(&m), "{m} is advertised but would be refused");
         }
@@ -510,7 +510,7 @@ mod tests {
         assert_eq!(gateway_tool_set(true).len(), 16);
     }
 
-    /// The read-only ten are advertised either way — narrowing must never remove a tool the
+    /// The read-only eight are advertised either way — narrowing must never remove a tool the
     /// gateway is willing to run.
     #[test]
     fn the_read_only_tools_are_advertised_either_way() {
@@ -522,8 +522,6 @@ mod tests {
                 "search_files",
                 "file_info",
                 "todo_write",
-                "web_fetch",
-                "web_search",
                 "glob",
                 "read_document",
                 "read_image",

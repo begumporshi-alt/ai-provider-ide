@@ -146,6 +146,109 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// What an opt-in history prune would remove.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct HistoryRetentionCounts {
+    pub sessions: i64,
+    pub messages: i64,
+    pub nodes: i64,
+    pub edges: i64,
+}
+
+/// `None` means retention is off (`days == 0`), never "everything is old".
+fn history_cutoff(days: u32) -> Option<i64> {
+    if days == 0 {
+        return None;
+    }
+    Some(now_ms().saturating_sub((days as i64).saturating_mul(86_400_000)))
+}
+
+fn count_history_at(
+    conn: &rusqlite::Connection,
+    cutoff: i64,
+) -> Result<HistoryRetentionCounts, String> {
+    let one = |sql: &str| -> Result<i64, String> {
+        conn.query_row(sql, [cutoff], |r| r.get(0)).map_err(|e| e.to_string())
+    };
+    const OLD_SESSIONS: &str = "SELECT id FROM router_sessions WHERE last_seen_at < ?1";
+    Ok(HistoryRetentionCounts {
+        sessions: one("SELECT COUNT(*) FROM router_sessions WHERE last_seen_at < ?1")?,
+        messages: one(&format!(
+            "SELECT COUNT(*) FROM session_messages WHERE session_id IN ({OLD_SESSIONS})"
+        ))?,
+        nodes: one(&format!(
+            "SELECT COUNT(*) FROM context_nodes WHERE session_id IN ({OLD_SESSIONS})"
+        ))?,
+        edges: one(&format!(
+            "SELECT COUNT(*) FROM context_edges
+             WHERE from_id IN (SELECT id FROM context_nodes WHERE session_id IN ({OLD_SESSIONS}))
+                OR to_id IN (SELECT id FROM context_nodes WHERE session_id IN ({OLD_SESSIONS}))"
+        ))?,
+    })
+}
+
+/// Count what [`prune_history`] would delete. `days == 0` (the default) means retention is off.
+///
+/// This is a **read**; the Settings screen calls it to show the user exactly what a prune would
+/// remove before they confirm.
+pub fn preview_history(store: &Store, days: u32) -> Result<HistoryRetentionCounts, String> {
+    let Some(cutoff) = history_cutoff(days) else { return Ok(HistoryRetentionCounts::default()) };
+    let conn = store.conn.lock().map_err(|e| e.to_string())?;
+    count_history_at(&conn, cutoff)
+}
+
+/// Delete session-scoped history older than `days` of inactivity.
+///
+/// **Manual and opt-in.** The caller is the Settings screen, after a preview and a second
+/// confirmation. Nothing schedules this pass. Memories and the run ledger are deliberately not
+/// touched — they have their own retention and their own reasons to outlive a conversation.
+///
+/// The session row goes with its transcript, graph, title and state in one transaction, so
+/// History cannot show a session whose transcript has already been removed.
+pub fn prune_history(store: &Store, days: u32) -> Result<HistoryRetentionCounts, String> {
+    let Some(cutoff) = history_cutoff(days) else { return Ok(HistoryRetentionCounts::default()) };
+    let mut conn = store.conn.lock().map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let counts = count_history_at(&tx, cutoff)?;
+    const OLD_SESSIONS: &str = "SELECT id FROM router_sessions WHERE last_seen_at < ?1";
+    // Edges first, from either side; then nodes, the transcript, the session metadata, and the
+    // session itself. Deleting a node first would leave edges pointing at a row that is gone
+    // until the cascade runs, and the cascade is not the guarantee we want to rely on here.
+    tx.execute(
+        &format!(
+            "DELETE FROM context_edges
+             WHERE from_id IN (SELECT id FROM context_nodes WHERE session_id IN ({OLD_SESSIONS}))
+                OR to_id IN (SELECT id FROM context_nodes WHERE session_id IN ({OLD_SESSIONS}))"
+        ),
+        [cutoff],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        &format!("DELETE FROM context_nodes WHERE session_id IN ({OLD_SESSIONS})"),
+        [cutoff],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        &format!("DELETE FROM session_messages WHERE session_id IN ({OLD_SESSIONS})"),
+        [cutoff],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        &format!("DELETE FROM session_titles WHERE session_id IN ({OLD_SESSIONS})"),
+        [cutoff],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        &format!("DELETE FROM session_state WHERE session_id IN ({OLD_SESSIONS})"),
+        [cutoff],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM router_sessions WHERE last_seen_at < ?1", [cutoff])
+        .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(counts)
+}
+
 fn fold_memory(acc: &mut Option<MemoryPruneStats>, step: MemoryPruneStats) {
     match acc {
         Some(a) => {
@@ -338,6 +441,70 @@ mod retention_tests {
         let left: i64 = conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0)).unwrap();
         drop(conn);
         assert_eq!(left, 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn history_retention_removes_only_sessions_older_than_the_cutoff() {
+        let (store, d) = temp_store("history");
+        let now = now_ms();
+        let old = now - 40 * 86_400_000;
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO router_sessions (id, created_at, last_seen_at) VALUES ('old', ?1, ?2)",
+                rusqlite::params![old, old],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO router_sessions (id, created_at, last_seen_at) VALUES ('new', ?1, ?2)",
+                rusqlite::params![now, now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_messages (session_id, seq, role, content, ts)
+                 VALUES ('old', 0, 'user', 'old q', ?1), ('new', 0, 'user', 'new q', ?1)",
+                [now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO context_nodes (id, kind, label, source, session_id, ts)
+                 VALUES ('n-old', 'message', 'old', 'ui', 'old', ?1),
+                        ('n-new', 'message', 'new', 'ui', 'new', ?1)",
+                [now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO context_edges (id, from_id, to_id, kind, weight, ts)
+                 VALUES ('e-old', 'n-old', 'n-old', 'follows', 1, ?1),
+                        ('e-new', 'n-new', 'n-new', 'follows', 1, ?1)",
+                [now],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            preview_history(&store, 0).unwrap(),
+            HistoryRetentionCounts::default(),
+            "0 means retention is off"
+        );
+        let expected = HistoryRetentionCounts { sessions: 1, messages: 1, nodes: 1, edges: 1 };
+        assert_eq!(preview_history(&store, 30).unwrap(), expected);
+        assert_eq!(prune_history(&store, 30).unwrap(), expected);
+
+        let conn = store.conn.lock().unwrap();
+        let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(count("SELECT COUNT(*) FROM router_sessions"), 1, "the recent session survives");
+        assert_eq!(count("SELECT COUNT(*) FROM session_messages"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM context_nodes"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM context_edges"), 1);
+        drop(conn);
+
+        assert_eq!(
+            preview_history(&store, 30).unwrap(),
+            HistoryRetentionCounts::default(),
+            "the prune is idempotent"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 }

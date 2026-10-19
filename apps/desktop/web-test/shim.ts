@@ -1521,6 +1521,12 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       transcriptRows.delete(sid);
       return null;
     }
+    case "history_retention_preview":
+    case "history_retention_prune":
+      // The shim has no session age clock; the Rust retention test owns the deletion logic. The
+      // commands exist here so the Settings section can render and preview without an unknown-
+      // command rejection — and so a UI test can see the honest empty result.
+      return { sessions: 0, messages: 0, nodes: 0, edges: 0 };
     // ---- the transcript (0027) ----
     // The durable copy of the conversation. Emulated rather than stubbed because the resume path
     // reads it back: a shim that returned [] would make "resume restored the transcript" pass

@@ -2898,7 +2898,7 @@ fn mutation_is_disabled_by_default() {
 fn mutating_tools_are_refused_while_read_only_still_works() {
     let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
     let (core, _bridge) = test_core(key);
-    for tool in ["write_file", "run_command"] {
+    for tool in ["write_file", "run_command", "web_fetch", "web_search"] {
         assert!(core.gateway_tool_refusal(tool).is_some(), "{tool} must be refused by default");
     }
     for tool in ["read_file", "list_dir"] {
@@ -2915,7 +2915,7 @@ fn enabling_mutation_lifts_the_refusal() {
     let (core, _bridge) = test_core(key);
     core.set_tools_mutation_enabled(true);
     assert!(core.is_tools_mutation_enabled());
-    for tool in ["write_file", "run_command", "read_file", "list_dir"] {
+    for tool in ["write_file", "run_command", "web_fetch", "web_search", "read_file", "list_dir"] {
         assert!(
             core.gateway_tool_refusal(tool).is_none(),
             "{tool} must be allowed once mutation is enabled"

@@ -55,6 +55,26 @@ describe("resumeSession", () => {
     expect(out[2]!.content).toBe("file body");
   });
 
+  it("restores attachment metadata as a placeholder, without inventing bytes", async () => {
+    const meta = [{ name: "diagram.png", mediaType: "image/png", bytes: 2048 }];
+    h.rows = [
+      {
+        sessionId: "s1",
+        seq: 1,
+        role: "user",
+        content: "look at this",
+        attachments: JSON.stringify(meta),
+        ts: 1,
+      },
+    ];
+
+    const out = await resumeSession("s1");
+    // The durable row says an image was sent; the bytes were never stored, so the UI gets a
+    // named placeholder rather than a silent disappearance or a fake thumbnail.
+    expect(out[0]!.attachmentMeta).toEqual(meta);
+    expect(out[0]!.content).toBe("look at this");
+  });
+
   it("falls back to the graph-derived timeline when the session predates 0027", async () => {
     h.rows = null;
     h.timeline = {

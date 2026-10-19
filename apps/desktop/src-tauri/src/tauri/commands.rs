@@ -20,6 +20,7 @@ use crate::core::egress::{self, EgressRequest, EgressState, StreamEvent};
 use crate::core::error::CommandError;
 use crate::core::memory;
 use crate::core::orchestrator;
+use crate::core::retention;
 use crate::core::skills;
 use crate::core::store::{self, Store};
 use crate::core::vault;
@@ -229,6 +230,25 @@ pub fn history_delete_session(
     session_id: String,
 ) -> Result<(), CommandError> {
     context::delete_session(&store, &session_id).map_err(CommandError)
+}
+
+/// How much a history prune would remove. `days == 0` means retention is off.
+#[tauri::command]
+pub fn history_retention_preview(
+    store: State<'_, Arc<Store>>,
+    days: u32,
+) -> Result<retention::HistoryRetentionCounts, CommandError> {
+    retention::preview_history(&store, days).map_err(CommandError)
+}
+
+/// Delete sessions whose last activity is older than `days`. Manual and opt-in: the Settings
+/// screen previews, then the user confirms. Memories and the run ledger are not touched.
+#[tauri::command]
+pub fn history_retention_prune(
+    store: State<'_, Arc<Store>>,
+    days: u32,
+) -> Result<retention::HistoryRetentionCounts, CommandError> {
+    retention::prune_history(&store, days).map_err(CommandError)
 }
 
 // ---------- the transcript (0027) ----------
@@ -1005,6 +1025,8 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         history_rename_session,
         history_max_seq,
         history_delete_session,
+        history_retention_preview,
+        history_retention_prune,
         transcript_append,
         transcript_list,
         transcript_replace,

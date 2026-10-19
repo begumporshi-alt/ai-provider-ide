@@ -320,18 +320,43 @@ pub fn install(
         .map_err(|e| ServiceError(format!("cannot create {}: {e}", bin_dir.display())))?;
     // Permissions come along: `fs::copy` copies the mode, and the bundled binary is already
     // executable. A `chmod` here would be a second spelling of a fact the source already carries.
-    std::fs::copy(source, &p.binary).map_err(|e| {
-        ServiceError(format!(
+    //
+    // **Write beside the live path and rename, never copy onto it.** A running launchd job keeps
+    // its old inode; rewriting the live file invalidates that process's code signature and the
+    // kernel SIGKILLs it with `OS_REASON_CODESIGNING` ("Code Signature Invalid" in the report).
+    // `dev-up.sh` already swaps this way; `install()` is the other writer of the same path.
+    let temp_name = format!(
+        ".{}.new-{}",
+        p.binary.file_name().and_then(|n| n.to_str()).unwrap_or("aiproviderd"),
+        std::process::id()
+    );
+    let temp = p.binary.with_file_name(temp_name);
+    if let Err(e) = std::fs::copy(source, &temp) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(ServiceError(format!(
             "cannot install {} from {}: {e}",
             p.binary.display(),
             source.display()
-        ))
-    })?;
+        )));
+    }
     // **Before anything is registered with launchd, and that order is deliberate.** A refused
     // install must leave a previously-loaded job alone; booting the old job out and *then* failing
     // would trade a working gateway for a broken one. This is also the last point at which the
     // failure is cheap — no launchd state has been touched yet.
-    verify_executable(&p.binary)?;
+    if let Err(e) = verify_executable(&temp) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(ServiceError(format!(
+            "cannot install {}: {e}",
+            p.binary.display()
+        )));
+    }
+    if let Err(e) = std::fs::rename(&temp, &p.binary) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(ServiceError(format!(
+            "cannot replace {} with the new binary: {e}",
+            p.binary.display()
+        )));
+    }
 
     let plist_dir = p
         .plist
@@ -828,6 +853,32 @@ mod tests {
                 "the installed binary must carry the source's mode, not the umask's"
             );
         }
+    }
+
+    #[test]
+    fn install_replaces_an_existing_binary_atomically_and_leaves_no_temp_file() {
+        let (p, dir) = scratch();
+        let src = source(&dir);
+        std::fs::create_dir_all(p.binary.parent().unwrap()).unwrap();
+        std::fs::write(&p.binary, "old binary").unwrap();
+
+        let rec = Recorder::ok(0, "");
+        install(&p, &src, DOMAIN, &|a| rec.run(a)).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&p.binary).unwrap(),
+            std::fs::read_to_string(&src).unwrap(),
+            "the live path must hold the new binary"
+        );
+        let temp_name = format!(
+            ".{}.new-{}",
+            p.binary.file_name().unwrap().to_string_lossy(),
+            std::process::id()
+        );
+        assert!(
+            !p.binary.with_file_name(temp_name).exists(),
+            "the temp file must be renamed away, not left beside the binary"
+        );
     }
 
     #[test]

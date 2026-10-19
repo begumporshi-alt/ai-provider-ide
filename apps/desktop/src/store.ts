@@ -1252,6 +1252,23 @@ export async function deleteSession(sessionId: string): Promise<void> {
   return invoke("history_delete_session", { sessionId });
 }
 
+export interface HistoryRetentionCounts {
+  sessions: number;
+  messages: number;
+  nodes: number;
+  edges: number;
+}
+
+/** What a prune would remove. `days === 0` means retention is off. */
+export async function historyRetentionPreview(days: number): Promise<HistoryRetentionCounts> {
+  return invoke<HistoryRetentionCounts>("history_retention_preview", { days });
+}
+
+/** Delete sessions inactive for `days`. Manual and opt-in; the UI previews first. */
+export async function historyRetentionPrune(days: number): Promise<HistoryRetentionCounts> {
+  return invoke<HistoryRetentionCounts>("history_retention_prune", { days });
+}
+
 /** Highest node sequence already recorded for a session, so a resume can continue the sequence. */
 export async function historyMaxSeq(sessionId: string): Promise<number> {
   return invoke<number>("history_max_seq", { sessionId });
@@ -1343,6 +1360,24 @@ export async function resumeSession(sessionId: string): Promise<import("./ui-sta
       if (r.memoryRefs) {
         const recalled = parseRecalledMemoryRefs(r.memoryRefs);
         if (recalled.length > 0) msg.recalledMemories = recalled;
+      }
+      if (r.attachments) {
+        try {
+          const parsed: unknown = JSON.parse(r.attachments);
+          if (Array.isArray(parsed)) {
+            const meta = parsed.filter(
+              (a): a is { name: string; mediaType: string; bytes: number } =>
+                !!a &&
+                typeof a === "object" &&
+                typeof (a as { name?: unknown }).name === "string" &&
+                typeof (a as { mediaType?: unknown }).mediaType === "string" &&
+                typeof (a as { bytes?: unknown }).bytes === "number",
+            );
+            if (meta.length > 0) msg.attachmentMeta = meta;
+          }
+        } catch {
+          // A malformed metadata blob is not worth losing the row over.
+        }
       }
       return msg;
     });

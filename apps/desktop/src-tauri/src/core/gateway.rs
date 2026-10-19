@@ -911,10 +911,20 @@ pub const MEMORY_FREEZE_TTL: Duration = Duration::from_secs(600);
 /// accumulates one entry per session for ever.
 const MAX_FROZEN_BLOCKS: usize = 256;
 
-/// Gateway-side tools that can change the workspace — or, for `http_request`, send data out of
-/// it. Everything else only reads.
-pub const MUTATING_TOOLS: [&str; 6] =
-    ["write_file", "edit_file", "mkdir", "run_command", "http_request", "apply_patch"];
+/// Gateway-side tools that can change the workspace **or send data out of it** — egress counts
+/// with writes here because the gateway executes tools with no user confirmation. `web_fetch` and
+/// `web_search` can carry workspace content in a URL/query, which is the same class of consequence
+/// as `http_request`. Everything else only reads locally.
+pub const MUTATING_TOOLS: [&str; 8] = [
+    "write_file",
+    "edit_file",
+    "mkdir",
+    "run_command",
+    "http_request",
+    "apply_patch",
+    "web_fetch",
+    "web_search",
+];
 
 /// Audit H1b: is `tool` permitted on the gateway path? `Some(reason)` = refused.
 ///
@@ -931,8 +941,8 @@ pub fn gateway_tool_refusal(tool: &str, mutation_enabled: bool) -> Option<String
     if MUTATING_TOOLS.contains(&tool) && !mutation_enabled {
         Some(format!(
             "\"{tool}\" is disabled on the gateway. The gateway executes tools with no user \
-             confirmation, so mutation is off by default. Enable it in Gateway settings, or use \
-             the Assistant, which asks before every call."
+             confirmation, so tools that write or send data out are off by default. Enable it in \
+             Gateway settings, or use the Assistant, which asks before every call."
         ))
     } else {
         None

@@ -7,15 +7,17 @@
  * and a tool the host does not implement is a call that can only ever return an error. Neither
  * surfaces until a model tries to use it — so the checks live here instead.
  *
- * The mutating set is asserted against the Rust list in `gateway.rs` (`MUTATING_TOOLS`) plus the
- * frontend composites the gateway never sees. That constant is what keeps gateway mutation
- * opt-in; a rename here without a rename there would silently un-gate a writing tool, so the
- * names are pinned in both places.
+ * The write-effect set is asserted against the Rust list in `gateway.rs` (`MUTATING_TOOLS`) plus
+ * the frontend composites the gateway never sees. The Rust constant also gates `web_fetch` and
+ * `web_search` as egress; the TypeScript `effect` models those separately as `network`, so they
+ * are intentionally absent from the write list below. A rename here without a rename there would
+ * silently un-gate a writing tool, so the names are pinned in both places.
  */
 import { describe, expect, it } from "vitest";
 import { AGENT_TOOLS, SUBAGENT_TOOLS, registryToOpenAI, toolEffect } from "./registry";
 
-/** Mirrors `MUTATING_TOOLS` in src-tauri/src/gateway.rs. Keep the two in step. */
+/** The write-effect tools. The Rust `MUTATING_TOOLS` additionally gates the web tools as egress;
+ *  those carry the `network` effect here, not `mutate`. */
 const GATEWAY_MUTATING = ["write_file", "edit_file", "mkdir", "run_command", "http_request", "apply_patch"];
 /** Assistant-only composites the gateway never sees: `edit_notebook` is read_file + write_file
  *  assembled in the agent loop, `generate_image` writes through the base64 encoding the loop

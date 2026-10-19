@@ -10,6 +10,17 @@ import { imageContextBlock } from "../vision";
 import type { Attachment, InlinedText } from "../../../components/Composer";
 import { parseRecalledMemoryRefs, recalledLight, type RecalledMemory } from "./memory-refs";
 
+/**
+ * What the durable transcript stores about an attachment: enough to name it, never its bytes.
+ * A resumed turn renders this as a placeholder — the image itself lives only in the turn that
+ * sent it, and pretending otherwise would make a blank thumbnail look like a loaded one.
+ */
+export interface AttachmentMeta {
+  name: string;
+  mediaType: string;
+  bytes: number;
+}
+
 // Re-exported: the turn modules read these from here, the store reads them from the leaf.
 export { parseRecalledMemoryRefs, recalledLight, type RecalledMemory };
 
@@ -43,6 +54,8 @@ export interface Msg {
    * from the composer), so this costs no extra read.
    */
   attachments?: Attachment[];
+  /** Metadata for an attachment restored from disk, where the bytes no longer exist. */
+  attachmentMeta?: AttachmentMeta[];
   /**
    * What a vision model saw in this turn's images, when the model that ANSWERED cannot see them.
    *
