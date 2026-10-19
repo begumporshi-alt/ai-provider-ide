@@ -395,7 +395,7 @@ export const AGENT_TOOLS: ToolSpec[] = [
   },
   {
     name: "web_ask",
-    effect: "read",
+    effect: "network",
     description:
       "Ask a question about a web page: fetches it and answers with the model in a side call, so the page text stays out of the conversation. Only the answer is returned.",
     parameters: {
@@ -496,7 +496,7 @@ export const AGENT_TOOLS: ToolSpec[] = [
   },
   {
     name: "web_fetch",
-    effect: "read",
+    effect: "network",
     description:
       "Read a public web page from the internet: fetched over http(s), HTML stripped, text capped at 32 KB. Private, loopback and non-http(s) URLs are refused.",
     parameters: {
@@ -511,7 +511,7 @@ export const AGENT_TOOLS: ToolSpec[] = [
   },
   {
     name: "web_search",
-    effect: "read",
+    effect: "network",
     description:
       "Search the public web (keyless, automatic fallback between backends) and get the top results: title, URL and snippet. Follow up with web_fetch to read a result.",
     parameters: {

@@ -69,6 +69,14 @@ describe("auto-approve reads — the acceptance criterion", () => {
     expect(decide(s, "run_command")).toEqual({ action: "ask" });
   });
 
+  it("prompts for network tools under auto-approve reads", () => {
+    // A fetch is egress: a prompt-injected page can put workspace data in its URL. It is not a
+    // local read, so the mode must not approve it by default.
+    expect(decide(s, "web_fetch")).toEqual({ action: "ask" });
+    expect(decide(s, "web_search")).toEqual({ action: "ask" });
+    expect(decide(s, "web_ask")).toEqual({ action: "ask" });
+  });
+
   it("never auto-approves a write in any mode but yolo", () => {
     expect(modeApprovesWrites("ask")).toBe(false);
     expect(modeApprovesWrites("auto-reads")).toBe(false);

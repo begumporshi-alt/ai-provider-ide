@@ -41,7 +41,7 @@ describe("resumeSession", () => {
       '[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\"a.txt\\"}"}}]';
     h.rows = [
       { sessionId: "s1", seq: 1, role: "user", content: "read it", ts: 1 },
-      { sessionId: "s1", seq: 2, role: "assistant", content: "", toolCalls: calls, ts: 2 },
+      { sessionId: "s1", seq: 2, role: "assistant", content: "", toolCalls: calls, reasoning: "weighing it", ts: 2 },
       { sessionId: "s1", seq: 3, role: "tool", content: "file body", toolCallId: "call_1", ts: 2 },
     ];
 
@@ -49,6 +49,8 @@ describe("resumeSession", () => {
     expect(out.map((m) => m.role)).toEqual(["user", "assistant", "tool"]);
     // The pair, parsed back into the object the wire needs — not the serialized string.
     expect(out[1]!.tool_calls).toEqual(JSON.parse(calls));
+    // The thinking panel is part of the turn the user saw; resume must not drop it.
+    expect(out[1]!.reasoning).toBe("weighing it");
     expect(out[2]!.tool_call_id).toBe("call_1");
     expect(out[2]!.content).toBe("file body");
   });

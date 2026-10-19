@@ -7,9 +7,10 @@
  *
  * Usage: `<Markdown source={messageContent} />`
  *
- * Security: markdown-it escapes user content by default. `html: true` allows inline HTML within
- * the markdown stream, but the source tokens come through the parser — provider/system content
- * is the input, not raw injection. Tool results are app-controlled strings.
+ * Security: `html: false`. Model output and tool results are untrusted, and the renderer feeds
+ * the result to `dangerouslySetInnerHTML`; allowing raw HTML there let a model emit an `<img
+ * onerror=…>` or a form. The app's own HTML cards do not go through this path — `RichMarkdown`
+ * splits a whole HTML document out to `HtmlPreview`, which runs it in a sandboxed frame.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import MarkdownIt from "markdown-it";
@@ -19,11 +20,16 @@ import "./markdown.css";
 
 // A single shared markdown-it instance — it is stateful (plugins, options) but not per-call.
 const md = new MarkdownIt({
-  html: true,
+  html: false,
   linkify: true,
   typographer: true,
   breaks: false,
 });
+
+/** Render one source string. Exported so the escaping rule can be pinned without a DOM. */
+export function renderMarkdown(source: string): string {
+  return md.render(source);
+}
 
 /**
  * Intercept every link click and hand the URL to the OS browser.
@@ -53,7 +59,7 @@ export function Markdown({ source }: { source: string }) {
 
   // Render markdown once per source change. useMemo so we don't re-render the whole DOM tree
   // on every keystroke — only when the text actually differs.
-  const html = useMemo(() => md.render(source), [source]);
+  const html = useMemo(() => renderMarkdown(source), [source]);
 
   // Post-render: syntax-highlight code blocks + inject copy buttons.
   useEffect(() => {

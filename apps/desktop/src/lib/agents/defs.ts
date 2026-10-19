@@ -49,12 +49,16 @@ export interface SubagentDef {
   enabled: boolean;
 }
 
-/** The read-effect tool names a definition's allowlist may draw from. Precomputed once: the
- *  registry is static for the process lifetime (MCP tools are registered at runtime, but a
- *  sub-agent allowlist pinned to a session's MCP set would silently break on the next launch,
- *  so builtins only). */
+/** The **non-mutating** tool names a definition's allowlist may draw from: read and network.
+ *  Precomputed once — the registry is static for the process lifetime (MCP tools are registered
+ *  at runtime, but a sub-agent allowlist pinned to a session's MCP set would silently break on
+ *  the next launch, so builtins only).
+ *
+ *  Network tools are included because they are not workspace writes, and the parent's approval
+ *  gate still sees their `network` effect — a definition can narrow the toolset, but it cannot
+ *  turn an egress call into an unprompted one. */
 const ALLOWABLE_TOOL_NAMES: ReadonlySet<string> = new Set(
-  AGENT_TOOLS.filter((t: ToolSpec) => t.effect === "read").map((t) => t.name),
+  AGENT_TOOLS.filter((t: ToolSpec) => t.effect !== "mutate").map((t) => t.name),
 );
 
 export function allowableToolNames(): string[] {
@@ -100,7 +104,7 @@ export function parseSubagentDef(raw: unknown): { def: SubagentDef } | { error: 
       if (typeof t !== "string" || !t.trim()) return { error: `"tools" entries must be non-empty strings` };
       const tool = t.trim();
       if (!ALLOWABLE_TOOL_NAMES.has(tool)) {
-        return { error: `"tools" names a tool that is not a read-effect builtin: "${tool}"` };
+        return { error: `"tools" names a tool that is not a read or network builtin: "${tool}"` };
       }
       if (!tools.includes(tool)) tools.push(tool);
     }

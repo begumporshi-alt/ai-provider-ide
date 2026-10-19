@@ -107,15 +107,35 @@ export function applyAgentEvent(segments: TimelineSegment[], ev: AgentEvent): Ti
       ];
     case "tool_result": {
       const next = [...segments];
-      for (let i = next.length - 1; i >= 0; i--) {
-        const seg = next[i]!;
-        if (seg.kind === "tool" && seg.status === "calling") {
-          next[i] = {
+      // Match the call the result names. Calls in one batch run concurrently, so the last
+      // segment still `calling` is often a different call than the one that just finished.
+      let index = -1;
+      if (ev.call.id) {
+        for (let i = next.length - 1; i >= 0; i--) {
+          const seg = next[i]!;
+          if (seg.kind === "tool" && seg.status === "calling" && seg.callId === ev.call.id) {
+            index = i;
+            break;
+          }
+        }
+      }
+      if (index < 0) {
+        for (let i = next.length - 1; i >= 0; i--) {
+          const seg = next[i]!;
+          if (seg.kind === "tool" && seg.status === "calling") {
+            index = i;
+            break;
+          }
+        }
+      }
+      if (index >= 0) {
+        const seg = next[index]!;
+        if (seg.kind === "tool") {
+          next[index] = {
             ...seg,
             status: /denied|refused/i.test(ev.result) ? "denied" : ev.ok ? "ok" : "error",
             result: ev.result,
           };
-          break;
         }
       }
       return next;

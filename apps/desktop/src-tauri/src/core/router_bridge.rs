@@ -499,13 +499,19 @@ impl Job {
                     let _ = replies.reply(id, BridgeMsg::Done);
                     return Ok(());
                 }
-                // Ours whoever declared the real tools: an inline marker is not part of any client
-                // tool contract, so it always runs here and never reaches the client.
+                // In-band markers are the gateway's own tool contract only when the gateway owns
+                // the turn. A client that declared its own tools (or no tools) has its own
+                // approval model; running host-side tools for it would bypass that gate.
                 TurnOutcome::SandboxMercury => {
-                    self.sandbox_turn(&mut messages, &turn_text, &mercury, cancel).await;
+                    let refusal = (ownership != ToolOwnership::Gateway).then_some(
+                        "In-band tool calls are not executed for this client: it did not grant \
+                         host-side tool use. Use the tool interface this client declared, or \
+                         answer without tools.",
+                    );
+                    self.sandbox_turn(&mut messages, &turn_text, &mercury, cancel, refusal).await;
                 }
                 TurnOutcome::SandboxCollected => {
-                    self.sandbox_turn(&mut messages, &turn_text, &collected, cancel).await;
+                    self.sandbox_turn(&mut messages, &turn_text, &collected, cancel, None).await;
                 }
             }
         }
@@ -552,6 +558,7 @@ impl Job {
         turn_text: &str,
         calls: &[ToolCall],
         cancel: &Cancel,
+        refusal: Option<&str>,
     ) {
         let wire = to_wire_tool_calls(calls);
         messages.push(json!({
@@ -566,12 +573,23 @@ impl Job {
                 return;
             }
             let name = call.name.clone().unwrap_or_default();
-            let result_text = match gateway_tool_refusal(&name, self.host.tools_mutation_enabled())
-            {
-                // The refusal is the tool's *result*, not a bridge failure: the model reads it and
-                // can choose another way. Sending an error would end the request instead.
-                Some(reason) => reason,
-                None => self.run_tool(&name, call.arguments.as_deref(), root.as_deref()).await,
+            let result_text = if let Some(reason) = refusal {
+                reason.to_string()
+            } else if !crate::core::tool_registry::is_registered_tool(&name) {
+                // A model-authored marker may name a tool the gateway never advertised. Refuse
+                // it before `tool_run`, which knows browser and process tools the registry does
+                // not publish.
+                format!(
+                    "\"{name}\" is not a tool the gateway advertises; it cannot be called from \
+                     inline tool syntax."
+                )
+            } else {
+                match gateway_tool_refusal(&name, self.host.tools_mutation_enabled()) {
+                    // The refusal is the tool's *result*, not a bridge failure: the model reads it
+                    // and can choose another way. Sending an error would end the request instead.
+                    Some(reason) => reason,
+                    None => self.run_tool(&name, call.arguments.as_deref(), root.as_deref()).await,
+                }
             };
             messages.push(json!({
                 "role": "tool",
@@ -1786,6 +1804,38 @@ mod tests {
                 .and_then(Value::as_str),
             Some(answered),
             "the id declared and the id answered are the same one"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mercury_marker_is_refused_when_the_client_declared_its_own_tools() {
+        // The client owns its tool contract. An inline marker must not reach the host sandbox
+        // behind its approval gate; the model is told so and can answer without tools.
+        let marker = "<tool_call><function=write_file>\
+                      <parameter=path>escape.txt</parameter>\
+                      <parameter=content>owned</parameter></function></tool_call>";
+        let adapter =
+            Scripted::text(vec![ScriptedTurn::saying(&[marker]), ScriptedTurn::saying(&["done"])]);
+        let bridge = bridge_with(adapter.clone(), Host::gateway_tools());
+
+        let mut req = chat("m1");
+        req.body["tools"] = json!([client_tool("client_side_thing")]);
+        let msgs = drain(&bridge, req).await;
+
+        assert_eq!(delta_text(&msgs), "done");
+        assert_eq!(adapter.text_calls(), 2, "the refusal was fed back and the model answered");
+        let second = adapter.messages_seen(1);
+        let result = second
+            .iter()
+            .find(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+            .expect("the refusal the bridge fed back");
+        assert!(
+            result
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("not executed for this client"),
+            "got: {result:?}"
         );
     }
 

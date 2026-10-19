@@ -27,7 +27,7 @@ export const APPROVAL_MODES: ReadonlyArray<{ id: ApprovalMode; label: string; hi
   {
     id: "auto-reads",
     label: "auto-approve reads",
-    hint: "Reading, listing and searching run straight away. Anything that writes still asks.",
+    hint: "Reading, listing and searching run straight away. A network fetch or anything that writes still asks.",
   },
   {
     id: "yolo",

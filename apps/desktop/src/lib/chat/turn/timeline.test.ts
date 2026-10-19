@@ -3,7 +3,8 @@
  * model. The two things pinned here are the two things the code exists for:
  *
  *  1. `applyAgentEvent` keeps arrival order: thinking and prose accumulate into their own trailing
- *     segment, a call opens a tool segment, a result fills the last one still calling.
+ *     segment, a call opens a tool segment, a result fills the call with that id (falling back to
+ *     the last one still calling when no id is present).
  *  2. `attachReasoning` lands round k's deliberation on round k's message — anchored on tool
  *     batches, so a round that called a tool *without* thinking does not shift every later round's
  *     thinking onto the wrong message.
@@ -58,7 +59,7 @@ describe("applyAgentEvent", () => {
     expect(segments[0]).toEqual({ kind: "thinking", text: "Let me look. First the config." });
   });
 
-  it("fills the last call still running, and marks a refusal denied", () => {
+  it("matches results to their call ids, and marks a refusal denied", () => {
     const segments = fold([
       call("run_command"),
       call("read_file"),
@@ -71,6 +72,22 @@ describe("applyAgentEvent", () => {
       ["read_file", "ok"],
     ]);
     expect(tools[1]!.result).toBe("contents");
+  });
+
+  it("does not paint a result onto a later call that is still running", () => {
+    const segments = fold([
+      call("read_file"),
+      { type: "tool_call", call: { id: "c-list_dir", name: "list_dir", arguments: "{}" } },
+      {
+        type: "tool_result",
+        call: { id: "c-read_file", name: "read_file", arguments: "{}" },
+        result: "first",
+        ok: true,
+      },
+    ]);
+    const tools = toolSegments(segments);
+    expect(tools[0]).toMatchObject({ name: "read_file", status: "ok", result: "first" });
+    expect(tools[1]).toMatchObject({ name: "list_dir", status: "calling" });
   });
 
   it("parses a call's arguments once, tolerantly", () => {

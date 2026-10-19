@@ -16,6 +16,7 @@ import {
   resumeSession,
   historyMaxSeq,
   transcriptAppend,
+  transcriptReplace,
   transcriptMaxSeq,
   setSessionTitle as saveSessionTitle,
   type HistorySession,
@@ -126,6 +127,7 @@ import { activeAxiomTurn } from "../lib/axiom/active";
 import { beginTurn, currentTurn } from "../lib/chat/turn/controller";
 import type { Trace } from "../lib/chat/turn/ports";
 import type { TranscriptEntry } from "../lib/chat/turn/ports";
+import { attachmentMeta } from "../lib/chat/turn/ports";
 
 /**
  * Tier 2 summarizer — what the assistant hands to `generateText` so dropped context becomes a
@@ -604,6 +606,8 @@ interface AssistantSettings {
   root?: string;
   agentMode?: boolean;
   useMemory?: boolean;
+  /** Compress the oldest history before a turn that would overflow the model window. Default on. */
+  autoCompact?: boolean;
   noTools?: boolean;
   /** Ceiling on tool-calling rounds in one turn. Stored raw; clamped on read, because a value
    *  written by a future build may sit outside today's bounds and must not crash the screen. */
@@ -673,7 +677,7 @@ const ASSISTANT_SETTINGS_KEY = "assistant";
  */
 const THINKING_LEVELS: readonly ReasoningEffort[] = ["off", "low", "medium", "high"];
 
-async function loadAssistantSettings(): Promise<AssistantSettings> {
+async function loadAssistantSettings(): Promise<AssistantSettings | null> {
   try {
     // The keyed route answers an **object**; the IPC command answered a JSON *string*. The
     // `JSON.parse` that used to sit here is gone with the transport rather than kept as a no-op —
@@ -681,7 +685,10 @@ async function loadAssistantSettings(): Promise<AssistantSettings> {
     const parsed: unknown = await fetchAdmin("GET", `/admin/settings/${ASSISTANT_SETTINGS_KEY}`);
     return parsed && typeof parsed === "object" ? (parsed as AssistantSettings) : {};
   } catch {
-    return {}; // no stored settings is not an error — it is the first run
+    // `null`, not `{}`: "the read failed" and "there is no row" are different facts. Hydration
+    // must not mark itself complete on a failed read, because the next effect would then write
+    // defaults over the user's stored settings.
+    return null;
   }
 }
 
@@ -725,6 +732,7 @@ export function AssistantScreen() {
   // P7: memory is on by default but switchable. Recalling and distilling on every turn changes
   // what the model sees and costs a second call, so it has to be possible to turn it off.
   const [useMemory, setUseMemory] = useState(true);
+  const [autoCompact, setAutoCompact] = useState(true);
   // Whether the run-configuration panel (the sliders icon beside "Add context") is open. The five
   // behaviour switches it holds keep their state above `Chat` — only the door lives here.
   const [runConfigOpen, setRunConfigOpen] = useState(false);
@@ -791,9 +799,13 @@ export function AssistantScreen() {
     void (async () => {
       const [stored, fallback] = await Promise.all([loadAssistantSettings(), fetchDefaultRoot()]);
       if (cancelled) return;
+      // A failed read is not a first run. Staying unhydrated keeps the write effects off, so
+      // defaults cannot overwrite a row we could not read.
+      if (stored === null) return;
       if (typeof stored.noTools === "boolean") setNoTools(stored.noTools);
       if (typeof stored.agentMode === "boolean") setAgentMode(stored.agentMode);
       if (typeof stored.useMemory === "boolean") setUseMemory(stored.useMemory);
+      if (typeof stored.autoCompact === "boolean") setAutoCompact(stored.autoCompact);
       // Clamped, not trusted: the stored JSON is ours but not written by this build.
       // `null` is a real stored value here ("no limit"), like `temperature`'s and `maxTokens`',
       // so it is tested for first; anything else is parsed (and unparseable reads as no limit).
@@ -846,7 +858,7 @@ export function AssistantScreen() {
   // missing, which reads back as "the user never changed it".
   const saveAll = useCallback(
     () => saveAssistantSettings({
-      root, agentMode, useMemory, noTools, maxIterations, approvalMode,
+      root, agentMode, useMemory, autoCompact, noTools, maxIterations, approvalMode,
       subagentsCanWrite,
       // `null` for "the loop's default", never `undefined`, for the round-trip reason below.
       subagentsSummaryCap,
@@ -867,7 +879,7 @@ export function AssistantScreen() {
       // `null` for "none" — a cleared provider has to overwrite the stored one, not vanish.
       searchProvider: searchProvider === "none" ? null : searchProvider,
     }),
-    [root, agentMode, useMemory, noTools, maxIterations, approvalMode, model, temperature, maxTokens, thinking,
+    [root, agentMode, useMemory, autoCompact, noTools, maxIterations, approvalMode, model, temperature, maxTokens, thinking,
       customSystemPrompt, customNoToolsSystem, customAgentSystem, searchProvider,
       subagentsCanWrite, subagentsSummaryCap],
   );
@@ -887,8 +899,9 @@ export function AssistantScreen() {
     saveAll();
     // `root` is written by the debounced effect below; depending on it here would write twice.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hydrated, agentMode, useMemory, noTools, maxIterations, approvalMode, model, temperature, maxTokens, thinking,
-      customSystemPrompt, customNoToolsSystem, customAgentSystem]);
+  }, [hydrated, agentMode, useMemory, autoCompact, noTools, maxIterations, approvalMode, model, temperature, maxTokens, thinking,
+      customSystemPrompt, customNoToolsSystem, customAgentSystem, searchProvider,
+      subagentsCanWrite, subagentsSummaryCap]);
 
   // ...but the root is typed one character at a time, so it is debounced instead.
   useEffect(() => {
@@ -982,6 +995,17 @@ export function AssistantScreen() {
           >
             <RunSwitchRow label="Agent mode" checked={agentMode} onChange={setAgentMode} />
             <RunSwitchRow label="Memory" checked={useMemory} onChange={setUseMemory} />
+            <RunSwitchRow
+              label="Auto-compact long context"
+              displayLabel="auto-compact"
+              checked={autoCompact}
+              onChange={setAutoCompact}
+              note={
+                autoCompact
+                  ? "oldest turns are summarized before a turn that would overflow the model window"
+                  : "off — a long turn may hit the provider's context limit"
+              }
+            />
             <div className="px-2 py-1.5">
               <ApprovalPicker mode={approvalMode} onChange={setApprovalMode} disabled={!agentMode} />
               {agentMode && planMode && (
@@ -1101,6 +1125,7 @@ export function AssistantScreen() {
           noTools={noTools}
           agentMode={agentMode}
           useMemory={useMemory}
+          autoCompact={autoCompact}
           maxIterations={maxIterations}
           subagentsCanWrite={subagentsCanWrite}
           subagentsSummaryCap={subagentsSummaryCap}
@@ -1560,6 +1585,7 @@ function Chat({
   noTools,
   agentMode,
   useMemory,
+  autoCompact,
   maxIterations,
   subagentsCanWrite,
   subagentsSummaryCap,
@@ -1588,6 +1614,8 @@ function Chat({
   noTools: boolean;
   agentMode: boolean;
   useMemory: boolean;
+  /** Automatic compaction is on unless the user turned it off; see `AssistantSettings`. */
+  autoCompact: boolean;
   /** The user's step budget, or null for no ceiling (the default). */
   maxIterations: number | null;
   /** Whether a delegated sub-agent may modify the workspace. Owned by `AssistantScreen` (it is
@@ -2133,34 +2161,82 @@ function Chat({
   const approvalRef = useRef<ApprovalState>({ ...INITIAL_APPROVAL, mode: approvalMode });
   approvalRef.current = { mode: approvalMode, planMode, trustedTools: granted.trustedTools, allowAll: granted.allowAll };
 
-  const handleAgentEvent = useCallback((ev: AgentEvent) => {
-    // One fold for the whole timeline: `applyAgentEvent` owns the ordering rules (thinking and
-    // prose accumulate into their trailing segment, a call opens a tool segment, a result fills
-    // the last one still calling), and it is unit-tested there against no DOM at all. The ref is
-    // updated alongside the state because `onReplaceTranscript` reads it from the turn's async
-    // tail, outside any render this closure could see.
-    const next = applyAgentEvent(timelineRef.current, ev);
+  const pendingAgentText = useRef<{ type: "assistant" | "reasoning"; text: string } | null>(null);
+  const agentPaintTimer = useRef<number | null>(null);
+
+  /** Fold buffered prose/reasoning into the timeline. Consecutive deltas become one event; the
+   *  old path ran one React render and one growing markdown parse per token. */
+  const flushAgentText = useCallback(() => {
+    if (agentPaintTimer.current !== null) {
+      window.clearTimeout(agentPaintTimer.current);
+      agentPaintTimer.current = null;
+    }
+    const pending = pendingAgentText.current;
+    if (!pending) return;
+    pendingAgentText.current = null;
+    const next = applyAgentEvent(timelineRef.current, pending as AgentEvent);
     timelineRef.current = next;
     setTimeline(next);
+  }, []);
 
-    if (ev.type === "tool_call") {
-      // The progress capsule's data source: `todo_write` carries the whole list in its arguments,
-      // so the panel can update the moment the call arrives rather than after the result lands.
-      if ((ev.call.name ?? "") === "todo_write") {
-        const parsed = tryParseArgs(ev.call.arguments);
-        const list = parsed?.todos;
-        if (Array.isArray(list)) {
-          setTodos(
-            list
-              .filter((t): t is { content: string; status: TodoItem["status"] } =>
-                typeof t?.content === "string" &&
-                (t?.status === "pending" || t?.status === "in_progress" || t?.status === "completed"))
-              .map((t) => ({ content: t.content, status: t.status })),
-          );
+  useEffect(
+    () => () => {
+      if (agentPaintTimer.current !== null) window.clearTimeout(agentPaintTimer.current);
+    },
+    [],
+  );
+
+  const handleAgentEvent = useCallback(
+    (ev: AgentEvent) => {
+      // Prose and reasoning paint at most every 50 ms. Tool events flush first, so the timeline
+      // keeps the model's order: text that arrived before a call lands before that call.
+      if (ev.type === "assistant" || ev.type === "reasoning") {
+        const pending = pendingAgentText.current;
+        if (pending && pending.type === ev.type) {
+          pending.text += ev.text;
+        } else {
+          if (pending) flushAgentText();
+          pendingAgentText.current = { type: ev.type, text: ev.text };
+        }
+        if (agentPaintTimer.current === null) {
+          agentPaintTimer.current = window.setTimeout(() => {
+            agentPaintTimer.current = null;
+            flushAgentText();
+          }, 50);
+        }
+        return;
+      }
+
+      flushAgentText();
+      // One fold for the whole timeline: `applyAgentEvent` owns the ordering rules (thinking and
+      // prose accumulate into their trailing segment, a call opens a tool segment, a result fills
+      // the last one still calling), and it is unit-tested there against no DOM at all. The ref is
+      // updated alongside the state because `onReplaceTranscript` reads it from the turn's async
+      // tail, outside any render this closure could see.
+      const next = applyAgentEvent(timelineRef.current, ev);
+      timelineRef.current = next;
+      setTimeline(next);
+
+      if (ev.type === "tool_call") {
+        // The progress capsule's data source: `todo_write` carries the whole list in its arguments,
+        // so the panel can update the moment the call arrives rather than after the result lands.
+        if ((ev.call.name ?? "") === "todo_write") {
+          const parsed = tryParseArgs(ev.call.arguments);
+          const list = parsed?.todos;
+          if (Array.isArray(list)) {
+            setTodos(
+              list
+                .filter((t): t is { content: string; status: TodoItem["status"] } =>
+                  typeof t?.content === "string" &&
+                  (t?.status === "pending" || t?.status === "in_progress" || t?.status === "completed"))
+                .map((t) => ({ content: t.content, status: t.status })),
+            );
+          }
         }
       }
-    }
-  }, []);
+    },
+    [flushAgentText],
+  );
 
   /**
    * The plan-mode ports the loop calls into (`lib/tools/types.ts` states the contract).
@@ -2251,6 +2327,36 @@ function Chat({
   );
 
   /**
+   * Write the visible transcript as the session's transcript. Used by the operations that remove
+   * or rewrite turns — edit, retry, delete, compaction, fork — where appending would leave the
+   * abandoned tail in the database and bring it back on resume.
+   */
+  const replaceTranscript = useCallback((next: Msg[]) => {
+    const session = ctxRef.current?.sessionId;
+    if (!session) return;
+    const ts = Date.now();
+    const rows = next.map((m, i) => ({
+      sessionId: session,
+      seq: i + 1,
+      role: m.role,
+      content: m.content,
+      toolCalls: m.tool_calls ? JSON.stringify(m.tool_calls) : null,
+      toolCallId: m.tool_call_id ?? null,
+      reasoning: m.reasoning ?? null,
+      attachments: m.attachments && m.attachments.length > 0 ? attachmentMeta(m.attachments) : null,
+      model: null,
+      memoryRefs:
+        m.recalledMemories && m.recalledMemories.length > 0
+          ? JSON.stringify(m.recalledMemories)
+          : null,
+      ts,
+    }));
+    // The next append continues past the rewritten view, not past the rows just removed.
+    transcriptSeqRef.current = rows.length;
+    void transcriptReplace(session, rows).catch(() => undefined);
+  }, []);
+
+  /**
    * The one turn runner. A fresh send, a retry and an edit-&-resend all funnel through here, so
    * they cannot drift in how they build history, record the context graph or surface the trace.
    * `baseMsgs` is the transcript BEFORE this turn — the whole thing for a send, the truncated
@@ -2270,6 +2376,21 @@ function Chat({
     const perTurn = instructionSystemText(instruction);
     // An image-only turn is a real turn: the composer allows sending one, so the guard must too.
     if ((!trimmed && attachments.length === 0) || busy || !chosen) return;
+    // Automatic compaction, bound to the chosen model. `compressWithSummary` makes no model call
+    // when the history fits, so this is free on ordinary turns and pays only when the request
+    // would overflow. The manual `/compact` action remains the way to make it permanent.
+    const compactRequest = autoCompact
+      ? {
+          compact: (messages: readonly ChatMessage[], budgetTokens: number) =>
+            compressWithSummary(messages, budgetTokens, createSummarizer(chosen)),
+          compactBudget: Math.max(256, Math.floor((modelWindow ?? DEFAULT_CONTEXT_WINDOW) * 0.75)),
+          onCompacted: (info: { dropped: number; beforeTokens: number; afterTokens: number }) =>
+            setNotice(
+              `Auto-compacted ${info.dropped} earlier message${info.dropped === 1 ? "" : "s"} ` +
+                `(${info.beforeTokens} → ${info.afterTokens} tokens) before this turn.`,
+            ),
+        }
+      : {};
 
     /**
      * A model that cannot see, handed an image — read it with one that can.
@@ -2424,6 +2545,7 @@ function Chat({
           model: chosen,
           perTurn,
           useMemory,
+          ...compactRequest,
           signal: ac.signal,
           startedAt: t0,
           assistantMsgId: assistantMsg.id,
@@ -2648,6 +2770,7 @@ function Chat({
         model: chosen,
         perTurn,
         useMemory,
+        ...compactRequest,
         // The references block rides the system turn here too — a session's sources are not an
         // agent-mode feature. `undefined` when both halves are empty, which keeps the blank
         // editor's "no system turn at all" third state intact.
@@ -2752,8 +2875,11 @@ function Chat({
    * it is unit-tested rather than embedded here.
    */
   function retryTurn(i: number) {
+    if (busy) return;
     const point = retryPoint(msgs, i);
     if (!point) return;
+    // The abandoned tail leaves the durable record too; otherwise resume replays both answers.
+    replaceTranscript(point.prefix);
     // The prompt's images ride along: dropping them made the retry a question without its
     // attachments, and the model answered a turn it could no longer see.
     void runTurn(point.text, point.prefix, point.attachments ?? []);
@@ -2761,22 +2887,27 @@ function Chat({
 
   /** Commit the inline editor: drop this user turn and everything after it, then resend edited. */
   function submitEdit(i: number) {
+    if (busy) return;
     const text = editDraft.trim();
     if (!text) return;
     const prefix = editPoint(msgs, i);
     // The editor changes text only, so the dropped turn's attachments are re-sent with the edited
     // prompt — the same carry `retryTurn` does, for the same reason.
     const attachments = msgs[i]?.attachments ?? [];
+    replaceTranscript(prefix);
     cancelEdit();
     void runTurn(text, prefix, attachments);
   }
 
   /**
-   * Drop this turn and everything after it. Only the visible transcript is truncated — the context
-   * graph is an append-only record of what happened, so the abandoned turns stay in History.
+   * Drop this turn and everything after it. The visible transcript and the durable one are both
+   * truncated: only the context graph remains append-only, as a record of what happened.
    */
   function deleteFrom(i: number) {
-    setMsgs((m) => m.slice(0, i));
+    if (busy) return;
+    const next = msgs.slice(0, i);
+    setMsgs(next);
+    replaceTranscript(next);
   }
 
   /**
@@ -2784,6 +2915,7 @@ function Chat({
    * its context, and the graph restarts so the two threads do not interleave nodes under one id.
    */
   function forkFrom(i: number) {
+    if (busy) return;
     const prefix = msgs.slice(0, i + 1).map((m) => ({ ...m }));
     ctxRef.current = startSession();
     lastNodeRef.current = null;
@@ -2792,6 +2924,9 @@ function Chat({
     // sequence in a session id that already has rows.
     transcriptSeqRef.current = 0;
     setMsgs(prefix);
+    // The fork's visible prefix is its durable transcript — otherwise resuming the fork loses
+    // the context it was forked with.
+    replaceTranscript(prefix);
     setTrace(null);
     setFinishReason(undefined);
     // The fork is a new session, so the used log restarts — but the overrides stay: it is the
@@ -2855,6 +2990,15 @@ function Chat({
         setUsedSkills([]);
         setManualRefs([]);
         setDismissedUrls(new Set());
+        // Session-scoped live state belongs to the conversation that was on screen. The progress
+        // capsule and a run's "what changed" card must not follow the user into a resumed session;
+        // the card is actionable, and its paths are relative to the old turn.
+        setTodos([]);
+        setRunChanges(null);
+        timelineRef.current = [];
+        setTimeline([]);
+        setTrace(null);
+        setFinishReason(undefined);
       } catch {
         return; // same policy as openSession: an unreadable session is not an error wall
       }
@@ -2917,6 +3061,11 @@ function Chat({
     // sees the global flags again and has loaded nothing.
     setSkillOverrides({});
     setUsedSkills([]);
+    // Session-scoped live state resets with the conversation, like `todos` above: a new chat sees
+    // the global flags again and has loaded nothing.
+    setRunChanges(null);
+    timelineRef.current = [];
+    setTimeline([]);
     // Same for references: the transcript-derived half empties with `msgs`; the curated halves
     // reset here.
     setManualRefs([]);
@@ -2966,6 +3115,10 @@ function Chat({
     setUsedSkills([]);
     setManualRefs([]);
     setDismissedUrls(new Set());
+    setTodos([]);
+    setRunChanges(null);
+    timelineRef.current = [];
+    setTimeline([]);
     // The session keeps its own name — it IS that session, not a copy. `titleLoadedFor` is
     // stamped so the async list refresh cannot adopt a stale value over it.
     titleLoadedFor.current = sid;
@@ -3109,11 +3262,14 @@ function Chat({
         ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
       }));
       setMsgs(kept);
+      // The durable transcript follows the compacted view; resume must not restore the
+      // uncompacted history the user just replaced with a summary.
+      replaceTranscript(kept);
       setNotice(`Compacted ${result.dropped} earlier message${result.dropped === 1 ? "" : "s"} into a summary.`);
     } catch (e) {
       setNotice(`Could not compact: ${(e as Error).message}`);
     }
-  }, [busy, msgs, modelWindow, chosen]);
+  }, [busy, msgs, modelWindow, chosen, replaceTranscript]);
 
   // The session controls, extracted from the old in-Chat session bar so they can portal into the
   // title row. Their state stays here on purpose: a session is its transcript — New/reset,

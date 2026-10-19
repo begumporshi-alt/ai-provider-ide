@@ -107,14 +107,31 @@ function emitLearned(stored: readonly Memory[]): void {
   }
 }
 
-/** The exchanges awaiting distillation, oldest first, capped at one batch. */
-const pending: Exchange[] = [];
-let sinceDistil = 0;
+/** One session's exchanges awaiting distillation, oldest first, capped at one batch.
+ *
+ *  **Per session, not module-global.** A shared queue let session A's exchange be distilled under
+ *  session B's id after a switch: the batch was global while the id came from the caller. The map
+ *  keeps each conversation's learning in its own conversation.
+ */
+interface DistilQueue {
+  pending: Exchange[];
+  sinceDistil: number;
+}
 
-/** Test seam: forget the accumulated window and the scenario-pass marker. */
+const queues = new Map<string, DistilQueue>();
+
+function queueFor(sessionId: string): DistilQueue {
+  let q = queues.get(sessionId);
+  if (!q) {
+    q = { pending: [], sinceDistil: 0 };
+    queues.set(sessionId, q);
+  }
+  return q;
+}
+
+/** Test seam: forget every session's accumulated window and the scenario-pass marker. */
 export function resetDistillation(): void {
-  pending.length = 0;
-  sinceDistil = 0;
+  queues.clear();
   lastScenarioAt.clear();
 }
 
@@ -137,11 +154,12 @@ export async function rememberTurn(
   userText: string,
   assistantText: string,
 ): Promise<void> {
-  pending.push({ user: userText, assistant: assistantText });
-  if (pending.length > DISTIL_EVERY) pending.splice(0, pending.length - DISTIL_EVERY);
+  const q = queueFor(sessionId);
+  q.pending.push({ user: userText, assistant: assistantText });
+  if (q.pending.length > DISTIL_EVERY) q.pending.splice(0, q.pending.length - DISTIL_EVERY);
   // A turn is the batching unit, so the counter advances here rather than in distilTurn — which
   // is called once per turn in practice but should not have to be for batching to be correct.
-  sinceDistil += 1;
+  q.sinceDistil += 1;
   try {
     await captureMemories([
       { layer: "L0", text: userText, session_id: sessionId, subject: "user" },
@@ -196,16 +214,18 @@ export async function distilTurn(
 ): Promise<Memory[]> {
   // No model means distillation can never run; returning without touching the counter keeps a
   // later turn — once a model is configured — from having to wait another full batch.
-  if (!model || pending.length === 0) return [];
-  if (sinceDistil < DISTIL_EVERY) return [];
+  const q = queues.get(sessionId);
+  if (!model || !q || q.pending.length === 0) return [];
+  if (q.sinceDistil < DISTIL_EVERY) return [];
 
-  const batch = pending.slice(-DISTIL_EVERY);
+  const batch = q.pending.slice(-DISTIL_EVERY);
   try {
     const atoms = await distillAndStore(sessionId, model, batch, generate);
     // An empty result is a successful look that found nothing durable, so the window is dropped
     // either way — otherwise a model that never returns JSON would be re-asked forever.
-    pending.length = 0;
-    sinceDistil = 0;
+    q.pending.length = 0;
+    q.sinceDistil = 0;
+    queues.delete(sessionId);
     return atoms;
   } catch (err) {
     // Counter and window both survive: a transient failure retries on the next turn instead of

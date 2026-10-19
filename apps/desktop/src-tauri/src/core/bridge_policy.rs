@@ -298,8 +298,9 @@ impl ProseGate {
 /// What the bridge does after one model turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnOutcome {
-    /// Inline `mercury` markers were found in the text. They are ours whoever declared the real
-    /// tools — they are not part of any client tool contract — so they always run locally.
+    /// Inline `mercury` markers were found in the text. They are ours only when the gateway owns
+    /// the turn; a client that declared its own tools (or none) keeps its own approval gate, so
+    /// the bridge refuses host-side execution for those clients.
     SandboxMercury,
     /// The model asked for tools the gateway supplied: run them and keep the conversation going.
     SandboxCollected,
@@ -313,7 +314,8 @@ pub enum TurnOutcome {
 ///
 /// The order is the reference's, and each step outranks the next:
 ///
-/// 1. Mercury markers first — they are ours regardless of who declared the real tools.
+/// 1. Mercury markers first — but only a gateway-owned turn may execute them; see
+///    [`crate::core::router_bridge`] for the refusal.
 /// 2. No calls at all: the model answered, and the turn is over.
 /// 3. Ownership decides whether the collected calls run here or go back to the client.
 ///

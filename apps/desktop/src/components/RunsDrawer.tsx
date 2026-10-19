@@ -114,18 +114,18 @@ export function SubagentsDrawer() {
   // transcript already shows those, and a drawer that repeated them is a second transcript.
   const children = useMemo(() => runs.filter((r) => r.parent_run_id != null), [runs]);
 
-  // Live while anything runs. The poll is what makes "live" true — and `tick` alone cannot
-  // carry it: a turn that starts while the Chat tab just sits there moves no tick (the same
-  // tick-bump-on-user-actions rule every screen keeps), so the drawer would never learn a run
-  // began. The orchestrator's live-run registry is the real-time signal: it is module-level
-  // state updated at startRun/endRun, and the interval is a no-op array check while nothing
-  // runs.
+  // Live while anything runs. The interval refreshes *this drawer only* — it must not bump the
+  // global tick, because that re-runs every mounted screen's data effects and a hidden AXIOM
+  // screen turns each tick into a multi-megabyte reload. `RUN_CHANGED_EVENT` still carries
+  // start/end; this poll is what makes the selected run's steps advance between those events.
   useEffect(() => {
     const t = setInterval(() => {
-      if (liveRunIds().length > 0) bump();
+      if (liveRunIds().length === 0) return;
+      listAgentRuns(MAX_ROWS).then(setRuns).catch(() => undefined);
+      if (selected) agentRunSteps(selected).then(setSteps).catch(() => undefined);
     }, 1500);
     return () => clearInterval(t);
-  }, [bump]);
+  }, [selected]);
 
   // ⌘⇧B: the drawer is the transcript's other sidebar, so its shortcut is the sidebar's with
   // Shift. Local to this component: it is only meaningful where the drawer is mounted.

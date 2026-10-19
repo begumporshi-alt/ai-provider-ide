@@ -271,12 +271,60 @@ describe("runAgentTurn", () => {
     expect(runs.ended[0]).toEqual(["run-1", "ok", 2, undefined, 0, 0]);
   });
 
+  it("compacts the replayed prefix and still sends this turn's user message", async () => {
+    const { ports, appended } = makePorts({ steps: [{ text: "done" }] });
+    const seen: { messages: { role: string; content: unknown }[] }[] = [];
+    const original = ports.generate;
+    ports.generate = (async (req: Parameters<typeof original>[0], opts: Parameters<typeof original>[1]) => {
+      seen.push(req as never);
+      return original(req, opts);
+    }) as never;
+
+    const compact = vi.fn(async () => ({
+      messages: [
+        { role: "system" as const, content: "summary of earlier turns" },
+        { role: "user" as const, content: "earlier question" },
+        { role: "assistant" as const, content: "earlier answer" },
+      ],
+      dropped: 2,
+      droppedMessages: [],
+      beforeTokens: 900,
+      afterTokens: 300,
+      budget: 400,
+      compressed: true,
+    }));
+    const onCompacted = vi.fn();
+
+    await runAgentTurn(
+      makeRequest({
+        baseMsgs: [
+          { id: "u1", role: "user", content: "earlier question" },
+          { id: "a1", role: "assistant", content: "earlier answer" },
+        ],
+        compact,
+        compactBudget: 400,
+        onCompacted,
+      }),
+      ports,
+    );
+
+    expect(compact).toHaveBeenCalledOnce();
+    expect(onCompacted).toHaveBeenCalledWith({ dropped: 2, beforeTokens: 900, afterTokens: 300 });
+    const messages = seen[0]!.messages as { role: string; content: string }[];
+    expect(messages).toContainEqual({ role: "system", content: "summary of earlier turns" });
+    expect(messages).toContainEqual({ role: "user", content: "do the thing" });
+    // The summary is ephemeral: the durable rows are this turn's user and answer only.
+    expect(appended).toHaveLength(1);
+    expect(appended[0]!.map((e) => e.role)).toEqual(["user", "assistant"]);
+    expect(appended[0]![0]!.content).toBe("do the thing");
+  });
+
   it("ends a stopped run as stopped and fills the empty bubble", async () => {
     // A pre-aborted controller + a generate that throws drives the catch path the way a cancelled
     // stream does: endRun "stopped", the trace, and the bubble fill (the run left an empty turn).
     const aborted = new AbortController();
     aborted.abort();
-    const { ports, runs, patches } = makePorts({ steps: [{ text: "partial" }] });
+    const { ports, runs, patches, appended } = makePorts({ steps: [{ text: "partial" }] });
     ports.generate = (async () => {
       throw new Error("aborted stream");
     }) as never;
@@ -284,6 +332,11 @@ describe("runAgentTurn", () => {
     expect(runs.ended[0]).toEqual(["run-1", "stopped", 0, undefined, 0, 0]);
     expect(ports.onTrace).toHaveBeenLastCalledWith(expect.objectContaining({ error: "stopped by you" }));
     expect(patches.some((p) => String(p.patch.content).startsWith("⚠ stopped by you"))).toBe(true);
+    // A turn the user stopped is still part of the conversation. Before this, resuming the
+    // session silently lost the whole exchange.
+    expect(appended, "the stopped turn is durable").toHaveLength(1);
+    expect(appended[0]!.map((e) => e.role)).toEqual(["user", "assistant"]);
+    expect(appended[0]![1]!.content).toContain("stopped by you");
   });
 
   it("accumulates each model call's failover chain into the run's trace", async () => {

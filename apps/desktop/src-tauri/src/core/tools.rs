@@ -596,7 +596,7 @@ fn do_read_file(args: &serde_json::Value, root: &Path) -> ToolResult {
             let lines: Vec<&str> = text.lines().collect();
             let total = lines.len();
             let from = offset.saturating_sub(1).min(total);
-            let to = limit.map_or(total, |n| (from + n).min(total));
+            let to = limit.map_or(total, |n| from.saturating_add(n).min(total));
             let body = lines[from..to].join("\n");
             text = format!("[lines {}-{} of {}]\n{}", from + 1, to, total, body);
         }
@@ -1494,11 +1494,20 @@ pub(crate) fn validate_root(root: &Path) -> Result<PathBuf, String> {
 /// arbitrary execution by design — the model can `write_file` a script and run it, so blocking
 /// `-c` alone would be theatre. The boundary for that is confirmation, not parsing.
 fn is_escaping_path(arg: &str) -> bool {
-    // Same rule `resolve_within` applies to the file tools: absolute paths are not accepted.
-    if arg.starts_with('/') {
+    // An option's value is a path too. `--target-directory=/tmp` and `-t/tmp` are both the
+    // workspace boundary being stepped over; inspecting only the whole argument treats them as
+    // ordinary words because they do not *start* with `/`.
+    let path = if let Some((_, value)) = arg.split_once('=') {
+        value
+    } else if arg.starts_with('-') && !arg.starts_with("--") && arg.len() > 2 {
+        &arg[2..]
+    } else {
+        arg
+    };
+    if path.starts_with('/') {
         return true;
     }
-    arg.split('/').any(|component| component == "..")
+    path.split('/').any(|component| component == "..")
 }
 
 /// Normalise the `arguments` payload into an object.
@@ -3710,6 +3719,32 @@ diff --git a/a.txt b/a.txt
         // Without the window the whole file comes back — paging must not become the default.
         let all = call("read_file", serde_json::json!({ "path": "a.txt" }), &r);
         assert!(all.output.contains("l1") && all.output.contains("l5"));
+    }
+
+    #[test]
+    fn read_file_huge_limit_does_not_overflow() {
+        let r = root();
+        fs::write(r.join("a.txt"), "l1\nl2\nl3\n").unwrap();
+        let res = call(
+            "read_file",
+            serde_json::json!({ "path": "a.txt", "offset": 2, "limit": u64::MAX }),
+            &r,
+        );
+        assert!(res.ok, "a model-supplied limit must not panic: {:?}", res.error);
+        assert!(res.output.starts_with("[lines 2-3 of 3]"), "got: {}", res.output);
+    }
+
+    #[test]
+    fn escaping_paths_are_caught_inside_option_values() {
+        assert!(is_escaping_path("/tmp/out"));
+        assert!(is_escaping_path("../out"));
+        assert!(is_escaping_path("--target-directory=/tmp/out"));
+        assert!(is_escaping_path("-t/tmp"));
+        assert!(is_escaping_path("--file=../out"));
+        assert!(is_escaping_path("-I../include"));
+        assert!(!is_escaping_path("a.txt"));
+        assert!(!is_escaping_path("-I./include"));
+        assert!(!is_escaping_path("--flag=relative/path"));
     }
 
     #[test]

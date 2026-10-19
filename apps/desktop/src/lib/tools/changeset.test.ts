@@ -258,6 +258,18 @@ describe("revertPlan", () => {
     expect(plan.skipped).toEqual([{ path: "bin.dat", reason: "its previous contents could not be read" }]);
   });
 
+  it("skips, with a reason, a file whose snapshot hit the read cap", async () => {
+    // `read_file` caps its output. Restoring that prefix would silently truncate the rest of the
+    // file, so the checkpoint marks the snapshot incomplete and revert refuses it.
+    const ws = fakeWorkspace({ "big.txt": "first line\n… truncated at 262144 bytes" });
+    const cp = new RunCheckpoint();
+    const host = createCheckpointingHost(ws.host, cp);
+    await host.run("write_file", { path: "big.txt", content: "new" });
+    const plan = revertPlan(cp.snapshot());
+    expect(plan.ops).toEqual([]);
+    expect(plan.skipped[0]!.reason).toContain("read cap");
+  });
+
   it("plans nothing for a run that only ran commands", () => {
     const plan = revertPlan({ files: [], untracked: ["ran `pnpm` — not reverted"] });
     expect(plan).toEqual({ ops: [], skipped: [] });

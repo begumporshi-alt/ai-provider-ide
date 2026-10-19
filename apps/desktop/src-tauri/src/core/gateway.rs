@@ -729,15 +729,21 @@ pub trait Bridge: Send + Sync + 'static {
 /// A consequence worth stating: `reply` after the core is gone is an ordinary `false` —
 /// "nobody is listening", the same answer it already gives for a stale id — not a panic, and
 /// not a reason to keep anything alive.
+/// How many bridge messages may be queued for one request before its consumer is declared
+/// stalled. A `Delta` is small and a healthy SSE reader drains continuously; 2,048 messages is
+/// far past any ordinary burst. Past it the request is cancelled and the channel is closed,
+/// which bounds per-request memory instead of letting a slow webview grow an unbounded queue.
+const REPLY_QUEUE_CAPACITY: usize = 2048;
+
 #[derive(Clone, Default)]
 pub struct ReplyHandle {
-    pending: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<BridgeMsg>>>>,
+    pending: Arc<Mutex<HashMap<u64, mpsc::Sender<BridgeMsg>>>>,
 }
 
 impl ReplyHandle {
     /// Register a waiting request. Called by the core when a request takes a slot; not part of
     /// the bridge's surface.
-    fn register(&self, id: u64, tx: mpsc::UnboundedSender<BridgeMsg>) {
+    fn register(&self, id: u64, tx: mpsc::Sender<BridgeMsg>) {
         self.pending.lock().unwrap().insert(id, tx);
     }
 
@@ -747,19 +753,33 @@ impl ReplyHandle {
     /// bridge streams into this channel, and if the client has already gone (disconnect, or a
     /// completed pass-through response) there is no point paying for more upstream tokens.
     /// `false` lets the caller tear the loop down instead of streaming into a void.
+    ///
+    /// **A full queue is treated as a dead consumer.** Removing the registration drops the last
+    /// sender, the receiver observes the close, and the handler stops waiting. The alternative —
+    /// buffering without bound — is how a slow renderer turns into a multi-gigabyte process.
     pub fn reply(&self, id: u64, msg: BridgeMsg) -> bool {
         let tx = self.pending.lock().unwrap().get(&id).cloned();
-        match tx {
-            Some(tx) => {
-                let terminal = matches!(msg, BridgeMsg::Done | BridgeMsg::Error { .. });
-                let sent = tx.send(msg).is_ok();
-                if terminal {
-                    self.pending.lock().unwrap().remove(&id);
-                }
-                sent
+        let Some(tx) = tx else { return false };
+        let terminal = matches!(&msg, BridgeMsg::Done | BridgeMsg::Error { .. });
+        let sent = match tx.try_send(msg) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    request_id = id,
+                    "bridge reply queue full — cancelling the request rather than buffering without bound"
+                );
+                self.pending.lock().unwrap().remove(&id);
+                false
             }
-            None => false,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.pending.lock().unwrap().remove(&id);
+                false
+            }
+        };
+        if terminal {
+            self.pending.lock().unwrap().remove(&id);
         }
+        sent
     }
 
     /// Drop a request's registration without answering it — the client is gone.
@@ -774,8 +794,8 @@ impl ReplyHandle {
     /// `core::router_bridge`'s tests are a sibling and cannot. This is the same accommodation
     /// `HealthTracker::keys` makes for assertions that need the shape rather than the accessor.
     #[cfg(test)]
-    pub(crate) fn test_channel(&self, id: u64) -> mpsc::UnboundedReceiver<BridgeMsg> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub(crate) fn test_channel(&self, id: u64) -> mpsc::Receiver<BridgeMsg> {
+        let (tx, rx) = mpsc::channel(REPLY_QUEUE_CAPACITY);
         self.register(id, tx);
         rx
     }
@@ -1423,7 +1443,7 @@ struct Slot {
     /// routing slot until it finishes — dropping it earlier would let a ninth request dispatch.
     _dispatch: OwnedSemaphorePermit,
     id: u64,
-    rx: mpsc::UnboundedReceiver<BridgeMsg>,
+    rx: mpsc::Receiver<BridgeMsg>,
     /// Set once the bridge has produced its first message; only that wait is bounded.
     started: bool,
     /// When the handler first polled this slot — i.e. when the request reached the bridge.
@@ -1548,7 +1568,7 @@ async fn try_slot(core: &Arc<GatewayCore>) -> Result<Slot, Response> {
         }
     };
     let id = core.next_id.fetch_add(1, Ordering::Relaxed);
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(REPLY_QUEUE_CAPACITY);
     core.replies.register(id, tx);
     Ok(Slot {
         core: core.clone(),

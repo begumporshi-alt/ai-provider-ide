@@ -1286,7 +1286,16 @@ export interface SessionMessageRow {
  * replays a `tool_calls` array with no results, which every provider rejects.
  */
 export async function transcriptAppend(rows: SessionMessageRow[]): Promise<void> {
-  return invoke("transcript_append", { rows });
+  await invoke("transcript_append", { rows });
+}
+
+/**
+ * Replace a session's durable transcript with the view the screen now shows. Edit, retry, delete,
+ * compaction and fork change the conversation itself; appending alone would resurrect the
+ * abandoned tail on resume.
+ */
+export async function transcriptReplace(sessionId: string, rows: SessionMessageRow[]): Promise<void> {
+  await invoke("transcript_replace", { sessionId, rows });
 }
 
 /** A session's transcript, in stored order. Empty for a session recorded before 0027. */
@@ -1318,6 +1327,9 @@ export async function resumeSession(sessionId: string): Promise<import("./ui-sta
         role: r.role,
         content: r.content,
         ...(r.toolCallId ? { tool_call_id: r.toolCallId } : {}),
+        // The thinking panel is part of the turn the user saw; a resume that dropped it made a
+        // reasoning-heavy answer look like it had no reasoning at all.
+        ...(r.reasoning ? { reasoning: r.reasoning } : {}),
       };
       if (r.toolCalls) {
         try {
@@ -2314,7 +2326,14 @@ export interface StoredAuditPass {
   decision: "promote" | "reject" | null;
   candidateId: string | null;
   baselineId: string | null;
-  report: Record<string, unknown>;
+  /** Absent from `axiom_audits_list`; present on `axiom_audit_get`. */
+  report?: Record<string, unknown>;
+  /** Size of the stored report body, so the list can say what it is not sending. */
+  reportBytes?: number;
+  /** A refusal's reason, extracted by the list read without shipping the report body. */
+  reportError?: string | null;
+  /** The decision's delta chips as serialized JSON, extracted by the list read. */
+  reportDeltas?: string | null;
 }
 
 export async function axiomPutAudit(audit: {
@@ -2335,4 +2354,8 @@ export async function axiomPutAudit(audit: {
 
 export async function axiomListAudits(limit = 200): Promise<StoredAuditPass[]> {
   return invoke<StoredAuditPass[]>("axiom_audits_list", { limit });
+}
+
+export async function axiomGetAudit(id: string): Promise<StoredAuditPass | null> {
+  return invoke<StoredAuditPass | null>("axiom_audit_get", { id });
 }

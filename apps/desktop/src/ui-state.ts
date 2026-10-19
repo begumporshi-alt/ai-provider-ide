@@ -33,6 +33,8 @@ interface UiState {
 export type ResumeMsg = {
   role: "user" | "assistant" | "tool";
   content: string;
+  /** The model's own reasoning, restored from the durable row when it was recorded. */
+  reasoning?: string;
   tool_calls?: unknown;
   tool_call_id?: string;
   /** The memories this answer drew on (0028's `memory_refs` column), for the recall card. */

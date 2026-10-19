@@ -2945,7 +2945,23 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       return [...axiomAudits]
         .sort((a, b) => (b.startedAt as number) - (a.startedAt as number) || String(b.id).localeCompare(String(a.id)))
         .slice(0, limit)
-        .map(cloneJson);
+        .map((a) => {
+          // Mirror the Rust contract: the list carries metadata and the two small fields the
+          // timeline renders, never the body.
+          const { report, ...meta } = cloneJson(a) as Record<string, unknown>;
+          const body = report === undefined ? "" : JSON.stringify(report);
+          const doc = report as { error?: unknown; decision?: { deltas?: unknown } } | undefined;
+          return {
+            ...meta,
+            reportBytes: body.length,
+            reportError: typeof doc?.error === "string" ? doc.error : null,
+            reportDeltas: doc?.decision?.deltas ? JSON.stringify(doc.decision.deltas) : null,
+          };
+        });
+    }
+    case "axiom_audit_get": {
+      const found = axiomAudits.find((a) => a.id === String(args.id));
+      return found ? cloneJson(found) : null;
     }
 
     default:

@@ -30,6 +30,22 @@ fn step4_ok_probe_delegates_true_app_skips_bind() {
     assert!(app_bind_decision(&taken));
 }
 
+/// A consumer that stops draining must cancel the request, not grow an unbounded queue.
+#[test]
+fn a_full_reply_queue_is_treated_as_a_dead_consumer() {
+    let h = ReplyHandle::default();
+    let mut rx = h.test_channel(7);
+    for _ in 0..REPLY_QUEUE_CAPACITY {
+        assert!(h.reply(7, BridgeMsg::Liveness), "the queue has room");
+    }
+    assert!(!h.reply(7, BridgeMsg::Liveness), "a full queue reports a stalled consumer");
+    // The registration is gone, so draining the queued frames reaches the closed end.
+    for _ in 0..REPLY_QUEUE_CAPACITY {
+        assert!(rx.try_recv().is_ok());
+    }
+    assert!(rx.try_recv().is_err(), "the channel closes after the cancellation");
+}
+
 /// `app_listener_action` is the seam `app.rs` calls: `Some(port)` = delegate to the agent,
 /// `None` = bind it ourselves. It composes `app_bind_decision` with the port the caller
 /// would bind, so both arms are pinned against a real port value.
@@ -4227,7 +4243,7 @@ fn the_bridge_holds_no_reference_that_keeps_the_core_alive() {
 fn the_bridge_and_the_core_answer_into_the_same_place() {
     let bridge = Arc::new(MinimalBridge::new());
     let core = Arc::new(GatewayCore::new(bridge.clone(), Arc::new(|| Some("sk-aip-test".into()))));
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(REPLY_QUEUE_CAPACITY);
     core.replies.register(7, tx);
     core.dispatch(bare_request(7));
 

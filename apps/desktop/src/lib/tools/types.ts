@@ -13,7 +13,12 @@ import type { ChatMessage, TextRequest, TextStream, UsageTokens } from "@aiprovi
 
 /** What a tool does to the workspace. Declared per tool so the approval policy can be a function
  *  of the declaration instead of a second hardcoded list that drifts away from this one. */
-export type ToolEffect = "read" | "mutate";
+/**
+ * What a tool does to the world. `network` is separate from `read`: a fetch sends data out as
+ * well as bringing it in, so "auto-approve reads" must not silently approve it — a prompt-injected
+ * page can encode workspace content in a URL. `mutate` still covers the workspace.
+ */
+export type ToolEffect = "read" | "network" | "mutate";
 
 /**
  * One delegated child's live state, as the parent loop sees it. Emitted while a

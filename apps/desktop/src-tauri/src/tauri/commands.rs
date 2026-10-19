@@ -254,6 +254,17 @@ pub fn transcript_list(
     context::session_messages(&store, &session_id).map_err(CommandError)
 }
 
+/// Replace a session's transcript with the view the screen now shows. Edit, retry, delete,
+/// compaction and fork all use this; see `context::replace_session_messages`.
+#[tauri::command]
+pub fn transcript_replace(
+    store: State<'_, Arc<Store>>,
+    session_id: String,
+    rows: Vec<context::SessionMessageRow>,
+) -> Result<(), CommandError> {
+    context::replace_session_messages(&store, &session_id, &rows).map_err(CommandError)
+}
+
 /// Highest message sequence already stored, so a resumed session continues past its own turns
 /// instead of upserting over them — the transcript's sibling of `history_max_seq`.
 #[tauri::command]
@@ -950,6 +961,16 @@ pub fn axiom_audits_list(
     axiom::list_audits(&store, limit.unwrap_or(200)).map_err(CommandError)
 }
 
+/// One audit pass with its report. The list command deliberately omits the body; this is the
+/// read that opens it, and it only ever crosses IPC when a user asks for that pass.
+#[tauri::command]
+pub fn axiom_audit_get(
+    store: State<'_, Arc<Store>>,
+    id: String,
+) -> Result<Option<serde_json::Value>, CommandError> {
+    axiom::audit(&store, &id).map_err(CommandError)
+}
+
 pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
         vault_put,
@@ -986,6 +1007,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         history_delete_session,
         transcript_append,
         transcript_list,
+        transcript_replace,
         transcript_max_seq,
         session_search,
         skills_list,
@@ -1131,6 +1153,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         axiom_decisions_list,
         axiom_audit_put,
         axiom_audits_list,
+        axiom_audit_get,
     ]
 }
 

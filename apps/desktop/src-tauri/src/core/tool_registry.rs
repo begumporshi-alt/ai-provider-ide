@@ -67,6 +67,15 @@ pub fn agent_tools() -> &'static [ToolSpec] {
     TOOLS.get_or_init(build)
 }
 
+/// Is `name` part of the tool contract the gateway advertises?
+///
+/// In-band markers are authored by the model, not the client. Without this check a marker could
+/// name any assistant tool — including browser and process tools that the gateway never
+/// advertises — and reach it through `tool_run` without passing the registry or its mutation gate.
+pub fn is_registered_tool(name: &str) -> bool {
+    agent_tools().iter().any(|t| t.name == name)
+}
+
 /// The subset of the registry the gateway should advertise.
 ///
 /// Mutation is off by default on the gateway path ([`crate::core::gateway::gateway_tool_refusal`]),
@@ -434,8 +443,7 @@ mod tests {
     /// The mutating set is exactly what the gateway gates, in both directions: a tool that is
     /// neither listed nor read-only is a tool that writes without being gated.
     #[test]
-    fn the_mutating_set_is_exactly_what_the_gateway_gates() {
-        let names: Vec<&str> = agent_tools().iter().map(|t| t.name).collect();
+    fn the_mutating_set_is_exactly_what_the_gateway_gates() {        let names: Vec<&str> = agent_tools().iter().map(|t| t.name).collect();
         for m in MUTATING_TOOLS {
             assert!(names.contains(&m), "{m} is gated by the gateway but absent from the registry");
         }
@@ -462,6 +470,17 @@ mod tests {
                 "web_search"
             ]
         );
+    }
+
+    /// In-band markers are model-authored. Only names the gateway actually publishes may reach
+    /// `tool_run` through them; browser and process tools are Assistant-only and not in this
+    /// registry.
+    #[test]
+    fn inline_calls_are_limited_to_what_the_gateway_advertises() {
+        assert!(is_registered_tool("read_file"));
+        assert!(is_registered_tool("run_command"));
+        assert!(!is_registered_tool("browser_click"));
+        assert!(!is_registered_tool("process_kill"));
     }
 
     /// The reason `edit_file` exists: `write_file` is a whole-file overwrite, so every small change

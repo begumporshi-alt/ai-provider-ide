@@ -116,8 +116,13 @@ describe("AGENT_TOOLS", () => {
     // Two descriptions of the same fact used to live in a comment and in this list. Phase 5's
     // approval modes read `effect`, so a tool that writes but declares "read" would run with no
     // prompt under "auto-approve reads" — silently, and in the direction that loses work.
+    const network = new Set(["web_ask", "web_fetch", "web_search"]);
     for (const t of AGENT_TOOLS) {
-      const expected = MUTATING.includes(t.name) ? "mutate" : "read";
+      const expected = MUTATING.includes(t.name)
+        ? "mutate"
+        : network.has(t.name)
+          ? "network"
+          : "read";
       expect(t.effect, t.name).toBe(expected);
     }
   });

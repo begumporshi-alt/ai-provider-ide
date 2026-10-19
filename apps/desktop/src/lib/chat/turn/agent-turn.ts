@@ -142,8 +142,23 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
   const recalledRefs = recalledLight(recalled);
   // Replay prior turns verbatim — including assistant turns that carry tool_calls and the
   // tool-result turns that answer them — so the model keeps its chaining context.
+  let replayed = replayHistory(req.baseMsgs);
+  // Automatic compaction happens before the current user turn is appended, so the turn that
+  // triggered it is never summarized away. The slice below uses the compacted history's length,
+  // which keeps this turn's durable rows separate from the summary.
+  if (req.compact && req.compactBudget) {
+    const compacted = await req.compact(replayed, req.compactBudget);
+    if (compacted.compressed) {
+      replayed = compacted.messages;
+      req.onCompacted?.({
+        dropped: compacted.dropped,
+        beforeTokens: compacted.beforeTokens,
+        afterTokens: compacted.afterTokens,
+      });
+    }
+  }
   const history: ChatMessage[] = [
-    ...replayHistory(req.baseMsgs),
+    ...replayed,
     {
       role: "user",
       content: userContent(req.text, req.attachments.map((a) => ({ mediaType: a.mediaType, dataBase64: a.dataBase64 }))),
@@ -196,6 +211,11 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
     }
     ports.onAgentEvent(ev);
   };
+  // The durable transcript is written on the success path below. If the turn stops or throws,
+  // the `finally` writes the turn anyway — a partial turn is still part of the conversation, and
+  // the plain-chat branch already does this. `transcriptWritten` keeps the two paths exclusive.
+  let transcriptWritten = false;
+  let failureText = "";
   try {
     const { text: finalText, messages, hitCeiling } = await runAgentLoop({
       model: req.model,
@@ -380,6 +400,7 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
             : null,
       })),
     ]);
+    transcriptWritten = true;
     // P7: remember the exchange, then distil it. Distillation is deliberately not awaited —
     // it is an extra model call, and a slow or failing one must not hold up the answer the
     // user is already reading.
@@ -430,13 +451,27 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
     if (req.controller.signal.aborted) {
       ports.orchestrator.endRun(runId, "stopped", iterations, undefined, runIn, runOut);
       ports.onTrace({ ms: ports.now() - req.startedAt, fallbacks: [], error: "stopped by you" });
-      ports.fillIfEmpty(req.assistantMsgId, "⚠ stopped by you — this turn did not finish. Send again, or retry it from the message actions.");
+      failureText = "⚠ stopped by you — this turn did not finish. Send again, or retry it from the message actions.";
+      ports.fillIfEmpty(req.assistantMsgId, failureText);
     } else {
       ports.orchestrator.endRun(runId, "error", iterations, (e as Error).message, runIn, runOut);
       ports.onTrace({ ms: ports.now() - req.startedAt, fallbacks: [], error: (e as Error).message });
-      ports.fillIfEmpty(req.assistantMsgId, `⚠ ${(e as Error).message}`);
+      failureText = `⚠ ${(e as Error).message}`;
+      ports.fillIfEmpty(req.assistantMsgId, failureText);
     }
   } finally {
+    // A stopped or failed run never reached the success append. Record the user's turn and the
+    // failure the bubble shows, so resuming the session does not silently lose the exchange.
+    if (!transcriptWritten) {
+      ports.transcript.append([
+        { role: "user", content: req.text, attachments: attachmentMeta(req.attachments), model: null },
+        {
+          role: "assistant",
+          content: failureText || "⚠ this turn did not finish",
+          model: req.model,
+        },
+      ]);
+    }
     // Flush here, not on the success path only. The user's node — and any recall edges anchored
     // to it — is created before the run starts, so a stopped or failed run would otherwise leave
     // those nodes buffered and silently prepend them to the next turn's batch. Same policy as the

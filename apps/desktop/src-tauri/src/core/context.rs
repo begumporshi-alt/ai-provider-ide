@@ -735,10 +735,7 @@ fn valid_role(role: &str) -> bool {
 /// is a unit, and a half-written turn is a transcript that replays a `tool_calls` array with no
 /// results — the exact shape a provider rejects. `(session_id, seq)` is the primary key, so
 /// appending a turn twice updates those rows instead of duplicating the conversation.
-pub fn append_session_messages(store: &Store, rows: &[SessionMessageRow]) -> Result<(), String> {
-    if rows.is_empty() {
-        return Ok(());
-    }
+fn validate_session_rows(rows: &[SessionMessageRow]) -> Result<(), String> {
     for r in rows {
         if r.session_id.trim().is_empty() {
             return Err("session_messages: session_id is required".into());
@@ -750,38 +747,82 @@ pub fn append_session_messages(store: &Store, rows: &[SessionMessageRow]) -> Res
             ));
         }
     }
+    Ok(())
+}
+
+fn insert_session_rows(
+    tx: &rusqlite::Transaction<'_>,
+    rows: &[SessionMessageRow],
+) -> Result<(), String> {
+    let mut stmt = tx
+        .prepare(
+            "INSERT INTO session_messages
+               (session_id, seq, role, content, tool_calls, tool_call_id, reasoning, attachments, model, memory_refs, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(session_id, seq) DO UPDATE SET
+               role=excluded.role, content=excluded.content, tool_calls=excluded.tool_calls,
+               tool_call_id=excluded.tool_call_id, reasoning=excluded.reasoning,
+               attachments=excluded.attachments, model=excluded.model,
+               memory_refs=excluded.memory_refs, ts=excluded.ts",
+        )
+        .map_err(|e| e.to_string())?;
+    for r in rows {
+        stmt.execute(params![
+            r.session_id,
+            r.seq,
+            r.role,
+            r.content,
+            r.tool_calls,
+            r.tool_call_id,
+            r.reasoning,
+            r.attachments,
+            r.model,
+            r.memory_refs,
+            r.ts,
+        ])
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+pub fn append_session_messages(store: &Store, rows: &[SessionMessageRow]) -> Result<(), String> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    validate_session_rows(rows)?;
     let mut conn = store.conn.lock().map_err(|e| e.to_string())?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
-    {
-        let mut stmt = tx
-            .prepare(
-                "INSERT INTO session_messages
-                   (session_id, seq, role, content, tool_calls, tool_call_id, reasoning, attachments, model, memory_refs, ts)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                 ON CONFLICT(session_id, seq) DO UPDATE SET
-                   role=excluded.role, content=excluded.content, tool_calls=excluded.tool_calls,
-                   tool_call_id=excluded.tool_call_id, reasoning=excluded.reasoning,
-                   attachments=excluded.attachments, model=excluded.model,
-                   memory_refs=excluded.memory_refs, ts=excluded.ts",
-            )
-            .map_err(|e| e.to_string())?;
-        for r in rows {
-            stmt.execute(params![
-                r.session_id,
-                r.seq,
-                r.role,
-                r.content,
-                r.tool_calls,
-                r.tool_call_id,
-                r.reasoning,
-                r.attachments,
-                r.model,
-                r.memory_refs,
-                r.ts,
-            ])
-            .map_err(|e| e.to_string())?;
-        }
+    insert_session_rows(&tx, rows)?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Replace a session's durable transcript with exactly `rows`.
+///
+/// Edit, retry, delete, compaction and fork all change what the conversation *is*, not just what
+/// is on screen. Appending could only add rows, so the abandoned tail came back on resume. This is
+/// the one write that removes it: delete the session's rows and insert the new view in the same
+/// transaction, so a crash cannot leave half a conversation. The FTS triggers fire on both halves.
+pub fn replace_session_messages(
+    store: &Store,
+    session_id: &str,
+    rows: &[SessionMessageRow],
+) -> Result<(), String> {
+    if session_id.trim().is_empty() {
+        return Err("session_messages: session_id is required".into());
     }
+    validate_session_rows(rows)?;
+    if let Some(bad) = rows.iter().find(|r| r.session_id != session_id) {
+        return Err(format!(
+            "session_messages: row for {:?} cannot be written into session {:?}",
+            bad.session_id, session_id
+        ));
+    }
+    let mut conn = store.conn.lock().map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM session_messages WHERE session_id = ?1", params![session_id])
+        .map_err(|e| e.to_string())?;
+    insert_session_rows(&tx, rows)?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -1378,6 +1419,36 @@ mod context_graph_tests {
         let rows = session_messages(&s, "s1").unwrap();
         assert_eq!(rows.len(), 1, "the row is updated, not duplicated");
         assert_eq!(rows[0].content, "hi again");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn replacing_a_transcript_drops_rows_the_new_view_no_longer_holds() {
+        let (s, d) = temp_store("tx-replace");
+        append_session_messages(
+            &s,
+            &[
+                msg("s1", 0, "user", "q1"),
+                msg("s1", 1, "assistant", "a1"),
+                msg("s1", 2, "user", "q2"),
+            ],
+        )
+        .unwrap();
+
+        replace_session_messages(&s, "s1", &[msg("s1", 0, "user", "q1 edited")]).unwrap();
+        let rows = session_messages(&s, "s1").unwrap();
+        assert_eq!(rows.len(), 1, "the abandoned tail is gone, not merely hidden");
+        assert_eq!(rows[0].content, "q1 edited");
+
+        // A row from another session is refused rather than written into this one.
+        let bad = replace_session_messages(&s, "s1", &[msg("s2", 0, "user", "x")]);
+        assert!(bad.is_err(), "the replacement cannot cross session ids");
+
+        // Emptying is a real replacement, and it leaves other sessions alone.
+        append_session_messages(&s, &[msg("s2", 0, "user", "other")]).unwrap();
+        replace_session_messages(&s, "s1", &[]).unwrap();
+        assert!(session_messages(&s, "s1").unwrap().is_empty());
+        assert_eq!(session_messages(&s, "s2").unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&d);
     }
 
