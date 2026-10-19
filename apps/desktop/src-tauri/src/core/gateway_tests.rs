@@ -4585,6 +4585,7 @@ async fn admin_routes_refuse_without_the_master_key() {
         ("DELETE", "/admin/memory", json!(null)),
         ("POST", "/admin/memory/batch", json!([])),
         ("POST", "/admin/memory/recall", json!({ "query": "x" })),
+        ("POST", "/admin/memory/scoped", json!({ "project_root": "/tmp/x" })),
         ("GET", "/admin/memory/stats", json!(null)),
         ("GET", "/admin/memory/conflicts", json!(null)),
         // The master switch. Listed with the memory statics because it is one, and because a reader
@@ -5385,6 +5386,24 @@ async fn admin_memory_recall_finds_a_captured_atom() {
     let rows: Value = res.json().await.unwrap();
     let arr = rows.as_array().expect("a list");
     assert!(!arr.is_empty(), "BM25 must find the atom it just stored: {rows}");
+}
+
+/// The scoped list route is workspace-only by construction: a caller that names no workspace is
+/// refused rather than silently handed every row. `scope_required` makes the refusal classifiable.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_memory_scoped_list_requires_a_workspace() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .post(format!("{}/admin/memory/scoped", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400, "no project_root is a caller error, not a wildcard");
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "scope_required");
 }
 
 /// Capture is not injection: a row is born `Unscoped` and must not be returned by a scoped recall
