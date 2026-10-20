@@ -946,4 +946,17 @@ mod tests {
         assert_eq!(rfc3339_ms("2026-10-01T10:00:00.250Z"), Some(1_790_848_800_250));
         assert_eq!(rfc3339_ms("not a date"), None);
     }
+
+    /// Reads the real zcode store on this machine. Ignored in CI because it depends on the
+    /// developer's `~/.zcode/cli/db/db.sqlite`; run with `--ignored` to prove the live WAL
+    /// database opens read-only and yields a transcript.
+    #[test]
+    #[ignore = "reads the real zcode store"]
+    fn live_zcode_store_is_readable() {
+        let src = ZcodeSource::new();
+        let refs = src.list().unwrap();
+        assert!(!refs.is_empty(), "the live store should expose sessions");
+        let turns = src.read(&refs[0].native_id).unwrap();
+        assert!(!turns.is_empty(), "the newest session should have a readable transcript");
+    }
 }
