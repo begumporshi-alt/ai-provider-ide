@@ -92,15 +92,20 @@ fn mtime_ms(path: &Path) -> i64 {
         .unwrap_or(0)
 }
 
-fn json_lines(path: &Path) -> Vec<Value> {
+/// Stream one JSONL file, handing each parsed line to `visit` in order.
+///
+/// Streaming rather than `read_to_end`: a Claude or Codex transcript with tool output reaches tens
+/// of megabytes, and a `Vec<Value>` of that is several times the file in memory — while `list()`
+/// touches every discovered file on every call.
+fn for_each_json_line(path: &Path, mut visit: impl FnMut(Value)) {
     let Ok(file) = fs::File::open(path) else {
-        return Vec::new();
+        return;
     };
-    BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
-        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-        .collect()
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if let Ok(value) = serde_json::from_str::<Value>(&line) {
+            visit(value);
+        }
+    }
 }
 
 fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
@@ -218,6 +223,30 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// What one envelope actually was, beyond its declared role.
+///
+/// A Claude `type:"user"` line can carry nothing but a `tool_result`, and an assistant line can be
+/// pure reasoning. Reporting those as ordinary prose would import machine output as something the
+/// human said — the role/label pair is what keeps the distinction.
+fn envelope_label(parts: &Value) -> Option<&'static str> {
+    let Some(items) = parts.as_array() else {
+        return None;
+    };
+    let kinds: Vec<&str> =
+        items.iter().filter_map(|p| p.get("type").and_then(Value::as_str)).collect();
+    if kinds.is_empty() {
+        return None;
+    }
+    let only = |allowed: &[&str]| kinds.iter().all(|k| allowed.contains(k));
+    if only(&["tool_use", "tool_result"]) {
+        return Some("tool");
+    }
+    if only(&["thinking"]) {
+        return Some("thinking");
+    }
+    None
+}
+
 // ---------- claude code / qoder ----------
 
 pub struct JsonlSource {
@@ -255,37 +284,23 @@ impl AgentSource for JsonlSource {
         collect_jsonl(base, &mut files, 0);
         let mut out = Vec::new();
         for path in files {
-            let lines = json_lines(&path);
-            if lines.is_empty() {
-                continue;
-            }
-            // A claude/qoder project dir should hold only its own transcripts, but a stray JSONL
-            // must not become a session: require the envelope's session id and a real turn.
-            let looks_like_transcript = lines.iter().any(|l| {
-                l.get("sessionId").is_some()
-                    && matches!(
-                        l.get("type").and_then(Value::as_str),
-                        Some("user") | Some("assistant")
-                    )
-            });
-            if !looks_like_transcript {
-                continue;
-            }
-            let native_id =
-                path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
-            if native_id.is_empty() {
-                continue;
-            }
-            let root =
-                lines.iter().find_map(|l| l.get("cwd").and_then(Value::as_str)).map(str::to_string);
+            // One streaming pass per file: keep only what a listing needs, then drop the handle.
+            let mut root: Option<String> = None;
             let mut preview = String::new();
             let mut title = None;
             let mut updated = mtime_ms(&path);
             let mut turns = 0usize;
-            for line in &lines {
+            let mut looks_like_transcript = false;
+            for_each_json_line(&path, |line| {
                 let kind = line.get("type").and_then(Value::as_str).unwrap_or("");
+                if line.get("sessionId").is_some() && (kind == "user" || kind == "assistant") {
+                    looks_like_transcript = true;
+                }
                 if kind == "user" || kind == "assistant" {
                     turns += 1;
+                }
+                if root.is_none() {
+                    root = line.get("cwd").and_then(Value::as_str).map(str::to_string);
                 }
                 if let Some(ts) = line.get("timestamp").and_then(Value::as_str).and_then(rfc3339_ms)
                 {
@@ -299,6 +314,16 @@ impl AgentSource for JsonlSource {
                         title = Some(clip(trimmed, 60));
                     }
                 }
+            });
+            // A claude/qoder project dir should hold only its own transcripts, but a stray JSONL
+            // must not become a session: require the envelope's session id and a real turn.
+            if !looks_like_transcript {
+                continue;
+            }
+            let native_id =
+                path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+            if native_id.is_empty() {
+                continue;
             }
             out.push(SessionRef {
                 source: self.name.into(),
@@ -329,26 +354,31 @@ impl AgentSource for JsonlSource {
             return Ok(Vec::new());
         };
         let mut turns = Vec::new();
-        for line in json_lines(&path) {
+        let mut fallback_ts = mtime_ms(&path);
+        for_each_json_line(&path, |line| {
             let kind = line.get("type").and_then(Value::as_str).unwrap_or("");
             if kind != "user" && kind != "assistant" {
-                continue;
+                return;
             }
-            let text = line.get("message").map(message_text).unwrap_or_default();
+            let message = line.get("message").unwrap_or(&Value::Null);
+            let text = message_text(message);
             if text.trim().is_empty() {
-                continue;
+                return;
+            }
+            // A user envelope holding only a tool_result is machine output, not something the
+            // human typed; the label is what the importer keys off to keep the distinction.
+            let label = envelope_label(message.get("content").unwrap_or(&Value::Null));
+            let role = if label == Some("tool") { "assistant" } else { kind };
+            if let Some(ts) = line.get("timestamp").and_then(Value::as_str).and_then(rfc3339_ms) {
+                fallback_ts = fallback_ts.max(ts);
             }
             turns.push(NormalizedTurn {
-                role: kind.to_string(),
+                role: role.to_string(),
                 content: text,
-                ts: line
-                    .get("timestamp")
-                    .and_then(Value::as_str)
-                    .and_then(rfc3339_ms)
-                    .unwrap_or_else(|| mtime_ms(&path)),
-                label: None,
+                ts: fallback_ts,
+                label: label.map(str::to_string),
             });
-        }
+        });
         Ok(turns)
     }
 }
@@ -391,50 +421,49 @@ impl AgentSource for CodexSource {
         collect_jsonl(base, &mut files, 0);
         let mut out = Vec::new();
         for path in files {
-            let lines = json_lines(&path);
-            let Some(meta) = lines
-                .iter()
-                .find(|l| l.get("type").and_then(Value::as_str) == Some("session_meta"))
-            else {
-                continue;
-            };
-            let native_id = meta
-                .get("session_id")
-                .or_else(|| meta.get("id"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            if native_id.is_empty() {
-                continue;
-            }
-            let root = meta.get("cwd").and_then(Value::as_str).map(str::to_string);
+            // One streaming pass: the metadata line comes first in a rollout file.
+            let mut native_id = String::new();
+            let mut root: Option<String> = None;
             let mut preview = String::new();
             let mut title = None;
             let mut updated = mtime_ms(&path);
             let mut turns = 0usize;
-            for line in &lines {
+            for_each_json_line(&path, |line| {
+                if line.get("type").and_then(Value::as_str) == Some("session_meta") {
+                    if native_id.is_empty() {
+                        native_id = line
+                            .get("session_id")
+                            .or_else(|| line.get("id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        root = line.get("cwd").and_then(Value::as_str).map(str::to_string);
+                    }
+                    return;
+                }
                 if line.get("type").and_then(Value::as_str) == Some("response_item") {
                     turns += 1;
+                    if preview.is_empty() {
+                        let payload = line.get("payload").unwrap_or(&Value::Null);
+                        if payload.get("type").and_then(Value::as_str) == Some("message")
+                            && payload.get("role").and_then(Value::as_str) == Some("user")
+                        {
+                            let text = payload.get("content").map(value_text).unwrap_or_default();
+                            let trimmed = text.trim();
+                            if !trimmed.is_empty() {
+                                preview = clip(trimmed, PREVIEW_CHARS);
+                                title = Some(clip(trimmed, 60));
+                            }
+                        }
+                    }
                 }
                 if let Some(ts) = line.get("timestamp").and_then(Value::as_str).and_then(rfc3339_ms)
                 {
                     updated = updated.max(ts);
                 }
-                if preview.is_empty()
-                    && line.get("type").and_then(Value::as_str) == Some("response_item")
-                {
-                    let payload = line.get("payload").unwrap_or(&Value::Null);
-                    if payload.get("type").and_then(Value::as_str) == Some("message")
-                        && payload.get("role").and_then(Value::as_str) == Some("user")
-                    {
-                        let text = payload.get("content").map(value_text).unwrap_or_default();
-                        let trimmed = text.trim();
-                        if !trimmed.is_empty() {
-                            preview = clip(trimmed, PREVIEW_CHARS);
-                            title = Some(clip(trimmed, 60));
-                        }
-                    }
-                }
+            });
+            if native_id.is_empty() {
+                continue;
             }
             out.push(SessionRef {
                 source: "codex".into(),
@@ -461,26 +490,33 @@ impl AgentSource for CodexSource {
         collect_jsonl(base, &mut files, 0);
         let mut turns = Vec::new();
         for path in files {
-            let lines = json_lines(&path);
-            let is_target = lines.iter().any(|l| {
-                l.get("type").and_then(Value::as_str) == Some("session_meta")
-                    && l.get("session_id").or_else(|| l.get("id")).and_then(Value::as_str)
-                        == Some(native_id)
-            });
-            if !is_target {
-                continue;
-            }
-            for line in &lines {
+            // Check the header before touching the rest: a rollout file names its session on
+            // line one, so a non-target file is dismissed after a single line.
+            let mut is_target = false;
+            let mut header_checked = false;
+            let mut fallback_ts = mtime_ms(&path);
+            for_each_json_line(&path, |line| {
+                if !header_checked {
+                    header_checked = true;
+                    is_target = line.get("type").and_then(Value::as_str) == Some("session_meta")
+                        && line
+                            .get("session_id")
+                            .or_else(|| line.get("id"))
+                            .and_then(Value::as_str)
+                            == Some(native_id);
+                }
+                if !is_target {
+                    return;
+                }
                 if line.get("type").and_then(Value::as_str) != Some("response_item") {
-                    continue;
+                    return;
                 }
                 let payload = line.get("payload").unwrap_or(&Value::Null);
                 let kind = payload.get("type").and_then(Value::as_str).unwrap_or("");
-                let ts = line
-                    .get("timestamp")
-                    .and_then(Value::as_str)
-                    .and_then(rfc3339_ms)
-                    .unwrap_or_else(|| mtime_ms(&path));
+                if let Some(ts) = line.get("timestamp").and_then(Value::as_str).and_then(rfc3339_ms)
+                {
+                    fallback_ts = fallback_ts.max(ts);
+                }
                 if kind == "message" {
                     let role = payload
                         .get("role")
@@ -489,7 +525,12 @@ impl AgentSource for CodexSource {
                         .to_string();
                     let text = payload.get("content").map(value_text).unwrap_or_default();
                     if !text.trim().is_empty() {
-                        turns.push(NormalizedTurn { role, content: text, ts, label: None });
+                        turns.push(NormalizedTurn {
+                            role,
+                            content: text,
+                            ts: fallback_ts,
+                            label: None,
+                        });
                     }
                 } else {
                     let body = payload
@@ -500,10 +541,13 @@ impl AgentSource for CodexSource {
                     turns.push(NormalizedTurn {
                         role: "assistant".into(),
                         content: format!("[tool: {body}]"),
-                        ts,
+                        ts: fallback_ts,
                         label: Some("tool".into()),
                     });
                 }
+            });
+            if is_target {
+                break;
             }
         }
         Ok(turns)
@@ -563,17 +607,20 @@ impl AgentSource for ZcodeSource {
             Ok(s) => s,
             Err(_) => return Ok(Vec::new()),
         };
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, i64>(4)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?;
+        let rows = match stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        }) {
+            Ok(rows) => rows,
+            // A store that cannot answer is unavailable, not a broken endpoint: one agent's
+            // failure must not take the combined search down with it.
+            Err(_) => return Ok(Vec::new()),
+        };
         let mut out = Vec::new();
         for row in rows.flatten() {
             let (id, title, directory, updated, turns) = row;
@@ -718,69 +765,84 @@ impl AgentSource for RouterSource {
         let Some(store) = &self.store else {
             return Ok(Vec::new());
         };
-        let conn = store.conn.lock().map_err(|e| e.to_string())?;
+        let Ok(conn) = store.conn.lock() else {
+            return Ok(Vec::new());
+        };
         let has_root = conn.prepare("SELECT root FROM session_messages LIMIT 1").is_ok();
-        let mut stmt = conn
-            .prepare(
-                "SELECT session_id, MIN(ts), MAX(ts), COUNT(*)
-                 FROM session_messages GROUP BY session_id
-                 ORDER BY MAX(ts) DESC LIMIT 500",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?;
-        let mut out = Vec::new();
-        for row in rows.flatten() {
-            let (session_id, started, updated, turns) = row;
-            let preview: String = conn
-                .query_row(
-                    "SELECT content FROM session_messages
-                     WHERE session_id = ?1 AND role = 'user' ORDER BY seq LIMIT 1",
-                    [&session_id],
-                    |r| r.get(0),
-                )
-                .unwrap_or_default();
-            let title: Option<String> = conn
-                .query_row(
-                    "SELECT title FROM session_titles WHERE session_id = ?1",
-                    [&session_id],
-                    |r| r.get(0),
-                )
-                .ok()
-                .flatten();
-            let root: Option<String> = if has_root {
-                conn.query_row(
-                    "SELECT root FROM session_messages
-                     WHERE session_id = ?1 AND root IS NOT NULL LIMIT 1",
-                    [&session_id],
-                    |r| r.get(0),
-                )
-                .ok()
-            } else {
-                None
-            };
-            let _ = started;
-            out.push(SessionRef {
-                source: "router".into(),
-                native_id: session_id,
-                title,
-                root,
-                updated_at: updated,
-                turn_estimate: turns as usize,
-                preview: clip(&preview, PREVIEW_CHARS),
-                native_path: "session_messages".into(),
-                readable: true,
-                note: None,
-            });
+        // Four queries total, not one per session: this holds the app's global store mutex, so an
+        // N+1 here would stall every write while the search runs.
+        let base = match conn.prepare(
+            "SELECT session_id, MAX(ts), COUNT(*) FROM session_messages
+             GROUP BY session_id ORDER BY MAX(ts) DESC LIMIT 500",
+        ) {
+            Ok(mut stmt) => stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+                })
+                .map(|rows| rows.flatten().collect::<Vec<_>>())
+                .unwrap_or_default(),
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut previews: HashMap<String, String> = HashMap::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT session_id, content FROM session_messages
+             WHERE role = 'user' GROUP BY session_id HAVING seq = MIN(seq)",
+        ) {
+            if let Ok(rows) =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            {
+                for (id, content) in rows.flatten() {
+                    previews.insert(id, content);
+                }
+            }
         }
+
+        let mut titles: HashMap<String, String> = HashMap::new();
+        if let Ok(mut stmt) = conn.prepare("SELECT session_id, title FROM session_titles") {
+            if let Ok(rows) =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            {
+                for (id, title) in rows.flatten() {
+                    titles.insert(id, title);
+                }
+            }
+        }
+
+        let mut roots: HashMap<String, String> = HashMap::new();
+        if has_root {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT session_id, root FROM session_messages
+                 WHERE root IS NOT NULL GROUP BY session_id",
+            ) {
+                if let Ok(rows) =
+                    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                {
+                    for (id, root) in rows.flatten() {
+                        roots.insert(id, root);
+                    }
+                }
+            }
+        }
+
+        let out = base
+            .into_iter()
+            .map(|(session_id, updated, turns)| {
+                let preview = previews.get(&session_id).cloned().unwrap_or_default();
+                SessionRef {
+                    source: "router".into(),
+                    title: titles.get(&session_id).cloned(),
+                    root: roots.get(&session_id).cloned(),
+                    native_id: session_id,
+                    updated_at: updated,
+                    turn_estimate: turns as usize,
+                    preview: clip(&preview, PREVIEW_CHARS),
+                    native_path: "session_messages".into(),
+                    readable: true,
+                    note: None,
+                }
+            })
+            .collect();
         Ok(out)
     }
 
@@ -854,15 +916,16 @@ mod tests {
     fn the_claude_adapter_reads_a_transcript_and_resolves_its_root() {
         let src = JsonlSource::at("claude", fixture("claude"));
         let refs = src.list().unwrap();
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].source, "claude");
-        assert_eq!(refs[0].root.as_deref(), Some("/tmp/proj-alpha"));
-        assert!(refs[0].preview.contains("flaky test"));
-        let turns = src.read(&refs[0].native_id).unwrap();
-        assert_eq!(turns.len(), 2);
+        // Two fixtures live in this directory: the conversation and a long-preview case.
+        assert_eq!(refs.len(), 2);
+        let session = refs.iter().find(|r| r.root.as_deref() == Some("/tmp/proj-alpha")).unwrap();
+        assert_eq!(session.source, "claude");
+        assert!(session.preview.contains("flaky test"));
+        let turns = src.read(&session.native_id).unwrap();
+        assert_eq!(turns.len(), 5);
         assert_eq!(turns[0].role, "user");
-        assert_eq!(turns[1].role, "assistant");
-        assert!(turns[1].content.contains("raced the fixture teardown"));
+        assert_eq!(turns[4].role, "assistant");
+        assert!(turns[4].content.contains("raced the fixture teardown"));
     }
 
     #[test]
@@ -890,15 +953,47 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let db = dir.join("db.sqlite");
         let conn = Connection::open(&db).unwrap();
+        // DDL transcribed from the live store (`sqlite3 'file:…?mode=ro' '.schema message'`,
+        // 2026-10-20): the NOT NULLs and the `sequence` columns the adapter orders by are real,
+        // so a mapping that drifted from the host schema would fail here rather than in
+        // production.
         conn.execute_batch(
-            "CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, directory TEXT, time_updated INTEGER);
-             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT, sequence INTEGER);
-             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, data TEXT, sequence INTEGER);
-             INSERT INTO session VALUES ('s1','release notes','/tmp/proj-alpha', 1000);
-             INSERT INTO message VALUES ('m1','s1',900,'{\"role\":\"user\"}',0);
-             INSERT INTO message VALUES ('m2','s1',950,'{\"role\":\"assistant\"}',1);
-             INSERT INTO part VALUES ('p1','m1','{\"type\":\"text\",\"text\":\"outline the release notes\"}',0);
-             INSERT INTO part VALUES ('p2','m2','{\"type\":\"text\",\"text\":\"Draft: three highlights.\"}',0);",
+            r#"
+CREATE TABLE session (
+        id text primary key,
+        project_id text not null,
+        workspace_id text,
+        parent_id text,
+        slug text not null,
+        directory text not null,
+        path text,
+        title text not null,
+        version text not null,
+        share_url text,
+        time_created integer not null,
+        time_updated integer not null
+      );
+CREATE TABLE message (
+        id text primary key,
+        session_id text not null references session(id) on delete cascade,
+        time_created integer not null,
+        time_updated integer not null,
+        data text not null
+      , sequence integer);
+CREATE TABLE part (
+        id text primary key,
+        message_id text not null references message(id) on delete cascade,
+        session_id text not null,
+        time_created integer not null,
+        time_updated integer not null,
+        data text not null
+      , sequence integer);
+INSERT INTO session VALUES ('s1','p','w',NULL,'slug','/tmp/proj-alpha',NULL,'release notes','1',NULL,900,1000);
+INSERT INTO message VALUES ('m1','s1',900,900,'{"role":"user"}',0);
+INSERT INTO message VALUES ('m2','s1',950,950,'{"role":"assistant"}',1);
+INSERT INTO part VALUES ('p1','m1','s1',900,900,'{"type":"text","text":"outline the release notes"}',0);
+INSERT INTO part VALUES ('p2','m2','s1',950,950,'{"type":"text","text":"Draft: three highlights."}',0);
+"#,
         ).unwrap();
         drop(conn);
 
@@ -909,15 +1004,42 @@ mod tests {
         assert!(refs[0].preview.contains("outline the release notes"));
         let turns = src.read("s1").unwrap();
         assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].role, "user");
         assert_eq!(turns[1].content, "Draft: three highlights.");
+        // Milliseconds since the host stores epoch millis; a seconds/millis mix-up shows here.
+        assert_eq!(turns[0].ts, 900);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
+    fn a_tool_only_envelope_imports_as_a_labeled_tool_turn() {
+        let src = JsonlSource::at("claude", fixture("claude"));
+        let turns = src.read("claude-session").unwrap();
+        let tool = turns
+            .iter()
+            .find(|t| t.content.contains("src/retry.spec.ts:42"))
+            .expect("the tool_result envelope is present");
+        assert_eq!(tool.role, "assistant", "a tool result is not something the human typed");
+        assert_eq!(tool.label.as_deref(), Some("tool"));
+        let thinking = turns
+            .iter()
+            .find(|t| t.content.contains("teardown looks racy"))
+            .expect("the thinking text is present");
+        assert_eq!(thinking.label.as_deref(), Some("thinking"));
+    }
+
+    #[test]
     fn an_unreadable_or_missing_store_reports_unavailable_not_an_error() {
-        let src = JsonlSource::at("claude", PathBuf::from("/nonexistent/does-not-exist"));
-        assert!(src.list().unwrap().is_empty());
-        assert!(src.read("anything").unwrap().is_empty());
+        let missing = PathBuf::from("/nonexistent/does-not-exist");
+        for src in [
+            Box::new(JsonlSource::at("claude", missing.clone())) as Box<dyn AgentSource>,
+            Box::new(JsonlSource::at("qoder", missing.clone())),
+            Box::new(CodexSource::at(missing.clone())),
+            Box::new(ZcodeSource::at(missing.join("db.sqlite"))),
+        ] {
+            assert!(src.list().unwrap().is_empty(), "{} must degrade to empty", src.name());
+            assert!(src.read("anything").unwrap().is_empty());
+        }
     }
 
     #[test]
@@ -928,15 +1050,52 @@ mod tests {
             vec!["zcode", "claude", "codex", "qoder", "router", "workbuddy", "gemini"]
         );
         for source in all_sources(None) {
-            assert!(source.list().unwrap().is_empty() || source.name() != "workbuddy");
+            assert!(source.list().is_ok(), "{} must never fail its listing", source.name());
         }
+        let empty: Vec<Vec<SessionRef>> =
+            all_sources(None).into_iter().map(|s| s.list().unwrap()).collect();
+        // The two stubs are always empty; the real ones depend on this machine.
+        assert!(empty[5].is_empty() && empty[6].is_empty());
     }
 
     #[test]
-    fn previews_and_content_stay_bounded() {
+    fn previews_are_clipped_rather_than_truncated_mid_token() {
         let src = JsonlSource::at("claude", fixture("claude"));
         let refs = src.list().unwrap();
-        assert!(refs[0].preview.chars().count() <= PREVIEW_CHARS + 1);
+        let long = refs
+            .iter()
+            .find(|r| r.root.as_deref() == Some("/tmp/proj-long"))
+            .expect("the long fixture is listed");
+        // 400 x's in the source become PREVIEW_CHARS characters plus the ellipsis marker.
+        assert_eq!(long.preview.chars().count(), PREVIEW_CHARS + 1);
+        assert!(long.preview.ends_with('…'));
+    }
+
+    #[test]
+    fn the_router_adapter_reads_its_own_transcript() {
+        let dir = std::env::temp_dir().join(format!("aip-router-src-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = crate::core::store::Store::open(&dir).expect("open");
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO session_messages (session_id, seq, role, content, ts)
+                 VALUES ('s-own',1,'user','why is the build slow',100),
+                        ('s-own',2,'assistant','the typecheck runs twice',200);
+                 INSERT INTO session_titles (session_id, title, updated_at)
+                 VALUES ('s-own','build speed', 100);",
+            )
+            .unwrap();
+        }
+        let src = RouterSource::new(Some(Arc::new(store)));
+        let refs = src.list().unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].title.as_deref(), Some("build speed"));
+        assert!(refs[0].preview.contains("build slow"));
+        let turns = src.read("s-own").unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[1].role, "assistant");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
