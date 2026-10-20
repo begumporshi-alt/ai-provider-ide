@@ -56,7 +56,7 @@ export interface ComposedManifest {
 /** The block's whole budget, header included. A manifest is a header, not a second recall. */
 export const MANIFEST_BUDGET_TOKENS = 400;
 
-const NEGATED = /\b(cannot|can't|can not|unable to|not available|no access|blocked from|does not work|doesn't work)\b/i;
+const NEGATED = /\b(cannot|can't|can not|unable to|unavailable|incapable|not available|not supported|no access|no real shell|blocked from|does not work|doesn't work)\b/i;
 const AFFIRMED = /\b(can|able to|works|available)\b/i;
 
 /** Verify one capability sentence against the tools and sandbox this turn actually has. */

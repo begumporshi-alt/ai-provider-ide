@@ -40,6 +40,11 @@ describe("verifyCapability", () => {
       .toBe("contradicted");
   });
 
+  it("treats 'unavailable' as negation, not as the affirmative 'available'", () => {
+    expect(verifyCapability("git clone is unavailable in this build", snap()))
+      .toBe("contradicted");
+  });
+
   it("returns unverified when the capability snapshot is empty", () => {
     // Absence of evidence is not evidence of inability. A blank snapshot is a caller that could
     // not read the policy — not a sandbox that forbids everything. Calling this `live` is how the

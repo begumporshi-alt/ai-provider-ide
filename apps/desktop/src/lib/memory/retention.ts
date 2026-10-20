@@ -51,16 +51,18 @@ let timer: ReturnType<typeof setInterval> | null = null;
 export async function pruneOnce(): Promise<RetentionResult> {
   if (running) return { skipped: true };
   running = true;
+  let memories: MemoryPruneStats | undefined;
   try {
     // Deliberately ungated: the Assistant records memories whether or not the *gateway*
     // memory switch is on, so pruning must run for both writers.
-    const memories = await pruneMemories();
+    memories = await pruneMemories();
     const live = await pruneLiveContext();
     return { memories, live, skipped: false };
   } catch (e) {
     // "Gateway not running" is a supported state, and this pass runs at boot. A rejection here
     // would surface as an uncaught page error that reads like a corrupt store; degrade instead.
-    return { skipped: true, error: e instanceof Error ? e.message : String(e) };
+    // The first step's stats survive a failure in the second: half a pass is still a fact.
+    return { memories, skipped: true, error: e instanceof Error ? e.message : String(e) };
   } finally {
     running = false;
   }

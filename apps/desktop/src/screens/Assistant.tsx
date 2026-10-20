@@ -2310,12 +2310,13 @@ function Chat({
         policy: await fetchToolsPolicy().catch(() => ({ git_subcommands: [] as string[] })),
       }).catch(() => ({ entries: [], block: "", tokens: 0 }));
     }
-    // Only rows the header actually carries, plus contradicted capabilities, are de-duplicated
-    // against recall. Project facts stay out of the manifest block, so excluding them here would
-    // silently disable the recall path that presents them and their trail.
+    // Rows the header actually carries, plus *every* capability row. A capability that is
+    // contradicted or unverified is deliberately absent from the block, but it must not re-enter
+    // through relevance recall either: "never trust a capability as text" applies to both paths.
+    // Project facts stay out of both sets, so recall remains their path.
     const manifestIds: ReadonlySet<string> = new Set(
       (nextManifest?.entries ?? [])
-        .filter((e) => e.included || e.verified === "contradicted")
+        .filter((e) => e.included || e.kind === "capability")
         .map((e) => e.id),
     );
     // Written unconditionally: switching memory off must not keep the previous turn's header.

@@ -65,6 +65,17 @@ describe("pruneOnce", () => {
     expect(live).not.toHaveBeenCalled();
   });
 
+  it("keeps the first step's stats when the second step fails", async () => {
+    memories.mockResolvedValue({ l0_expired: 4, l0_ring: 0, decayed: 1 });
+    live.mockRejectedValue(new Error("Failed to fetch"));
+
+    const r = await pruneOnce();
+
+    expect(r.skipped).toBe(true);
+    expect(r.error).toContain("Failed to fetch");
+    expect(r.memories).toEqual({ l0_expired: 4, l0_ring: 0, decayed: 1 });
+  });
+
   it("does not run a second pass on top of a running one", async () => {
     let release: (v: store.MemoryPruneStats) => void = () => undefined;
     memories.mockImplementation(
