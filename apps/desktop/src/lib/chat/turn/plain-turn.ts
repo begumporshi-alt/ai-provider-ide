@@ -91,10 +91,17 @@ export async function runPlainTurn(req: PlainTurnRequest, ports: TurnPorts): Pro
     const exec = await ports.generate(
       {
         model: req.model,
-        messages: buildPlainRequestMessages(req.systemPromptText, recallMsg, req.perTurn, history, {
-          content: req.text,
-          attachments: req.attachments,
-        }),
+        messages: buildPlainRequestMessages(
+          req.systemPromptText,
+          req.manifestBlock,
+          recallMsg,
+          req.perTurn,
+          history,
+          {
+            content: req.text,
+            attachments: req.attachments,
+          },
+        ),
         onFinish: ports.onFinishReason,
         onReasoning: (t: string) => {
           reasoned += t;

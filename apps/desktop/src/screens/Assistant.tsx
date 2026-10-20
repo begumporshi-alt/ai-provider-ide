@@ -9,6 +9,7 @@ import { createPortal } from "react-dom";
 import {
   catalog,
   listSkills,
+  listScopedMemories,
   agentDefsList,
   registry,
   router,
@@ -51,7 +52,7 @@ import { parseListing, type MentionCandidate } from "../lib/chat/mentions";
 import { parseAssistantStream, type ToolSegment } from "../lib/assistant-stream";
 import { editPoint, retryPoint } from "../lib/chat/actions";
 import { instructionSystemText } from "../lib/chat/context-blocks";
-import { createTauriToolHost, fetchToolsPolicy, fetchDefaultRoot, savePlan, planPathFromResult, clampIterations, resolveSubagentResultCap, type ToolsPolicy, type AgentEvent, type PlanPorts } from "../lib/tools";
+import { createTauriToolHost, fetchToolsPolicy, fetchDefaultRoot, savePlan, planPathFromResult, clampIterations, resolveSubagentResultCap, AGENT_TOOLS, type ToolsPolicy, type AgentEvent, type PlanPorts } from "../lib/tools";
 import {
   APPROVAL_MODES, INITIAL_APPROVAL, revertPlan,
   type ApprovalMode, type ApprovalState, type RunChangeSet,
@@ -95,6 +96,7 @@ import {
   distilTurn, memoryBlock, onLearned, recallContext, recordRecall, rememberTurn,
   type LearnedMemory,
 } from "../lib/memory/engine";
+import { buildManifest, type ComposedManifest } from "../lib/memory/manifest";
 import { newMsgId, replayHistory, withIds, type Msg } from "../lib/chat/turn/messages";
 import {
   applyAgentEvent,
@@ -1579,6 +1581,15 @@ function Chat({
   if (!ctxRef.current) ctxRef.current = activeSession();
   const lastNodeRef = useRef<string | null>(null);
   /**
+   * The manifest the last turn ran with. `manifest` is what the screen echoes — every entry,
+   * included or not, so a contradicted capability can be shown as stale — while `manifestRef`
+   * mirrors it for the turn's async closures, the same rule as `skillOverridesRef`: a closure
+   * must read the manifest built for THAT turn, not the render that sent it.
+   */
+  const [manifest, setManifest] = useState<ComposedManifest | null>(null);
+  const manifestRef = useRef<ComposedManifest | null>(null);
+  manifestRef.current = manifest;
+  /**
    * The durable transcript's next sequence number (0027).
    *
    * A ref, not state: a turn appends from a callback that must not re-render the screen. Seeded
@@ -2284,6 +2295,30 @@ function Chat({
     // would otherwise read is one render behind the flip it is correcting.
     passStartedInPlanModeRef.current = planPass;
 
+    // The session manifest: the always-carried header, composed once and verified against what
+    // this app can actually do. Built before the branch so both paths send the same block, and
+    // best-effort — a failed memory or policy read yields an empty manifest, never a failed turn.
+    // A blank root is no workspace, so there is no scope to read; the agent branch's own guard
+    // still refuses the turn outright.
+    let nextManifest: ComposedManifest | null = null;
+    if (useMemory && root.trim()) {
+      nextManifest = await buildManifest(root.trim(), agentMode ? "agent" : "plain", {
+        list: (r) => listScopedMemories({ projectRoot: r, limit: 200 }),
+        tools: AGENT_TOOLS.map((t) => t.name),
+        // The full surface, not the chat mode's: a plain-chat claim about git is still a claim
+        // about this app, and the controller's ruling is that the mode must not blank the lists.
+        policy: await fetchToolsPolicy().catch(() => ({ git_subcommands: [] as string[] })),
+      }).catch(() => ({ entries: [], block: "", tokens: 0 }));
+    }
+    // Every entry counts for de-duplication, included or not: a contradicted capability must not
+    // re-enter through relevance recall, and a budget-dropped row must not appear twice either.
+    const manifestIds: ReadonlySet<string> = new Set(
+      (nextManifest?.entries ?? []).map((e) => e.id),
+    );
+    // Written unconditionally: switching memory off must not keep the previous turn's header.
+    manifestRef.current = nextManifest;
+    setManifest(nextManifest);
+
     // ---- Agent mode: run the loop, execute tools through the sandbox, confirm each call. ----
     if (agentMode) {
       if (!root.trim()) {
@@ -2312,6 +2347,8 @@ function Chat({
           model: chosen,
           perTurn,
           useMemory,
+          // The verified header for this turn, built above from the scoped rows and live policy.
+          manifestBlock: nextManifest?.block ?? "",
           ...compactRequest,
           signal: ac.signal,
           startedAt: t0,
@@ -2485,7 +2522,7 @@ function Chat({
           recorder: ctxRef.current!,
           lastNode: lastNodeRef,
           memory: {
-            recall: (text: string) => recallContext(text, { root }),
+            recall: (text: string) => recallContext(text, { root, excludeIds: manifestIds }),
             block: memoryBlock,
             recordRecall,
             remember: rememberTurn,
@@ -2543,6 +2580,8 @@ function Chat({
         model: chosen,
         perTurn,
         useMemory,
+        // Same block on the plain path — a session's stable knowledge is not an agent-mode feature.
+        manifestBlock: nextManifest?.block ?? "",
         ...compactRequest,
         // The references block rides the system turn here too — a session's sources are not an
         // agent-mode feature. `undefined` when both halves are empty, which keeps the blank
@@ -2566,7 +2605,7 @@ function Chat({
         recorder: ctxRef.current!,
         lastNode: lastNodeRef,
         memory: {
-          recall: (text: string) => recallContext(text, { root }),
+          recall: (text: string) => recallContext(text, { root, excludeIds: manifestIds }),
           block: memoryBlock,
           recordRecall,
           remember: rememberTurn,

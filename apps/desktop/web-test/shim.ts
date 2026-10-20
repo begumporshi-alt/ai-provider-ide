@@ -538,7 +538,14 @@ const DEFAULT_WORKSPACE_ROOT = "/Users/tester/AI-Provider-Router-Workspace";
 
 const TOOLS_POLICY = {
   programs: ["ls", "cat", "echo", "grep", "rg", "find", "git", "node", "npm", "npx", "pnpm", "python3", "make", "tar", "sed", "awk"],
-  git_subcommands: ["status", "log", "diff", "show"],
+  // Mirrors `GIT_SUBCOMMANDS` in core/tools.rs rather than a read-only subset. The manifest's
+  // capability verification reads this list, so a shim that omitted clone/fetch would judge
+  // "cannot run git clone" against a sandbox the real app does not have — and the spec would pin
+  // the wrong verdict.
+  git_subcommands: [
+    "status", "diff", "log", "show", "branch", "add", "commit", "init", "rev-parse",
+    "ls-files", "config", "describe", "stash", "clone", "fetch", "pull", "push",
+  ],
   max_command_ms: 60_000,
   max_output_bytes: 64 * 1024,
 };

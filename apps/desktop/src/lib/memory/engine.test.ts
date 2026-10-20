@@ -467,6 +467,19 @@ describe("memory engine", () => {
       expect(await recallContext("q")).toHaveLength(1);
     });
 
+    it("drops ids another block already carries, before accounting", async () => {
+      // The manifest owns its entries for the turn. A row that also ranked as relevant must not
+      // be injected twice, and the retrieval counter must describe exactly what was returned —
+      // including a contradicted capability, whose id is excluded so it cannot re-enter here.
+      listMemories.mockResolvedValue([mem("p", "L1", "pinned fact", true)]);
+      recallMemories.mockResolvedValue([mem("a", "L1", "relevant")]);
+
+      const hits = await recallContext("q", { excludeIds: new Set(["p"]) });
+
+      expect(hits.map((m) => m.id)).toEqual(["a"]);
+      expect(markMemoriesRetrieved).toHaveBeenCalledWith(["a"]);
+    });
+
     it("returns nothing instead of throwing when recall fails", async () => {
       recallMemories.mockRejectedValue(new Error("fts corrupt"));
       await expect(recallContext("q")).resolves.toEqual([]);

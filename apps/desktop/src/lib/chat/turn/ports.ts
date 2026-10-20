@@ -132,6 +132,12 @@ export interface TurnRequestBase {
   compactBudget?: number;
   /** Called when compaction actually removed messages, so the screen can say so. */
   onCompacted?: (info: { dropped: number; beforeTokens: number; afterTokens: number }) => void;
+  /**
+   * Verified, scoped manifest text for this turn; empty when memory is off or nothing is scoped.
+   * Built by the screen (it owns the tool policy), threaded unchanged through both branches, and
+   * placed above the per-turn recall so stable knowledge reads first.
+   */
+  manifestBlock?: string;
 }
 
 /**

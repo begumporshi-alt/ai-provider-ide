@@ -408,6 +408,13 @@ export interface RecallOptions {
   layers?: MemoryLayer[];
   /** Workspace root. When set, every read is scoped to that workspace. */
   root?: string;
+  /**
+   * Ids already carried by another block this turn — the manifest's entries, included or not.
+   * Filtered from the merged result before it is returned, so one row cannot be injected twice in
+   * the same request. Contradicted capabilities are in this set too: without that, a claim the
+   * composer just refused would re-enter through relevance recall and defeat verification.
+   */
+  excludeIds?: ReadonlySet<string>;
 }
 
 /**
@@ -465,12 +472,17 @@ export async function recallContext(
       seen.add(m.id);
       merged.push(m);
     }
-    if (merged.length > 0) {
+    // The manifest is additive to recall, so the same row must not land in both blocks. Filtering
+    // here — after the merge, before accounting — keeps the returned rows and the retrieval
+    // counters describing the same list.
+    const exclude = opts.excludeIds;
+    const kept = exclude && exclude.size > 0 ? merged.filter((m) => !exclude.has(m.id)) : merged;
+    if (kept.length > 0) {
       // Fire-and-forget: a usage counter must never delay or fail a turn. This is also why the
       // blank-root early return above runs before any read — there is nothing to account for.
-      void markMemoriesRetrieved(merged.map((m) => m.id)).catch(() => 0);
+      void markMemoriesRetrieved(kept.map((m) => m.id)).catch(() => 0);
     }
-    return merged;
+    return kept;
   } catch {
     return [];
   }

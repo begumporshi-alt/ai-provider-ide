@@ -229,6 +229,7 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
         custom: req.customAgentPrompt,
         skillsBlock: req.skillsBlock,
         referencesBlock: req.referencesBlock,
+        manifest: req.manifestBlock,
         recalledMemory: ports.memory.block(recalled),
         planMode: req.planMode,
         perTurn: req.perTurn,
