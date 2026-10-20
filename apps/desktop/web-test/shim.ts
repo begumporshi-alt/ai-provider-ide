@@ -3407,6 +3407,10 @@ async function routeAdmin(method: string, segs: string[], q: URLSearchParams, bo
     case "memory":
       return routeMemory(method, segs, q, body);
 
+    // ── cross-agent session sources (v1) ───────────────────────────────────
+    case "sources":
+      return routeSources(method, segs, q, body);
+
     // ── context graph (P4) ─────────────────────────────────────────────────
     case "context": {
       if (method === "GET" && segs.length === 2) return dispatch("context_graph", { limit: limitOf(q, 200) });
@@ -3575,6 +3579,77 @@ async function routeMemory(method: string, segs: string[], q: URLSearchParams, b
     }
   }
 
+  refuse(404, `no admin route for ${method} /${segs.join("/")}`, "unknown_route");
+}
+
+/** Cross-agent session sources: list/search/import. The shim seeds a synthetic Claude session so
+ * the TS surface has something to render, plus empty stubs for every other adapter (incl. the
+ * user-locked workbuddy empty stub) so `listAgentSources` reports the full UI order. */
+const ADAPTER_ORDER = ["zcode", "claude", "codex", "qoder", "router", "workbuddy", "gemini"];
+const SOURCES_SEED: Record<string, RelatedSessionSeed[]> = {
+  claude: [
+    {
+      source: "claude", nativeId: "sess_1", title: "Claude: auth flow sketch",
+      root: "/tmp/proj-beta", turns: 12, preview: "How do we rotate the refresh token?",
+      nativePath: "~/.claude/projects/-tmp-proj-beta/sess_1.jsonl", importId: null,
+    },
+  ],
+};
+interface RelatedSessionSeed {
+  source: string;
+  nativeId: string;
+  title: string | null;
+  root: string | null;
+  turns: number;
+  preview: string;
+  nativePath: string;
+  importId: string | null;
+}
+function sourceList(): unknown[] {
+  return ADAPTER_ORDER.map((name) => {
+    const sessions = SOURCES_SEED[name] ?? [];
+    return {
+      name,
+      available: sessions.length > 0,
+      sessionCount: sessions.length,
+      note: sessions.length ? null : "no sessions found",
+    };
+  });
+}
+async function routeSources(method: string, segs: string[], q: URLSearchParams, body: unknown): Promise<unknown> {
+  const at = (i: number): string => (i < segs.length ? decodeURIComponent(segs[i]) : "");
+  // GET /admin/sources
+  if (method === "GET" && segs.length === 2) return { sources: sourceList() };
+  // GET /admin/sources/{name}/sessions  |  GET /admin/sources/sessions
+  if (method === "GET" && segs.length === 3) {
+    const which = at(2);
+    const root = q.get("root");
+    const qstr = (q.get("q") || "").trim().toLowerCase();
+    const pool: RelatedSessionSeed[] =
+      which === "sessions" ? ADAPTER_ORDER.flatMap((n) => SOURCES_SEED[n] ?? []) : SOURCES_SEED[which] ?? [];
+    let hits = pool;
+    if (root) hits = hits.filter((s) => s.root === root);
+    if (qstr) {
+      hits = hits.filter((s) =>
+        (s.title ?? "").toLowerCase().includes(qstr) ||
+        s.preview.toLowerCase().includes(qstr) ||
+        (s.root ?? "").toLowerCase().includes(qstr),
+      );
+    }
+    const limit = limitOf(q, 25);
+    return { sessions: hits.slice(0, limit) };
+  }
+  // POST /admin/sources/import — `import` is a static segment, so it precedes any {name}/sessions
+  // match the same way the Rust router declares it before `{name}/sessions`.
+  if (method === "POST" && segs.length === 3 && at(2) === "import") {
+    const b = (body ?? {}) as { source?: unknown; native_id?: unknown };
+    const sessions = SOURCES_SEED[String(b.source ?? "")] ?? [];
+    const match = sessions.find((s) => s.nativeId === b.native_id);
+    if (!match) refuse(404, "unknown session", "unknown_session");
+    const id = `imp-${b.source}-${match.nativeId}`;
+    match.importId = id;
+    return { sessionId: id, turns: match.turns };
+  }
   refuse(404, `no admin route for ${method} /${segs.join("/")}`, "unknown_route");
 }
 

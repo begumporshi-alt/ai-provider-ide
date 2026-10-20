@@ -66,6 +66,7 @@ import {
   type ProviderRecord,
   type RepairPlan,
 } from "@aiprovider/router-core";
+import { type RelatedSourceSession } from "./lib/memory/manifest";
 import { createHttpPort, createKeyVaultPort } from "./ipc-client";
 import { noteTrailFailure, type TrailId } from "./lib/trail-health";
 import { parseRecalledMemoryRefs } from "./lib/chat/turn/memory-refs";
@@ -81,17 +82,37 @@ import {
 // ---------- host row shapes (camelCase, mirror persist.rs) ----------
 
 export interface HostProviderRow {
-  id: string; slug: string; name: string; type: string | null; baseUrl: string;
-  status: string; rotationStrategy: string; createdAt: number; updatedAt: number;
+  id: string;
+  slug: string;
+  name: string;
+  type: string | null;
+  baseUrl: string;
+  status: string;
+  rotationStrategy: string;
+  createdAt: number;
+  updatedAt: number;
 }
 export interface HostKeyRow {
-  id: string; providerId: string; label: string; secretRef: string; secretHint: string | null;
-  status: string; priority: number; cooldownUntil: number | null; addedAt: number;
-  lastUsedAt: number | null; lastTestedAt: number | null;
+  id: string;
+  providerId: string;
+  label: string;
+  secretRef: string;
+  secretHint: string | null;
+  status: string;
+  priority: number;
+  cooldownUntil: number | null;
+  addedAt: number;
+  lastUsedAt: number | null;
+  lastTestedAt: number | null;
 }
 export interface HostModelRow {
-  providerId: string; nativeId: string; modality: string; contextWindow: number | null; fetchedAt: number;
-  pricingJson: string | null; capabilitiesJson: string | null;
+  providerId: string;
+  nativeId: string;
+  modality: string;
+  contextWindow: number | null;
+  fetchedAt: number;
+  pricingJson: string | null;
+  capabilitiesJson: string | null;
   /**
    * `discovered` or `manual`. Optional because it arrives from the host, and a stale host that
    * predates the column must not empty the whole catalog — a row with no origin is a discovered
@@ -104,7 +125,9 @@ export interface HostModelRow {
  * Capabilities come back as a JSON string. Unknown stays unknown — never assumed either way,
  * because a client acts on this flag.
  */
-function parseCapabilitiesJson(v: string | null | undefined): { reasoning?: boolean; vision?: boolean } | undefined {
+function parseCapabilitiesJson(
+  v: string | null | undefined,
+): { reasoning?: boolean; vision?: boolean } | undefined {
   if (!v) return undefined;
   try {
     return JSON.parse(v) as { reasoning?: boolean };
@@ -114,27 +137,51 @@ function parseCapabilitiesJson(v: string | null | undefined): { reasoning?: bool
 }
 
 /** Pricing comes back as a string; a row that fails to parse is unknown, never free. */
-function parsePricingJson(v: string | null | undefined): PricingMicros | undefined {
+function parsePricingJson(
+  v: string | null | undefined,
+): PricingMicros | undefined {
   if (!v) return undefined;
   try {
     const p = JSON.parse(v) as PricingMicros;
-    return typeof p?.prompt === "number" && typeof p?.completion === "number" ? p : undefined;
+    return typeof p?.prompt === "number" && typeof p?.completion === "number"
+      ? p
+      : undefined;
   } catch {
     return undefined;
   }
 }
 export interface HostManifestRow {
-  id: string; providerId: string; version: number; origin: string; bodyJson: string;
-  contractResultJson: string | null; createdAt: number; isActive: boolean;
+  id: string;
+  providerId: string;
+  version: number;
+  origin: string;
+  bodyJson: string;
+  contractResultJson: string | null;
+  createdAt: number;
+  isActive: boolean;
 }
 export interface HostAliasRow {
-  alias: string; providerId: string; nativeModelId: string; priority: number;
+  alias: string;
+  providerId: string;
+  nativeModelId: string;
+  priority: number;
 }
 export interface HostLedgerRow {
-  ts: number; modality: string; source: string; providerId: string | null; keyId: string | null;
-  requestedModel: string | null; model: string; status: string; httpStatus: number | null;
-  errorClass: string | null; latencyMs: number | null; tokensIn: number; tokensOut: number;
-  costEstimateMicros: number; fallbackChainJson: string | null;
+  ts: number;
+  modality: string;
+  source: string;
+  providerId: string | null;
+  keyId: string | null;
+  requestedModel: string | null;
+  model: string;
+  status: string;
+  httpStatus: number | null;
+  errorClass: string | null;
+  latencyMs: number | null;
+  tokensIn: number;
+  tokensOut: number;
+  costEstimateMicros: number;
+  fallbackChainJson: string | null;
   /** Null when the provider reported no cache block — not the same as a reported zero (0015). */
   cachedTokens: number | null;
   /**
@@ -151,7 +198,9 @@ const vault = createKeyVaultPort();
 const http = createHttpPort();
 
 export const registry = new ProviderRegistry(vault);
-export const adapters = new AdapterRuntime(http, { appUrl: "https://aiprovider.router" });
+export const adapters = new AdapterRuntime(http, {
+  appUrl: "https://aiprovider.router",
+});
 export const ledger = new UsageLedger({
   async append(e: LedgerEntry) {
     // `POST /admin/ledger` takes the row itself. The IPC command's `{ e }` wrapper was
@@ -181,14 +230,16 @@ export const ledger = new UsageLedger({
       // measurement can tell "not reported" apart from "reported zero".
       cachedTokens: e.cachedTokens ?? null,
       fallbackChainJson: e.fallbackChain
-        ? JSON.stringify(e.fallbackChain.map((a) => ({
-            provider: a.candidate.provider.slug,
-            key: a.candidate.key.label,
-            cls: a.cls,
-            // the provider's own words for the refusal, when it gave any — Activity quotes them
-            // so a 400 content-policy block reads "content-blocked", not "schema"
-            ...(a.reason ? { reason: a.reason } : {}),
-          })))
+        ? JSON.stringify(
+            e.fallbackChain.map((a) => ({
+              provider: a.candidate.provider.slug,
+              key: a.candidate.key.label,
+              cls: a.cls,
+              // the provider's own words for the refusal, when it gave any — Activity quotes them
+              // so a 400 content-policy block reads "content-blocked", not "schema"
+              ...(a.reason ? { reason: a.reason } : {}),
+            })),
+          )
         : null,
       // Bounded evidence for a failure the class label cannot explain (migration 0021). This field
       // was missing here for the whole life of the column: the engine set it, the Rust row accepts
@@ -220,7 +271,11 @@ export const router = new ModelRouter(registry, adapters, catalog, ledger);
  * it: `approveRepair` is the one that does, because "repaired" beside a row still reading "Open" is
  * a contradiction the operator can see on one screen.
  */
-async function writeTrail(trail: TrailId, cmd: string, args: Record<string, unknown>): Promise<boolean> {
+async function writeTrail(
+  trail: TrailId,
+  cmd: string,
+  args: Record<string, unknown>,
+): Promise<boolean> {
   try {
     await invoke(cmd, args);
     return true;
@@ -260,9 +315,16 @@ export async function recordGeneratorAudit(a: {
 }
 
 /** Providers currently in repair flow: id -> evidence + plan (UI subscribes via useUi tick). */
-export const pendingRepairs = new Map<string, { evidence: DriftEvidence; plan?: RepairPlan; error?: string }>();
+export const pendingRepairs = new Map<
+  string,
+  { evidence: DriftEvidence; plan?: RepairPlan; error?: string }
+>();
 
-const requestTimes: { requestedModel: string; providerId: string; ts: number }[] = [];
+const requestTimes: {
+  requestedModel: string;
+  providerId: string;
+  ts: number;
+}[] = [];
 
 export const driftMonitor = new DriftMonitor({
   succeededElsewhere: (requestedModel, excludeProviderId) => {
@@ -270,10 +332,19 @@ export const driftMonitor = new DriftMonitor({
     const now = Date.now();
     return ledger
       .query({ since: now - 60 * 60_000 })
-      .some((e) => e.status === "ok" && e.requestedModel === requestedModel && e.providerId && e.providerId !== excludeProviderId);
+      .some(
+        (e) =>
+          e.status === "ok" &&
+          e.requestedModel === requestedModel &&
+          e.providerId &&
+          e.providerId !== excludeProviderId,
+      );
   },
   onTrigger: (e) => {
-    void writeTrail("drift", "drift_event_record", { providerId: e.providerId, triggerJson: JSON.stringify(e) });
+    void writeTrail("drift", "drift_event_record", {
+      providerId: e.providerId,
+      triggerJson: JSON.stringify(e),
+    });
     // mark repairing (failover keeps serving) and open the plan in the background
     void setProviderStatus(e.providerId, "repairing").catch(() => undefined);
     void buildRepairPlan(e).catch(() => undefined);
@@ -284,12 +355,19 @@ export const driftMonitor = new DriftMonitor({
 router.onAttempt = (a) => {
   driftMonitor.observe(a);
   if (a.cls === "OK") {
-    requestTimes.push({ requestedModel: a.requestedModel, providerId: a.providerId, ts: a.ts });
-    if (requestTimes.length > 2000) requestTimes.splice(0, requestTimes.length - 2000);
+    requestTimes.push({
+      requestedModel: a.requestedModel,
+      providerId: a.providerId,
+      ts: a.ts,
+    });
+    if (requestTimes.length > 2000)
+      requestTimes.splice(0, requestTimes.length - 2000);
   }
 };
 
-export async function buildRepairPlan(evidence: DriftEvidence): Promise<RepairPlan | undefined> {
+export async function buildRepairPlan(
+  evidence: DriftEvidence,
+): Promise<RepairPlan | undefined> {
   const provider = registry.getProvider(evidence.providerId);
   if (!provider) return undefined;
   const entry = { evidence };
@@ -312,10 +390,15 @@ export async function buildRepairPlan(evidence: DriftEvidence): Promise<RepairPl
     const { adapter } = await adapters.forProvider(provider.id);
     const secretRef = registry.keysOf(provider.id)[0]?.secretRef;
     if (!secretRef) throw new Error(`no key to probe ${provider.name} with`);
-    const otherHealthy = registry.listProviders().filter((p) => p.id !== provider.id && p.status === "enabled").length;
+    const otherHealthy = registry
+      .listProviders()
+      .filter((p) => p.id !== provider.id && p.status === "enabled").length;
     // free re-checks produce the failing-assertions context for the AI patch prompt
     const { runContractSuite } = await import("@aiprovider/router-core");
-    const contract = await runContractSuite(adapter, { secretRef, consent: { text: false, image: false } });
+    const contract = await runContractSuite(adapter, {
+      secretRef,
+      consent: { text: false, image: false },
+    });
     const plan = await new RepairOrchestrator({
       http,
       // A1 Phase 3: the repair AI is a gateway client at the System AI model — the TS engine
@@ -324,7 +407,12 @@ export async function buildRepairPlan(evidence: DriftEvidence): Promise<RepairPl
       systemLabel: routerSettingsLabel(),
       currentManifest: adapter.manifest,
       currentVersion: 1,
-      provider: { id: provider.id, slug: provider.slug, name: provider.name, baseUrl: provider.baseUrl },
+      provider: {
+        id: provider.id,
+        slug: provider.slug,
+        name: provider.name,
+        baseUrl: provider.baseUrl,
+      },
       secretRef,
       otherHealthyProviders: otherHealthy,
       failingChecks: contract.checks.filter((c) => !c.pass),
@@ -335,7 +423,10 @@ export async function buildRepairPlan(evidence: DriftEvidence): Promise<RepairPl
     pendingRepairs.set(provider.id, { ...entry, plan });
     return plan;
   } catch (err) {
-    pendingRepairs.set(provider.id, { ...entry, error: String((err as Error).message) });
+    pendingRepairs.set(provider.id, {
+      ...entry,
+      error: String((err as Error).message),
+    });
     return undefined;
   }
 }
@@ -368,9 +459,13 @@ export function routerSettingsLabel(): string {
  */
 export async function approveRepair(
   providerId: string,
-): Promise<{ version: number; previous: number | null; resolveRecorded: boolean } | undefined> {
+): Promise<
+  | { version: number; previous: number | null; resolveRecorded: boolean }
+  | undefined
+> {
   const entry = pendingRepairs.get(providerId);
-  const manifest = entry?.plan?.candidate?.manifest ?? entry?.plan?.deterministic;
+  const manifest =
+    entry?.plan?.candidate?.manifest ?? entry?.plan?.deterministic;
   if (!manifest || !entry) return undefined;
   const origin = entry.plan?.candidate ? "ai-patched" : "builtin-template";
   // `POST /admin/manifests/stage` takes the row itself, not the IPC command's `{ m }` wrapper, and
@@ -378,16 +473,27 @@ export async function approveRepair(
   // than chosen here.
   const { version } = expectShape(
     await fetchAdmin("POST", "/admin/manifests/stage", {
-      id: crypto.randomUUID(), providerId, version: 0, origin,
-      bodyJson: JSON.stringify({ ...manifest, provenance: { ...manifest.provenance, origin } }),
-      contractResultJson: JSON.stringify(entry.plan?.candidate?.contract ?? null),
-      createdAt: Date.now(), isActive: false,
+      id: crypto.randomUUID(),
+      providerId,
+      version: 0,
+      origin,
+      bodyJson: JSON.stringify({
+        ...manifest,
+        provenance: { ...manifest.provenance, origin },
+      }),
+      contractResultJson: JSON.stringify(
+        entry.plan?.candidate?.contract ?? null,
+      ),
+      createdAt: Date.now(),
+      isActive: false,
     }),
     isVersioned,
     "POST /admin/manifests/stage",
   );
   const activated = expectShape(
-    await fetchAdmin("POST", `/admin/manifests/${providerId}/activate`, { version }),
+    await fetchAdmin("POST", `/admin/manifests/${providerId}/activate`, {
+      version,
+    }),
     isActivation,
     `POST /admin/manifests/${providerId}/activate`,
   );
@@ -405,13 +511,25 @@ export async function approveRepair(
   return { version, previous, resolveRecorded };
 }
 
-export async function rollbackManifest(providerId: string, version: number): Promise<void> {
-  await fetchAdmin("POST", `/admin/manifests/${providerId}/activate`, { version });
-  const rows = await fetchAdminAs("GET", "/admin/manifests", arrayOf(isHostManifestRow));
+export async function rollbackManifest(
+  providerId: string,
+  version: number,
+): Promise<void> {
+  await fetchAdmin("POST", `/admin/manifests/${providerId}/activate`, {
+    version,
+  });
+  const rows = await fetchAdminAs(
+    "GET",
+    "/admin/manifests",
+    arrayOf(isHostManifestRow),
+  );
   const row = rows.find((r) => r.providerId === providerId);
   if (row) {
     try {
-      adapters.register(providerId, JSON.parse(row.bodyJson) as AdapterManifest);
+      adapters.register(
+        providerId,
+        JSON.parse(row.bodyJson) as AdapterManifest,
+      );
     } catch {
       // A corrupt manifest leaves the provider unregistered rather than throwing out of a
       // rollback. This is the guarded twin of the register in `loadManifests` (audit M3).
@@ -419,7 +537,9 @@ export async function rollbackManifest(providerId: string, version: number): Pro
   }
 }
 
-export async function listManifestHistory(providerId: string): Promise<HostManifestRow[]> {
+export async function listManifestHistory(
+  providerId: string,
+): Promise<HostManifestRow[]> {
   // `encodeURIComponent`: the provider id is a path segment here, and a slug with a `/` in it would
   // otherwise address a different route entirely rather than failing.
   return await fetchAdminAs(
@@ -490,14 +610,15 @@ async function runBootstrap(): Promise<void> {
   let aliases: HostAliasRow[];
   let routerSettings: Record<string, unknown>;
   try {
-    [providers, keys, models, manifests, aliases, routerSettings] = await Promise.all([
-      fetchAdminAs("GET", "/admin/providers", arrayOf(isHostProviderRow)),
-      fetchAdminAs("GET", "/admin/api-keys", arrayOf(isHostKeyRow)),
-      fetchAdminAs("GET", "/admin/models-cache", arrayOf(isHostModelRow)),
-      fetchAdminAs("GET", "/admin/manifests", arrayOf(isHostManifestRow)),
-      fetchAdminAs("GET", "/admin/aliases", arrayOf(isHostAliasRow)),
-      fetchAdminAs("GET", "/admin/settings/router", isObj),
-    ]);
+    [providers, keys, models, manifests, aliases, routerSettings] =
+      await Promise.all([
+        fetchAdminAs("GET", "/admin/providers", arrayOf(isHostProviderRow)),
+        fetchAdminAs("GET", "/admin/api-keys", arrayOf(isHostKeyRow)),
+        fetchAdminAs("GET", "/admin/models-cache", arrayOf(isHostModelRow)),
+        fetchAdminAs("GET", "/admin/manifests", arrayOf(isHostManifestRow)),
+        fetchAdminAs("GET", "/admin/aliases", arrayOf(isHostAliasRow)),
+        fetchAdminAs("GET", "/admin/settings/router", isObj),
+      ]);
   } catch (e) {
     // The gateway is a listener this app can start, not a precondition for opening it, so an
     // unreachable surface degrades: the shell renders and `bootDegradedReason` names the cause.
@@ -517,18 +638,25 @@ async function runBootstrap(): Promise<void> {
   registry.hydrate(providers.map(hostToProvider), keys.map(hostToKey));
 
   const fetchedByProvider: Record<string, number> = {};
-  for (const m of models) fetchedByProvider[m.providerId] = Math.max(fetchedByProvider[m.providerId] ?? 0, m.fetchedAt);
+  for (const m of models)
+    fetchedByProvider[m.providerId] = Math.max(
+      fetchedByProvider[m.providerId] ?? 0,
+      m.fetchedAt,
+    );
   // A model whose modality this build does not understand is left out, not routed as text. The
   // assertion that used to sit here let an unknown value through wearing a known type, where it
   // then matched neither modality in the router (audit M8).
   const classifiable = models.filter(
-    (m): m is HostModelRow & { modality: CatalogModel["modality"] } => isModality(m.modality),
+    (m): m is HostModelRow & { modality: CatalogModel["modality"] } =>
+      isModality(m.modality),
   );
   catalog.hydrate(
     classifiable.map((m) => ({
-      providerId: m.providerId, nativeId: m.nativeId,
+      providerId: m.providerId,
+      nativeId: m.nativeId,
       modality: m.modality,
-      contextWindow: m.contextWindow ?? undefined, fetchedAt: m.fetchedAt,
+      contextWindow: m.contextWindow ?? undefined,
+      fetchedAt: m.fetchedAt,
       pricing: parsePricingJson(m.pricingJson),
       supportsReasoning: parseCapabilitiesJson(m.capabilitiesJson)?.reasoning,
       // Same column, second fact. Vision gates the composer's image attach, and `undefined` stays
@@ -536,7 +664,8 @@ async function runBootstrap(): Promise<void> {
       supportsVision: parseCapabilitiesJson(m.capabilitiesJson)?.vision,
       // Carried through, not defaulted: a manual row that hydrated as `discovered` would be
       // deleted by the next refresh, which is the exact loss this column exists to prevent.
-      origin: m.origin === "manual" ? ("manual" as const) : ("discovered" as const),
+      origin:
+        m.origin === "manual" ? ("manual" as const) : ("discovered" as const),
     })),
     fetchedByProvider,
   );
@@ -595,7 +724,10 @@ async function runBootstrap(): Promise<void> {
   // `deleteProvider` learned to clear it). Hydration is the one moment the registry and the
   // setting are both in hand, so the dangle is repaired here and persisted — otherwise every
   // generation audit keeps recording an unattributable "unknown-provider" label forever.
-  if (router.settings.systemAi && !registry.getProvider(router.settings.systemAi.providerId)) {
+  if (
+    router.settings.systemAi &&
+    !registry.getProvider(router.settings.systemAi.providerId)
+  ) {
     router.settings.systemAi = null;
     persistRouterSettings();
   }
@@ -627,7 +759,10 @@ async function refreshFromHost(): Promise<void> {
 async function refreshStaleCatalogs(): Promise<void> {
   const providers = registry.listProviders();
   const stale = providers.filter(
-    (p) => p.status === "enabled" && registry.keysOf(p.id).some((k) => k.status === "active") && catalog.isStale(p.id),
+    (p) =>
+      p.status === "enabled" &&
+      registry.keysOf(p.id).some((k) => k.status === "active") &&
+      catalog.isStale(p.id),
   );
   for (const p of stale) {
     await refreshCatalog(p.id).catch(() => undefined);
@@ -646,27 +781,45 @@ async function persistAliases(): Promise<void> {
   //
   // Found by the browser harness: the wrapper made this a 422, and because `persistAliases` runs in
   // the boot path, the app came up with "App data could not be opened" — no screen rendered at all.
-  await fetchAdmin("POST", "/admin/aliases", catalog.aliases.map((a) => ({
-    alias: a.alias, providerId: a.providerId, nativeModelId: a.nativeModelId, priority: a.priority,
-  })));
+  await fetchAdmin(
+    "POST",
+    "/admin/aliases",
+    catalog.aliases.map((a) => ({
+      alias: a.alias,
+      providerId: a.providerId,
+      nativeModelId: a.nativeModelId,
+      priority: a.priority,
+    })),
+  );
 }
-
 
 function hostToProvider(p: HostProviderRow): ProviderRecord {
   return {
-    id: p.id, slug: p.slug, name: p.name, type: (p.type ?? "manifest") as ProviderRecord["type"],
-    baseUrl: p.baseUrl, status: p.status as ProviderRecord["status"],
+    id: p.id,
+    slug: p.slug,
+    name: p.name,
+    type: (p.type ?? "manifest") as ProviderRecord["type"],
+    baseUrl: p.baseUrl,
+    status: p.status as ProviderRecord["status"],
     rotationStrategy: p.rotationStrategy as ProviderRecord["rotationStrategy"],
-    createdAt: p.createdAt, updatedAt: p.updatedAt,
+    createdAt: p.createdAt,
+    updatedAt: p.updatedAt,
   };
 }
 
 function hostToKey(k: HostKeyRow): ApiKeyRecord {
   return {
-    id: k.id, providerId: k.providerId, label: k.label, secretRef: k.secretRef,
-    secretHint: k.secretHint ?? undefined, status: k.status as ApiKeyRecord["status"],
-    priority: k.priority, cooldownUntil: k.cooldownUntil, addedAt: k.addedAt,
-    lastUsedAt: k.lastUsedAt, lastTestedAt: k.lastTestedAt,
+    id: k.id,
+    providerId: k.providerId,
+    label: k.label,
+    secretRef: k.secretRef,
+    secretHint: k.secretHint ?? undefined,
+    status: k.status as ApiKeyRecord["status"],
+    priority: k.priority,
+    cooldownUntil: k.cooldownUntil,
+    addedAt: k.addedAt,
+    lastUsedAt: k.lastUsedAt,
+    lastTestedAt: k.lastTestedAt,
   };
 }
 
@@ -676,9 +829,16 @@ function providerToHost(r: ProviderRecord): HostProviderRow {
 
 function keyToHost(r: ApiKeyRecord): HostKeyRow {
   return {
-    id: r.id, providerId: r.providerId, label: r.label, secretRef: r.secretRef,
-    secretHint: r.secretHint ?? null, status: r.status, priority: r.priority,
-    cooldownUntil: r.cooldownUntil, addedAt: r.addedAt, lastUsedAt: r.lastUsedAt,
+    id: r.id,
+    providerId: r.providerId,
+    label: r.label,
+    secretRef: r.secretRef,
+    secretHint: r.secretHint ?? null,
+    status: r.status,
+    priority: r.priority,
+    cooldownUntil: r.cooldownUntil,
+    addedAt: r.addedAt,
+    lastUsedAt: r.lastUsedAt,
     lastTestedAt: r.lastTestedAt,
   };
 }
@@ -693,23 +853,35 @@ export async function addProvider(input: {
   manifest: AdapterManifest;
 }): Promise<ProviderRecord> {
   if (registry.providerBySlug(input.slug)) {
-    throw new Error(`a provider with slug "${input.slug}" already exists — remove it first`);
+    throw new Error(
+      `a provider with slug "${input.slug}" already exists — remove it first`,
+    );
   }
   const p = registry.addProvider({
-    id: crypto.randomUUID(), slug: input.slug, name: input.name, type: input.type,
-    baseUrl: input.baseUrl, status: "draft", rotationStrategy: "round_robin",
+    id: crypto.randomUUID(),
+    slug: input.slug,
+    name: input.name,
+    type: input.type,
+    baseUrl: input.baseUrl,
+    status: "draft",
+    rotationStrategy: "round_robin",
   });
   try {
     await fetchAdmin("POST", "/admin/providers", providerToHost(p));
     adapters.register(p.id, input.manifest);
     await fetchAdmin("POST", "/admin/manifests", {
-      id: crypto.randomUUID(), providerId: p.id, version: 1,
+      id: crypto.randomUUID(),
+      providerId: p.id,
+      version: 1,
       // The manifest's OWN provenance, not a constant. Hardcoded `"builtin-template"` here made
       // every hand-added provider's row claim it came from a builtin template while its body said
       // `user-edited` — measured 2026-09-26, both spellings on one row. The row is what the drift
       // register and the history view read, so the lie was the durable half.
       origin: input.manifest.provenance.origin,
-      bodyJson: JSON.stringify(input.manifest), contractResultJson: null, createdAt: Date.now(), isActive: true,
+      bodyJson: JSON.stringify(input.manifest),
+      contractResultJson: null,
+      createdAt: Date.now(),
+      isActive: true,
     });
     return p;
   } catch (e) {
@@ -721,13 +893,19 @@ export async function addProvider(input: {
   }
 }
 
-export async function setProviderStatus(id: string, status: ProviderRecord["status"]): Promise<void> {
+export async function setProviderStatus(
+  id: string,
+  status: ProviderRecord["status"],
+): Promise<void> {
   registry.setProviderStatus(id, status);
   const p = registry.getProvider(id);
   if (p) await fetchAdmin("POST", "/admin/providers", providerToHost(p)); // syncs allowlist host-side
 }
 
-export async function setProviderRotation(id: string, rotationStrategy: ProviderRecord["rotationStrategy"]): Promise<void> {
+export async function setProviderRotation(
+  id: string,
+  rotationStrategy: ProviderRecord["rotationStrategy"],
+): Promise<void> {
   registry.setProviderRotation(id, rotationStrategy);
   const p = registry.getProvider(id);
   if (p) await fetchAdmin("POST", "/admin/providers", providerToHost(p));
@@ -771,7 +949,10 @@ export async function deleteProvider(id: string): Promise<void> {
  * (invariant 6). Four characters can collide by chance, so this is a *warning*, never a block:
  * the operator sees "same last 4" and decides.
  */
-export function duplicateKeyHintExists(providerId: string, secret: string): boolean {
+export function duplicateKeyHintExists(
+  providerId: string,
+  secret: string,
+): boolean {
   const hint = secret.trim().slice(-4);
   if (hint.length < 4) return false;
   return registry.keysOf(providerId).some((k) => k.secretHint === hint);
@@ -794,7 +975,11 @@ export function nextKeyLabel(providerId: string): string {
   return `key-${String(next).padStart(2, "0")}`;
 }
 
-export async function addKey(providerId: string, label: string, secret: string): Promise<ApiKeyRecord> {
+export async function addKey(
+  providerId: string,
+  label: string,
+  secret: string,
+): Promise<ApiKeyRecord> {
   const provider = registry.getProvider(providerId);
   const k = await registry.addKey({ providerId, label, secret });
   try {
@@ -805,7 +990,8 @@ export async function addKey(providerId: string, label: string, secret: string):
   }
   // draft providers aren't host-allowlisted (invariant 3); the first key promotes to
   // pending so Test works immediately.
-  if (provider?.status === "draft") await setProviderStatus(providerId, "pending");
+  if (provider?.status === "draft")
+    await setProviderStatus(providerId, "pending");
   return k;
 }
 
@@ -814,7 +1000,10 @@ export async function deleteKey(id: string): Promise<void> {
   await refreshFromHost();
 }
 
-export async function setKeyStatus(id: string, status: ApiKeyRecord["status"]): Promise<void> {
+export async function setKeyStatus(
+  id: string,
+  status: ApiKeyRecord["status"],
+): Promise<void> {
   registry.updateKey(id, { status });
   const k = registry.getKey(id);
   if (k) await fetchAdmin("POST", "/admin/api-keys", keyToHost(k));
@@ -828,13 +1017,17 @@ export async function setKeyStatus(id: string, status: ApiKeyRecord["status"]): 
  * working key out of service — which is what this used to do. `lastTestedAt` is recorded either
  * way, so even an inconclusive test leaves a trace of when it was tried.
  */
-export async function testKey(keyId: string): Promise<PingResult & { verdict: KeyVerdict }> {
+export async function testKey(
+  keyId: string,
+): Promise<PingResult & { verdict: KeyVerdict }> {
   const k = registry.getKey(keyId);
   if (!k) throw new Error(`unknown key ${keyId}`);
   const { adapter } = await adapters.forProvider(k.providerId);
   const res = await adapter.pingKey(k.secretRef);
   const verdict = verdictFor(res);
-  const patch: Parameters<typeof registry.updateKey>[1] = { lastTestedAt: Date.now() };
+  const patch: Parameters<typeof registry.updateKey>[1] = {
+    lastTestedAt: Date.now(),
+  };
   if (isConclusive(verdict)) patch.status = verdict;
   registry.updateKey(keyId, patch);
   const fresh = registry.getKey(keyId);
@@ -860,13 +1053,27 @@ export async function publishModelContext(): Promise<number> {
     .map((m) => {
       const slug = registry.getProvider(m.providerId)?.slug;
       return slug
-        ? { model_key: `${slug}/${m.nativeId}`, context_window: m.contextWindow!, chars_per_token: null }
+        ? {
+            model_key: `${slug}/${m.nativeId}`,
+            context_window: m.contextWindow!,
+            chars_per_token: null,
+          }
         : null;
     })
-    .filter((r): r is { model_key: string; context_window: number; chars_per_token: null } => r !== null);
+    .filter(
+      (
+        r,
+      ): r is {
+        model_key: string;
+        context_window: number;
+        chars_per_token: null;
+      } => r !== null,
+    );
   if (rows.length === 0) return 0;
   // Best-effort: a budget planned against the default is a worse answer, not a failed refresh.
-  return invoke<number>("router_model_context_replace", { rows }).catch(() => 0);
+  return invoke<number>("router_model_context_replace", { rows }).catch(
+    () => 0,
+  );
 }
 
 /** How many models the gateway can plan a budget against. Zero means every request uses the default. */
@@ -886,8 +1093,11 @@ function catalogRowsFor(providerId: string) {
     .all()
     .filter((m) => m.providerId === providerId)
     .map((m) => ({
-      providerId: m.providerId, nativeId: m.nativeId, modality: m.modality,
-      contextWindow: m.contextWindow ?? null, fetchedAt: m.fetchedAt,
+      providerId: m.providerId,
+      nativeId: m.nativeId,
+      modality: m.modality,
+      contextWindow: m.contextWindow ?? null,
+      fetchedAt: m.fetchedAt,
       // Persisted alongside the row: the catalog is fetched once per 24h, so a launch that
       // only hydrates would otherwise price every request as unknown — and would have no idea
       // what the model can do.
@@ -897,7 +1107,10 @@ function catalogRowsFor(providerId: string) {
       capabilitiesJson:
         m.supportsReasoning === undefined && m.supportsVision === undefined
           ? null
-          : JSON.stringify({ reasoning: m.supportsReasoning, vision: m.supportsVision }),
+          : JSON.stringify({
+              reasoning: m.supportsReasoning,
+              vision: m.supportsVision,
+            }),
       origin: m.origin === "manual" ? "manual" : "discovered",
     }));
 }
@@ -922,7 +1135,10 @@ export async function persistCatalog(providerId: string): Promise<void> {
   void publishModelContext();
 }
 
-export async function refreshCatalog(providerId: string, signal?: AbortSignal): Promise<number> {
+export async function refreshCatalog(
+  providerId: string,
+  signal?: AbortSignal,
+): Promise<number> {
   const n = await catalog.refreshProvider(providerId, signal);
   await persistCatalog(providerId);
   return n;
@@ -964,7 +1180,10 @@ export async function setModelVision(
 }
 
 /** Remove a hand-added model. Never touches a discovered row. */
-export async function removeManualModel(providerId: string, nativeId: string): Promise<boolean> {
+export async function removeManualModel(
+  providerId: string,
+  nativeId: string,
+): Promise<boolean> {
   const removed = catalog.removeManual(providerId, nativeId);
   if (removed) await persistCatalog(providerId);
   return removed;
@@ -1002,7 +1221,9 @@ export async function testModel(
 ): Promise<ModelTestResult> {
   const keys = registry.keysOf(providerId).filter((k) => k.status === "active");
   if (keys.length === 0) {
-    throw new Error("this provider has no active key — add and enable one first");
+    throw new Error(
+      "this provider has no active key — add and enable one first",
+    );
   }
   const { adapter } = await adapters.forProvider(providerId);
   const t0 = Date.now();
@@ -1034,7 +1255,12 @@ export async function testModel(
           message: `${nativeId} answered with an empty response — the request succeeded but no content came back`,
         };
       }
-      return { ok: true, ms, message: `${nativeId} replied in ${ms} ms`, preview: text.slice(0, 120) };
+      return {
+        ok: true,
+        ms,
+        message: `${nativeId} replied in ${ms} ms`,
+        preview: text.slice(0, 120),
+      };
     } catch (e) {
       lastErr = e;
       // Try the provider's next active key before concluding: a single cooled or revoked key is
@@ -1079,13 +1305,20 @@ export async function updateProvider(input: {
 
   if (input.manifest) {
     adapters.register(input.id, input.manifest);
-    const history = await listManifestHistory(input.id).catch(() => [] as HostManifestRow[]);
-    const nextVersion = history.reduce((max, h) => Math.max(max, h.version), 0) + 1;
+    const history = await listManifestHistory(input.id).catch(
+      () => [] as HostManifestRow[],
+    );
+    const nextVersion =
+      history.reduce((max, h) => Math.max(max, h.version), 0) + 1;
     await fetchAdmin("POST", "/admin/manifests", {
-      id: crypto.randomUUID(), providerId: input.id, version: nextVersion,
+      id: crypto.randomUUID(),
+      providerId: input.id,
+      version: nextVersion,
       origin: input.manifest.provenance.origin,
-      bodyJson: JSON.stringify(input.manifest), contractResultJson: null,
-      createdAt: Date.now(), isActive: true,
+      bodyJson: JSON.stringify(input.manifest),
+      contractResultJson: null,
+      createdAt: Date.now(),
+      isActive: true,
     });
   }
   return fresh;
@@ -1099,7 +1332,11 @@ export interface WorkbuddyStatus {
   clientPresent: boolean;
 }
 export interface WorkbuddySyncResult {
-  path: string; endpoint: string; models: string[]; updated: number; removed: number;
+  path: string;
+  endpoint: string;
+  models: string[];
+  updated: number;
+  removed: number;
   note: string | null;
 }
 
@@ -1111,7 +1348,9 @@ export async function workbuddyStatus(): Promise<WorkbuddyStatus> {
  * Publish exactly these models to the client and rewrite its config now. Ids are native ids,
  * which is what the client sends and what the router resolves.
  */
-export async function workbuddySetModels(models: string[]): Promise<WorkbuddySyncResult> {
+export async function workbuddySetModels(
+  models: string[],
+): Promise<WorkbuddySyncResult> {
   return invoke<WorkbuddySyncResult>("workbuddy_set_models", { models });
 }
 
@@ -1120,7 +1359,9 @@ export function persistRouterSettings(): void {
   // into the row, so a key another writer added between this call and the write survives. The
   // `catch` is not decoration — nothing awaits this, so a rejection would surface as an unhandled
   // promise rather than anywhere useful.
-  void fetchAdmin("POST", "/admin/settings/router", router.settings).catch(() => undefined);
+  void fetchAdmin("POST", "/admin/settings/router", router.settings).catch(
+    () => undefined,
+  );
 }
 
 export function listLedger(): LedgerEntry[] {
@@ -1134,7 +1375,11 @@ export function getHttpPort() {
 
 /** Unique slug from a provider name ("My Provider!" -> my-provider, my-provider-2, …). */
 export function uniqueSlug(name: string): string {
-  const base = name.toLowerCase().replace(/\W+/g, "-").replace(/^-+|-+$/g, "") || "provider";
+  const base =
+    name
+      .toLowerCase()
+      .replace(/\W+/g, "-")
+      .replace(/^-+|-+$/g, "") || "provider";
   let slug = base;
   let n = 2;
   while (registry.providerBySlug(slug)) slug = `${base}-${n++}`;
@@ -1143,11 +1388,19 @@ export function uniqueSlug(name: string): string {
 
 /** Wizard step 1: create the provider row as `pending` (allowlisted host-side) so probes
  *  can reach it. Registration of manifest/catalog happens after the contract suite. */
-export async function createPendingProvider(name: string, baseUrl: string): Promise<string> {
+export async function createPendingProvider(
+  name: string,
+  baseUrl: string,
+): Promise<string> {
   const slug = uniqueSlug(name);
   const p = registry.addProvider({
-    id: crypto.randomUUID(), slug, name, type: "manifest",
-    baseUrl, status: "pending", rotationStrategy: "round_robin",
+    id: crypto.randomUUID(),
+    slug,
+    name,
+    type: "manifest",
+    baseUrl,
+    status: "pending",
+    rotationStrategy: "round_robin",
   });
   try {
     await fetchAdmin("POST", "/admin/providers", providerToHost(p));
@@ -1171,7 +1424,11 @@ export async function createPendingProvider(name: string, baseUrl: string): Prom
 }
 
 export async function loadRecentLedger(): Promise<HostLedgerRow[]> {
-  return fetchAdminAs("GET", "/admin/ledger?limit=200", arrayOf(isHostLedgerRow));
+  return fetchAdminAs(
+    "GET",
+    "/admin/ledger?limit=200",
+    arrayOf(isHostLedgerRow),
+  );
 }
 
 // ---------- P4: context graph ----------
@@ -1190,7 +1447,9 @@ export async function recordContext(
   await fetchAdmin("POST", "/admin/context", { nodes, edges });
 }
 
-export async function loadContextGraph(limit = 400): Promise<{ nodes: HostContextNode[]; edges: HostContextEdge[] }> {
+export async function loadContextGraph(
+  limit = 400,
+): Promise<{ nodes: HostContextNode[]; edges: HostContextEdge[] }> {
   return fetchAdminAs("GET", `/admin/context?limit=${limit}`, isContextGraph);
 }
 
@@ -1236,15 +1495,22 @@ export interface HistoryTimeline {
   entries: TimelineEntry[];
 }
 
-export async function loadHistorySessions(limit = 100): Promise<HistorySession[]> {
+export async function loadHistorySessions(
+  limit = 100,
+): Promise<HistorySession[]> {
   return invoke<HistorySession[]>("history_sessions", { limit });
 }
 
-export async function loadHistoryTimeline(sessionId: string): Promise<HistoryTimeline> {
+export async function loadHistoryTimeline(
+  sessionId: string,
+): Promise<HistoryTimeline> {
   return invoke<HistoryTimeline>("history_timeline", { sessionId });
 }
 
-export async function setSessionTitle(sessionId: string, title: string): Promise<void> {
+export async function setSessionTitle(
+  sessionId: string,
+  title: string,
+): Promise<void> {
   return invoke("history_rename_session", { sessionId, title });
 }
 
@@ -1260,12 +1526,16 @@ export interface HistoryRetentionCounts {
 }
 
 /** What a prune would remove. `days === 0` means retention is off. */
-export async function historyRetentionPreview(days: number): Promise<HistoryRetentionCounts> {
+export async function historyRetentionPreview(
+  days: number,
+): Promise<HistoryRetentionCounts> {
   return invoke<HistoryRetentionCounts>("history_retention_preview", { days });
 }
 
 /** Delete sessions inactive for `days`. Manual and opt-in; the UI previews first. */
-export async function historyRetentionPrune(days: number): Promise<HistoryRetentionCounts> {
+export async function historyRetentionPrune(
+  days: number,
+): Promise<HistoryRetentionCounts> {
   return invoke<HistoryRetentionCounts>("history_retention_prune", { days });
 }
 
@@ -1302,7 +1572,9 @@ export interface SessionMessageRow {
  * Append one turn's messages. Batched deliberately: a turn is a unit, and a half-written turn
  * replays a `tool_calls` array with no results, which every provider rejects.
  */
-export async function transcriptAppend(rows: SessionMessageRow[]): Promise<void> {
+export async function transcriptAppend(
+  rows: SessionMessageRow[],
+): Promise<void> {
   await invoke("transcript_append", { rows });
 }
 
@@ -1311,12 +1583,17 @@ export async function transcriptAppend(rows: SessionMessageRow[]): Promise<void>
  * compaction and fork change the conversation itself; appending alone would resurrect the
  * abandoned tail on resume.
  */
-export async function transcriptReplace(sessionId: string, rows: SessionMessageRow[]): Promise<void> {
+export async function transcriptReplace(
+  sessionId: string,
+  rows: SessionMessageRow[],
+): Promise<void> {
   await invoke("transcript_replace", { sessionId, rows });
 }
 
 /** A session's transcript, in stored order. Empty for a session recorded before 0027. */
-export async function transcriptList(sessionId: string): Promise<SessionMessageRow[]> {
+export async function transcriptList(
+  sessionId: string,
+): Promise<SessionMessageRow[]> {
   return invoke<SessionMessageRow[]>("transcript_list", { sessionId });
 }
 
@@ -1336,8 +1613,12 @@ export async function transcriptMaxSeq(sessionId: string): Promise<number> {
  * exactly why it was never lossless. The fallback is kept rather than migrated, because a backfill
  * could only invent the text the graph never stored.
  */
-export async function resumeSession(sessionId: string): Promise<import("./ui-state").ResumeMsg[]> {
-  const rows = await transcriptList(sessionId).catch(() => [] as SessionMessageRow[]);
+export async function resumeSession(
+  sessionId: string,
+): Promise<import("./ui-state").ResumeMsg[]> {
+  const rows = await transcriptList(sessionId).catch(
+    () => [] as SessionMessageRow[],
+  );
   if (rows.length > 0) {
     return rows.map((r) => {
       const msg: import("./ui-state").ResumeMsg = {
@@ -1386,14 +1667,19 @@ export async function resumeSession(sessionId: string): Promise<import("./ui-sta
 }
 
 /** The pre-0027 reconstruction: a transcript rebuilt from the context graph's timeline. */
-async function resumeFromTimeline(sessionId: string): Promise<import("./ui-state").ResumeMsg[]> {
+async function resumeFromTimeline(
+  sessionId: string,
+): Promise<import("./ui-state").ResumeMsg[]> {
   const timeline = await loadHistoryTimeline(sessionId);
   const out: import("./ui-state").ResumeMsg[] = [];
   for (const e of timeline.entries) {
     if (e.kind === "user") {
       out.push({ role: "user", content: e.text });
     } else if (e.kind === "assistant") {
-      const msg: import("./ui-state").ResumeMsg = { role: "assistant", content: e.text };
+      const msg: import("./ui-state").ResumeMsg = {
+        role: "assistant",
+        content: e.text,
+      };
       if (e.tool_calls) {
         try {
           msg.tool_calls = JSON.parse(e.tool_calls);
@@ -1416,10 +1702,21 @@ async function resumeFromTimeline(sessionId: string): Promise<import("./ui-state
 // ---------- P5: skills ----------
 
 export interface Skill {
-  id: string; slug: string; name: string; description: string; version: string;
-  source: string; body: string; enabled: boolean; installed_at: number;
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  version: string;
+  source: string;
+  body: string;
+  enabled: boolean;
+  installed_at: number;
 }
-export interface ParsedSkill { name: string; description: string; body: string; }
+export interface ParsedSkill {
+  name: string;
+  description: string;
+  body: string;
+}
 
 export async function listSkills(): Promise<Skill[]> {
   return invoke<Skill[]>("skills_list");
@@ -1430,7 +1727,10 @@ export async function skillsCatalog(): Promise<Skill[]> {
 }
 
 export async function installSkill(s: {
-  slug: string; name: string; description: string; body: string;
+  slug: string;
+  name: string;
+  description: string;
+  body: string;
 }): Promise<Skill> {
   return invoke<Skill>("skills_install", s);
 }
@@ -1439,7 +1739,10 @@ export async function uninstallSkill(slug: string): Promise<void> {
   await invoke("skills_uninstall", { slug });
 }
 
-export async function setSkillEnabled(slug: string, enabled: boolean): Promise<void> {
+export async function setSkillEnabled(
+  slug: string,
+  enabled: boolean,
+): Promise<void> {
   await invoke("skills_set_enabled", { slug, enabled });
 }
 
@@ -1465,11 +1768,17 @@ export async function agentDefsList(): Promise<AgentDefFile[]> {
   return invoke<AgentDefFile[]>("agent_defs_list");
 }
 
-export async function agentDefSave(id: string, contentJson: string): Promise<void> {
+export async function agentDefSave(
+  id: string,
+  contentJson: string,
+): Promise<void> {
   await invoke("agent_def_save", { id, contentJson });
 }
 
-export async function agentDefSetEnabled(id: string, enabled: boolean): Promise<void> {
+export async function agentDefSetEnabled(
+  id: string,
+  enabled: boolean,
+): Promise<void> {
   await invoke("agent_def_set_enabled", { id, enabled });
 }
 
@@ -1480,19 +1789,30 @@ export async function agentDefDelete(id: string): Promise<boolean> {
 // ---------- P6: agent orchestrator ----------
 
 export interface AgentRun {
-  id: string; session_id: string | null;
+  id: string;
+  session_id: string | null;
   /** The run that delegated this one via dispatch_agent, or null for a top-level run — the
    *  edge the Subagents screen's tree is drawn from. */
   parent_run_id: string | null;
-  model: string; status: string;
-  prompt: string | null; iterations: number; tool_calls: number;
-  started_at: number; ended_at: number | null; error: string | null;
+  model: string;
+  status: string;
+  prompt: string | null;
+  iterations: number;
+  tool_calls: number;
+  started_at: number;
+  ended_at: number | null;
+  error: string | null;
   /** This run's own model calls, summed — `0` also means "recorded before migration 0025". */
-  prompt_tokens: number; completion_tokens: number;
+  prompt_tokens: number;
+  completion_tokens: number;
 }
 export interface AgentStep {
-  seq: number; kind: string; label: string | null;
-  detail: string | null; ok: boolean | null; ts: number;
+  seq: number;
+  kind: string;
+  label: string | null;
+  detail: string | null;
+  ok: boolean | null;
+  ts: number;
 }
 
 export async function listAgentRuns(limit = 50): Promise<AgentRun[]> {
@@ -1500,21 +1820,33 @@ export async function listAgentRuns(limit = 50): Promise<AgentRun[]> {
 }
 
 export async function agentRunStart(a: {
-  id: string; sessionId: string | null; parentRunId: string | null; model: string; prompt: string | null;
+  id: string;
+  sessionId: string | null;
+  parentRunId: string | null;
+  model: string;
+  prompt: string | null;
 }): Promise<void> {
   await invoke("agent_run_start", a);
 }
 
 export async function agentStepAppend(a: {
-  runId: string; kind: string; label: string | null; detail: string | null; ok: boolean | null;
+  runId: string;
+  kind: string;
+  label: string | null;
+  detail: string | null;
+  ok: boolean | null;
 }): Promise<void> {
   await invoke("agent_step_append", a);
 }
 
 export async function agentRunFinish(a: {
-  runId: string; status: string; iterations: number; error: string | null;
+  runId: string;
+  status: string;
+  iterations: number;
+  error: string | null;
   /** The run's own model calls. Omitted means "no usage reported" — the host stores 0. */
-  promptTokens?: number; completionTokens?: number;
+  promptTokens?: number;
+  completionTokens?: number;
 }): Promise<void> {
   await invoke("agent_run_finish", a);
 }
@@ -1531,7 +1863,12 @@ export type MemoryLayer = "L0" | "L1" | "L2" | "L3";
 
 /** What a row is. `conversation` is L0 verbatim turns; the rest are distilled material. */
 export type MemoryKind =
-  | "identity" | "preference" | "decision" | "project_fact" | "capability" | "conversation";
+  | "identity"
+  | "preference"
+  | "decision"
+  | "project_fact"
+  | "capability"
+  | "conversation";
 
 /**
  * Where a memory may be injected. A row with neither a project nor an explicit global mark is
@@ -1578,24 +1915,30 @@ export interface MemoryConflict {
 }
 
 export interface MemoryStats {
-  l0: number; l1: number; l2: number; l3: number; total: number; bytes: number;
+  l0: number;
+  l1: number;
+  l2: number;
+  l3: number;
+  total: number;
+  bytes: number;
   /** Rows that can actually be injected. Everything else is capture-only. */
   injectable: number;
 }
 
 export async function captureMemory(m: {
-  layer: MemoryLayer; text: string;
-  sessionId?: string | null; subject?: string | null; pinned?: boolean;
+  layer: MemoryLayer;
+  text: string;
+  sessionId?: string | null;
+  subject?: string | null;
+  pinned?: boolean;
 }): Promise<Memory> {
-  return fetchAdminAs(
-    "POST",
-    "/admin/memory",
-    isMemory,
-    {
-      layer: m.layer, text: m.text,
-      session_id: m.sessionId ?? null, subject: m.subject ?? null, pinned: m.pinned ?? false,
-    },
-  );
+  return fetchAdminAs("POST", "/admin/memory", isMemory, {
+    layer: m.layer,
+    text: m.text,
+    session_id: m.sessionId ?? null,
+    subject: m.subject ?? null,
+    pinned: m.pinned ?? false,
+  });
 }
 
 /**
@@ -1609,12 +1952,22 @@ export async function captureMemory(m: {
  * the two boundaries differ.
  */
 export async function captureMemories(
-  items: Array<{ layer: MemoryLayer; text: string; session_id?: string | null; subject?: string | null; pinned?: boolean }>,
+  items: Array<{
+    layer: MemoryLayer;
+    text: string;
+    session_id?: string | null;
+    subject?: string | null;
+    pinned?: boolean;
+  }>,
 ): Promise<number> {
   if (items.length === 0) return 0;
-  const res = expectShapeOr(await fetchAdmin("POST", "/admin/memory/batch", items), isCaptured, {
-    captured: 0,
-  });
+  const res = expectShapeOr(
+    await fetchAdmin("POST", "/admin/memory/batch", items),
+    isCaptured,
+    {
+      captured: 0,
+    },
+  );
   return res.captured;
 }
 
@@ -1647,7 +2000,9 @@ export interface MemoryListScope {
 }
 
 /** Scoped listing: the Assistant's read surface. No query, so always-on rows are included. */
-export async function listScopedMemories(scope: MemoryListScope): Promise<Memory[]> {
+export async function listScopedMemories(
+  scope: MemoryListScope,
+): Promise<Memory[]> {
   return fetchAdminAs("POST", "/admin/memory/scoped", arrayOf(isMemory), {
     project_root: scope.projectRoot,
     limit: scope.limit ?? 200,
@@ -1655,7 +2010,10 @@ export async function listScopedMemories(scope: MemoryListScope): Promise<Memory
   });
 }
 
-export async function listMemories(layer?: MemoryLayer | null, limit = 200): Promise<Memory[]> {
+export async function listMemories(
+  layer?: MemoryLayer | null,
+  limit = 200,
+): Promise<Memory[]> {
   const qs = layer ? `?layer=${layer}&limit=${limit}` : `?limit=${limit}`;
   return fetchAdminAs("GET", `/admin/memory${qs}`, arrayOf(isMemory));
 }
@@ -1671,16 +2029,22 @@ export async function markMemoriesRetrieved(ids: string[]): Promise<number> {
   const res = expectShapeOr(
     await fetchAdmin("POST", "/admin/memory/retrieved", { ids }),
     (v): v is { updated: number } =>
-      typeof v === "object" && v !== null && typeof (v as { updated?: unknown }).updated === "number",
+      typeof v === "object" &&
+      v !== null &&
+      typeof (v as { updated?: unknown }).updated === "number",
     { updated: 0 },
   );
   return res.updated;
 }
 
 export async function forgetMemory(id: string): Promise<boolean> {
-  const res = expectShapeOr(await fetchAdmin("DELETE", `/admin/memory/${id}`), isOk, {
-    ok: false,
-  });
+  const res = expectShapeOr(
+    await fetchAdmin("DELETE", `/admin/memory/${id}`),
+    isOk,
+    {
+      ok: false,
+    },
+  );
   return res.ok;
 }
 
@@ -1690,30 +2054,52 @@ export async function forgetMemory(id: string): Promise<boolean> {
  *
  * Rejects on a pinned or L3 row — §6.4.5 forbids quietly replacing either.
  */
-export async function supersedeMemory(old: string, newId: string): Promise<boolean> {
-  const res = expectShapeOr(await fetchAdmin("POST", "/admin/memory/supersede", { old, new: newId }), isOk, {
-    ok: false,
-  });
+export async function supersedeMemory(
+  old: string,
+  newId: string,
+): Promise<boolean> {
+  const res = expectShapeOr(
+    await fetchAdmin("POST", "/admin/memory/supersede", { old, new: newId }),
+    isOk,
+    {
+      ok: false,
+    },
+  );
   return res.ok;
 }
 
 /** §6.4.3: undo a supersession. The row was never deleted, so this makes it reachable again. */
 export async function unsupersedeMemory(id: string): Promise<boolean> {
-  const res = expectShapeOr(await fetchAdmin("POST", `/admin/memory/${id}/unsupersede`), isOk, {
-    ok: false,
-  });
+  const res = expectShapeOr(
+    await fetchAdmin("POST", `/admin/memory/${id}/unsupersede`),
+    isOk,
+    {
+      ok: false,
+    },
+  );
   return res.ok;
 }
 
 /** §6.4.5: what the Memory screen has to put in front of a human. */
 export async function memoryConflicts(): Promise<MemoryConflict[]> {
-  return fetchAdminAs("GET", "/admin/memory/conflicts", arrayOf(isMemoryConflict));
+  return fetchAdminAs(
+    "GET",
+    "/admin/memory/conflicts",
+    arrayOf(isMemoryConflict),
+  );
 }
 
-export async function setMemoryPinned(id: string, pinned: boolean): Promise<boolean> {
-  const res = expectShapeOr(await fetchAdmin("POST", `/admin/memory/${id}/pin`, { pinned }), isOk, {
-    ok: false,
-  });
+export async function setMemoryPinned(
+  id: string,
+  pinned: boolean,
+): Promise<boolean> {
+  const res = expectShapeOr(
+    await fetchAdmin("POST", `/admin/memory/${id}/pin`, { pinned }),
+    isOk,
+    {
+      ok: false,
+    },
+  );
   return res.ok;
 }
 
@@ -1726,29 +2112,128 @@ export async function gatewayProjectKey(): Promise<string | null> {
   return invoke<string | null>("gateway_project_key");
 }
 
+/** One adapter that the host can see, with a live session count. */
+export interface AgentSourceInfo {
+  name: string;
+  available: boolean;
+  sessionCount: number;
+  note: string | null;
+}
+
+export async function listAgentSources(): Promise<AgentSourceInfo[]> {
+  const res = await fetchAdminAs(
+    "GET",
+    "/admin/sources",
+    arrayOf(isAgentSource),
+  );
+  // Preserve the UI's card order from `all_sources` rather than trusting the host's ordering.
+  const order = [
+    "zcode",
+    "claude",
+    "codex",
+    "qoder",
+    "router",
+    "workbuddy",
+    "gemini",
+  ];
+  return res
+    .slice()
+    .sort((a, b) => order.indexOf(a.name) - order.indexOf(b.name));
+}
+
+/** Foreign sessions from one source, or across all of them when `source` is absent. */
+export async function listSourceSessions(opts: {
+  source?: string;
+  query?: string;
+  root?: string;
+  limit?: number;
+}): Promise<RelatedSourceSession[]> {
+  const q = new URLSearchParams();
+  if (opts.source) q.set("source", opts.source);
+  if (opts.query) q.set("q", opts.query);
+  if (opts.root) q.set("root", opts.root);
+  if (opts.limit) q.set("limit", String(opts.limit));
+  const path = opts.source
+    ? `/admin/sources/${opts.source}/sessions?${q.toString()}`
+    : `/admin/sources/sessions?${q.toString()}`;
+  return fetchAdminAs("GET", path, arrayOf(isRelatedSourceSession));
+}
+
+/** Pull a single foreign session into this app's transcript store. Idempotent. */
+export async function importSourceSession(
+  source: string,
+  nativeId: string,
+): Promise<{
+  sessionId: string;
+  turns: number;
+}> {
+  return fetchAdminAs(
+    "POST",
+    "/admin/sources/import",
+    (v): v is { sessionId: string; turns: number } =>
+      typeof v === "object" &&
+      v !== null &&
+      typeof (v as { sessionId?: unknown }).sessionId === "string" &&
+      typeof (v as { turns?: unknown }).turns === "number",
+    { source, native_id: nativeId },
+  );
+}
+
+function isAgentSource(v: unknown): v is AgentSourceInfo {
+  return (
+    typeof v === "object" &&
+    v !== null &&
+    typeof (v as { name?: unknown }).name === "string" &&
+    typeof (v as { available?: unknown }).available === "boolean" &&
+    typeof (v as { sessionCount?: unknown }).sessionCount === "number"
+  );
+}
+
+function isRelatedSourceSession(v: unknown): v is RelatedSourceSession {
+  return (
+    typeof v === "object" &&
+    v !== null &&
+    typeof (v as { source?: unknown }).source === "string" &&
+    typeof (v as { nativeId?: unknown }).nativeId === "string" &&
+    typeof (v as { turns?: unknown }).turns === "number" &&
+    typeof (v as { preview?: unknown }).preview === "string"
+  );
+}
+
 /**
  * Bind a memory to a scope. This is the only way a row becomes injectable — every memory is born
  * capture-only. `kind` is `project` (optionally narrowed to one agent), `global`, or `unscoped`.
  */
 export async function assignMemoryScope(
   id: string,
-  scope: { kind: "project"; project: string; agent?: string | null } | { kind: "global" } | { kind: "unscoped" },
+  scope:
+    | { kind: "project"; project: string; agent?: string | null }
+    | { kind: "global" }
+    | { kind: "unscoped" },
 ): Promise<boolean> {
   const payload =
     scope.kind === "project"
       ? { kind: "project", project: scope.project, agent: scope.agent ?? null }
       : { kind: scope.kind, project: null, agent: null };
-  const res = expectShapeOr(await fetchAdmin("POST", `/admin/memory/${id}/scope`, payload), isOk, {
-    ok: false,
-  });
+  const res = expectShapeOr(
+    await fetchAdmin("POST", `/admin/memory/${id}/scope`, payload),
+    isOk,
+    {
+      ok: false,
+    },
+  );
   return res.ok;
 }
 
 /** Rewrite one memory's text. The layer is left alone — promotion is the caller's call. */
 export async function updateMemory(id: string, text: string): Promise<boolean> {
-  const res = expectShapeOr(await fetchAdmin("PUT", `/admin/memory/${id}`, { text }), isOk, {
-    ok: false,
-  });
+  const res = expectShapeOr(
+    await fetchAdmin("PUT", `/admin/memory/${id}`, { text }),
+    isOk,
+    {
+      ok: false,
+    },
+  );
   return res.ok;
 }
 
@@ -1757,9 +2242,15 @@ export async function updateMemory(id: string, text: string): Promise<boolean> {
  * a chronological window rather than the recency-ordered one `listMemories` returns.
  */
 export async function sessionMemories(
-  sessionId: string, layer: MemoryLayer, limit = 200,
+  sessionId: string,
+  layer: MemoryLayer,
+  limit = 200,
 ): Promise<Memory[]> {
-  return fetchAdminAs("GET", `/admin/memory/session/${sessionId}?layer=${layer}&limit=${limit}`, arrayOf(isMemory));
+  return fetchAdminAs(
+    "GET",
+    `/admin/memory/session/${sessionId}?layer=${layer}&limit=${limit}`,
+    arrayOf(isMemory),
+  );
 }
 
 export async function clearMemories(): Promise<void> {
@@ -1788,7 +2279,11 @@ export interface PendingRow {
 }
 
 export interface QueueStatus {
-  queued: number; processing: number; done: number; failed: number; outstanding: number;
+  queued: number;
+  processing: number;
+  done: number;
+  failed: number;
+  outstanding: number;
   /** §10(2): distillations still available in this rolling hour. Absent on an older host. */
   budget_left?: number;
   /**
@@ -1820,8 +2315,14 @@ export async function captureComplete(id: number): Promise<boolean> {
  * because "3 turns failed" with no reason is not something anyone can act on: a provider outage
  * leaves the turns re-runnable, a distilled-nothing reply does not.
  */
-export async function captureRelease(id: number, error?: string): Promise<boolean> {
-  return invoke<boolean>("capture_release", { id, ...(error ? { error } : {}) });
+export async function captureRelease(
+  id: number,
+  error?: string,
+): Promise<boolean> {
+  return invoke<boolean>("capture_release", {
+    id,
+    ...(error ? { error } : {}),
+  });
 }
 
 /** Put back rows whose claim went stale, i.e. the webview died mid-batch. */
@@ -1860,7 +2361,11 @@ export interface LiveContextPruneStats {
 export async function pruneLiveContext(): Promise<LiveContextPruneStats> {
   // `POST /admin/context/prune` bounds `live_context`; `POST /admin/memory/prune` above bounds
   // `memories`. Two routes because the retention policies are unrelated.
-  return await fetchAdminAs("POST", "/admin/context/prune", isLiveContextPruneStats);
+  return await fetchAdminAs(
+    "POST",
+    "/admin/context/prune",
+    isLiveContextPruneStats,
+  );
 }
 
 /**
@@ -1875,7 +2380,11 @@ export interface PrincipalRow {
 }
 
 export async function memoryPrincipalList(): Promise<PrincipalRow[]> {
-  return fetchAdminAs("GET", "/admin/memory/principals", arrayOf(isPrincipalRow));
+  return fetchAdminAs(
+    "GET",
+    "/admin/memory/principals",
+    arrayOf(isPrincipalRow),
+  );
 }
 
 /**
@@ -1892,7 +2401,10 @@ export async function setMemoryPrincipal(
   enabled: boolean | null,
 ): Promise<boolean> {
   const res = expectShapeOr(
-    await fetchAdmin("POST", "/admin/memory/principals", { principal, enabled }),
+    await fetchAdmin("POST", "/admin/memory/principals", {
+      principal,
+      enabled,
+    }),
     isOk,
     { ok: false },
   );
@@ -1908,13 +2420,19 @@ export async function setMemoryPrincipal(
  * route is what makes the toggle follow the listener in use.
  */
 export async function gatewayMemoryEnabled(): Promise<boolean> {
-  const res = expectShapeOr(await fetchAdmin("GET", "/admin/memory/enabled"), isEnabledFlag, {
-    enabled: false,
-  });
+  const res = expectShapeOr(
+    await fetchAdmin("GET", "/admin/memory/enabled"),
+    isEnabledFlag,
+    {
+      enabled: false,
+    },
+  );
   return res.enabled;
 }
 
-export async function setGatewayMemoryEnabled(enabled: boolean): Promise<boolean> {
+export async function setGatewayMemoryEnabled(
+  enabled: boolean,
+): Promise<boolean> {
   const res = expectShapeOr(
     await fetchAdmin("POST", "/admin/memory/enabled", { enabled }),
     isEnabledFlag,
@@ -1980,8 +2498,12 @@ export async function appBuildIdentity(): Promise<BuildIdentity> {
  */
 export async function gatewayBuildIdentity(): Promise<BuildIdentity | null> {
   try {
-    const raw = (await fetchAdmin("GET", "/admin/build")) as Partial<BuildIdentity> | null;
-    if (typeof raw?.commit !== "string" || typeof raw?.source_fp !== "string") return null;
+    const raw = (await fetchAdmin(
+      "GET",
+      "/admin/build",
+    )) as Partial<BuildIdentity> | null;
+    if (typeof raw?.commit !== "string" || typeof raw?.source_fp !== "string")
+      return null;
     return { commit: raw.commit, source_fp: raw.source_fp };
   } catch {
     return null;
@@ -2087,7 +2609,9 @@ export interface GatewayLogLine {
  * than failing — a gateway that has never run has nothing to report, and the screen must not show
  * that as an error.
  */
-export async function gatewayLogTail(limit?: number): Promise<GatewayLogLine[]> {
+export async function gatewayLogTail(
+  limit?: number,
+): Promise<GatewayLogLine[]> {
   return invoke<GatewayLogLine[]>("gateway_log_tail", { limit: limit ?? null });
 }
 
@@ -2122,8 +2646,12 @@ export interface GeneratorAuditEntry {
  * trail that does not contain what they just approved. An empty table answers `[]`; a missing one cannot
  * happen, since the schema creates it on open.
  */
-export async function generatorAuditList(limit?: number): Promise<GeneratorAuditEntry[]> {
-  return invoke<GeneratorAuditEntry[]>("generator_audit_list", { limit: limit ?? null });
+export async function generatorAuditList(
+  limit?: number,
+): Promise<GeneratorAuditEntry[]> {
+  return invoke<GeneratorAuditEntry[]>("generator_audit_list", {
+    limit: limit ?? null,
+  });
 }
 
 export interface DriftEventEntry {
@@ -2145,8 +2673,12 @@ export interface DriftEventEntry {
  * as raw JSON pasted into a bug report. Same shape as `generatorAuditList`, and for the same reason: the
  * two cards sit on one screen and must not disagree about what an empty trail means.
  */
-export async function driftEventsList(limit?: number): Promise<DriftEventEntry[]> {
-  return invoke<DriftEventEntry[]>("drift_events_list", { limit: limit ?? null });
+export async function driftEventsList(
+  limit?: number,
+): Promise<DriftEventEntry[]> {
+  return invoke<DriftEventEntry[]>("drift_events_list", {
+    limit: limit ?? null,
+  });
 }
 
 /**
@@ -2160,9 +2692,13 @@ export async function driftEventsList(limit?: number): Promise<DriftEventEntry[]
  * every launch looked like a bug rather than a policy.
  */
 export async function gatewayToolsEnabled(): Promise<boolean> {
-  const res = expectShapeOr(await fetchAdmin("GET", "/admin/tools"), isEnabledFlag, {
-    enabled: false,
-  });
+  const res = expectShapeOr(
+    await fetchAdmin("GET", "/admin/tools"),
+    isEnabledFlag,
+    {
+      enabled: false,
+    },
+  );
   return res.enabled;
 }
 
@@ -2171,13 +2707,19 @@ export async function setGatewayToolsEnabled(enabled: boolean): Promise<void> {
 }
 
 export async function gatewayMutationEnabled(): Promise<boolean> {
-  const res = expectShapeOr(await fetchAdmin("GET", "/admin/tools"), isMutationFlag, {
-    mutationEnabled: false,
-  });
+  const res = expectShapeOr(
+    await fetchAdmin("GET", "/admin/tools"),
+    isMutationFlag,
+    {
+      mutationEnabled: false,
+    },
+  );
   return res.mutationEnabled;
 }
 
-export async function setGatewayMutationEnabled(enabled: boolean): Promise<void> {
+export async function setGatewayMutationEnabled(
+  enabled: boolean,
+): Promise<void> {
   await fetchAdmin("POST", "/admin/tools", { mutationEnabled: enabled });
 }
 
@@ -2205,7 +2747,12 @@ export async function readGatewaySettings(): Promise<GatewaySettings> {
   // `parseHostJsonOr` keeps the existing contract, a corrupt row must not take a screen down,
   // and adds the shape check the `as` skipped: `{ port: "8800" }` used to arrive typed as a
   // number and reach the URL builder (audit M8).
-  return parseHostJsonOr(raw, isGatewaySettings, {}, "the `gateway` settings row");
+  return parseHostJsonOr(
+    raw,
+    isGatewaySettings,
+    {},
+    "the `gateway` settings row",
+  );
 }
 
 /**
@@ -2217,9 +2764,14 @@ export async function readGatewaySettings(): Promise<GatewaySettings> {
  * Start/Stop handler wrote `JSON.stringify({ port, enabled })`, so adding the tool switches without
  * this helper would have wiped them every time the gateway was restarted.
  */
-export async function patchGatewaySettings(patch: GatewaySettings): Promise<GatewaySettings> {
+export async function patchGatewaySettings(
+  patch: GatewaySettings,
+): Promise<GatewaySettings> {
   const next = { ...(await readGatewaySettings()), ...patch };
-  await invoke("settings_set", { key: "gateway", valueJson: JSON.stringify(next) });
+  await invoke("settings_set", {
+    key: "gateway",
+    valueJson: JSON.stringify(next),
+  });
   return next;
 }
 
@@ -2234,8 +2786,10 @@ export async function patchGatewaySettings(patch: GatewaySettings): Promise<Gate
  */
 export async function applyPersistedGatewaySwitches(): Promise<void> {
   const s = await readGatewaySettings();
-  if (typeof s.toolsEnabled === "boolean") await setGatewayToolsEnabled(s.toolsEnabled);
-  if (typeof s.mutationEnabled === "boolean") await setGatewayMutationEnabled(s.mutationEnabled);
+  if (typeof s.toolsEnabled === "boolean")
+    await setGatewayToolsEnabled(s.toolsEnabled);
+  if (typeof s.mutationEnabled === "boolean")
+    await setGatewayMutationEnabled(s.mutationEnabled);
 }
 
 /**
@@ -2264,15 +2818,20 @@ export async function exportConfig(): Promise<string> {
  * the host re-scans and forces providers→draft, keys→invalid so nothing routes until
  * keys are re-entered (audit H7).
  */
-export async function importConfig(text: string): Promise<{ providers: number; keys: number }> {
+export async function importConfig(
+  text: string,
+): Promise<{ providers: number; keys: number }> {
   const { validateImport } = await import("@aiprovider/router-core");
   const report = validateImport(text);
   if (!report.ok) throw new Error(report.errors.join(" · "));
   // Parsed through the boundary so a paste that is valid JSON but not an object fails with a
   // named message rather than an `undefined` reaching the host (audit M3).
-  const applied = await invoke<{ providers: number; keys: number }>("config_import", {
-    raw: parseHostJson(text, isObj, "the imported config"),
-  });
+  const applied = await invoke<{ providers: number; keys: number }>(
+    "config_import",
+    {
+      raw: parseHostJson(text, isObj, "the imported config"),
+    },
+  );
   await refreshFromHost(); // registry now holds drafts + invalid keys (re-enter-key flow)
   return applied;
 }
@@ -2333,8 +2892,14 @@ export interface ActiveAxiomConfig {
   versionId: string | null;
 }
 
-export async function axiomListTraces(limit = 50, sessionId?: string | null): Promise<RunTrace[]> {
-  return invoke<RunTrace[]>("axiom_traces_list", { limit, sessionId: sessionId ?? null });
+export async function axiomListTraces(
+  limit = 50,
+  sessionId?: string | null,
+): Promise<RunTrace[]> {
+  return invoke<RunTrace[]>("axiom_traces_list", {
+    limit,
+    sessionId: sessionId ?? null,
+  });
 }
 
 export async function axiomGetTrace(runId: string): Promise<RunTrace | null> {
@@ -2345,7 +2910,9 @@ export async function axiomListVersions(): Promise<AgentVersion[]> {
   return invoke<AgentVersion[]>("axiom_versions_list");
 }
 
-export async function axiomGetVersion(id: string): Promise<AgentVersion | null> {
+export async function axiomGetVersion(
+  id: string,
+): Promise<AgentVersion | null> {
   return invoke<AgentVersion | null>("axiom_version_get", { id });
 }
 
@@ -2356,11 +2923,17 @@ export async function axiomPutVersion(version: AgentVersion): Promise<void> {
 }
 
 /** Move a version's state. Promoting to `active` retires the incumbent in the same step. */
-export async function axiomSetVersionState(id: string, state: VersionState): Promise<void> {
+export async function axiomSetVersionState(
+  id: string,
+  state: VersionState,
+): Promise<void> {
   await invoke("axiom_version_set_state", { id, state });
 }
 
-export async function axiomLinkDecision(versionId: string, decisionId: string): Promise<void> {
+export async function axiomLinkDecision(
+  versionId: string,
+  decisionId: string,
+): Promise<void> {
   await invoke("axiom_version_link_decision", { versionId, decisionId });
 }
 
@@ -2395,11 +2968,15 @@ export async function axiomListSuiteResults(opts?: {
   });
 }
 
-export async function axiomPutDecision(decision: PromotionDecision): Promise<void> {
+export async function axiomPutDecision(
+  decision: PromotionDecision,
+): Promise<void> {
   await invoke("axiom_decision_put", { decision });
 }
 
-export async function axiomListDecisions(limit = 100): Promise<PromotionDecision[]> {
+export async function axiomListDecisions(
+  limit = 100,
+): Promise<PromotionDecision[]> {
   return invoke<PromotionDecision[]>("axiom_decisions_list", { limit });
 }
 
@@ -2448,6 +3025,8 @@ export async function axiomListAudits(limit = 200): Promise<StoredAuditPass[]> {
   return invoke<StoredAuditPass[]>("axiom_audits_list", { limit });
 }
 
-export async function axiomGetAudit(id: string): Promise<StoredAuditPass | null> {
+export async function axiomGetAudit(
+  id: string,
+): Promise<StoredAuditPass | null> {
   return invoke<StoredAuditPass | null>("axiom_audit_get", { id });
 }
