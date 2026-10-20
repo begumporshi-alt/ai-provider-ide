@@ -4591,6 +4591,11 @@ async fn admin_routes_refuse_without_the_master_key() {
         ("POST", "/admin/memory/retrieved", json!({ "ids": ["m1"] })),
         ("GET", "/admin/memory/stats", json!(null)),
         ("GET", "/admin/memory/conflicts", json!(null)),
+        // Cross-agent session sources. `import` writes rows, so it authenticates like every
+        // other mutating admin route.
+        ("GET", "/admin/sources", json!(null)),
+        ("GET", "/admin/sources/claude/sessions", json!(null)),
+        ("POST", "/admin/sources/import", json!({ "source": "claude", "native_id": "x" })),
         // The master switch. Listed with the memory statics because it is one, and because a reader
         // of the routes should see that it authenticates like every other one.
         ("GET", "/admin/memory/enabled", json!(null)),
@@ -6111,4 +6116,217 @@ async fn admin_memory_enabled_round_trips_and_is_off_by_default() {
     // And it is the *core's* flag the request path consults, not a copy the route keeps. This is the
     // assertion that makes the route's authority claim testable rather than prose.
     assert!(s.core.memory_enabled(), "the route must flip the core's own flag");
+}
+
+#[tokio::test]
+async fn sources_list_reports_every_agent_with_availability() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .get(format!("{}/admin/sources", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    let sources = body.get("sources").and_then(|v| v.as_array()).expect("a list");
+    let names: Vec<&str> =
+        sources.iter().map(|x| x.get("name").and_then(|n| n.as_str()).unwrap()).collect();
+    assert_eq!(
+        names,
+        vec!["zcode", "claude", "codex", "qoder", "router", "workbuddy", "gemini"],
+        "every adapter is reported, in the UI's order"
+    );
+    // Availability is data for every entry, including agents that are not installed.
+    for src in sources {
+        assert!(src.get("available").and_then(|v| v.as_bool()).is_some());
+        assert!(src.get("sessionCount").and_then(|v| v.as_u64()).is_some());
+    }
+    // The two stubs never have sessions on any machine.
+    let stub = sources.iter().find(|x| x["name"] == "workbuddy").unwrap();
+    assert_eq!(stub["sessionCount"], 0);
+}
+
+#[tokio::test]
+async fn source_sessions_rejects_an_unknown_source_but_searches_everything_with_q() {
+    let s = start_with_store().await;
+
+    let unknown = s
+        .client
+        .get(format!("{}/admin/sources/nope/sessions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), 404, "a listing names one real source");
+
+    // With a query the route is the combined search: an unknown name is not a filter, so it
+    // answers 200 with whatever matches (possibly nothing).
+    let searched = s
+        .client
+        .get(format!("{}/admin/sources/nope/sessions?q=definitely-not-present", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(searched.status(), 200);
+    let body: Value = searched.json().await.unwrap();
+    assert!(body.get("sessions").and_then(|v| v.as_array()).is_some());
+}
+
+#[tokio::test]
+async fn source_import_rejects_unknown_sources_and_unreadable_sessions() {
+    let s = start_with_store().await;
+
+    let unknown = s
+        .client
+        .post(format!("{}/admin/sources/import", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "source": "nope", "native_id": "x" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), 404);
+    let body: Value = unknown.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "unknown_source");
+
+    // A real source with an id it does not contain: nothing to import, and saying "not found"
+    // beats writing an empty session that looks like a successful import.
+    let missing = s
+        .client
+        .post(format!("{}/admin/sources/import", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "source": "workbuddy", "native_id": "x" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+    let body: Value = missing.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "unknown_session");
+}
+
+#[tokio::test]
+async fn source_import_writes_a_resumable_scrubbed_transcript_and_is_idempotent() {
+    // `HOME` is process-global, so a single test owns both the import and the scrub assertions:
+    // two tests mutating it in parallel would revert it out from under each other's request.
+    let dir = std::env::temp_dir().join(format!("aip-codex-import-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".codex/sessions/2026/10/02")).unwrap();
+    std::fs::write(
+        dir.join(".codex/sessions/2026/10/02/rollout-2026-10-02T09-00-00-cafe.jsonl"),
+        "{\"type\":\"session_meta\",\"session_id\":\"cafe\",\"cwd\":\"/tmp/proj-alpha\"}\n\
+         {\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"why is the build slow, key sk-abcdefghijklmnopqrstuvwxyz012345\"}]},\"timestamp\":\"2026-10-02T09:00:00Z\"}\n\
+         {\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"the typecheck runs twice\"}]},\"timestamp\":\"2026-10-02T09:00:05Z\"}\n",
+    )
+    .unwrap();
+
+    let previous = std::env::var_os("HOME");
+    std::env::set_var("HOME", &dir);
+    // Restore HOME no matter how the test exits — it's process-global and the rest of the suite
+    // (and the developer's machine, if this ever runs against a real store) depends on it.
+    struct RestoreHome(Option<std::ffi::OsString>);
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            if let Some(home) = &self.0 {
+                std::env::set_var("HOME", home);
+            }
+        }
+    }
+    let _guard = RestoreHome(previous.clone());
+
+    let s = start_with_store().await;
+
+    let first = s
+        .client
+        .post(format!("{}/admin/sources/import", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "source": "codex", "native_id": "cafe" }))
+        .send()
+        .await
+        .unwrap();
+    let status = first.status();
+    let body: Value = first.json().await.unwrap();
+    assert_eq!(status, 200, "import failed: {body}");
+    assert_eq!(body["turns"], 2);
+    let session_id = body["sessionId"].as_str().unwrap().to_string();
+    assert!(session_id.starts_with("imp-codex-"));
+
+    // The transcript is in this app's own store, readable by the existing session tools, and the
+    // capture scrub ran before the row was written.
+    let (role, content): (String, String) = s
+        .core
+        .store()
+        .unwrap()
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT role, content FROM session_messages WHERE session_id = ?1 AND seq = 1",
+            [&session_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(role, "user");
+    assert!(content.contains("build slow"));
+    assert!(
+        !content.contains("sk-abcdefghijklmnopqrstuvwxyz012345"),
+        "the capture scrub must run before the row is stored"
+    );
+    // Task 3 — the import carries the foreign session's project root, so the manifest can scope
+    // recall to /tmp/proj-alpha just like an in-tree session.
+    let root: Option<String> = s
+        .core
+        .store()
+        .unwrap()
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT root FROM session_messages WHERE session_id = ?1 AND seq = 1",
+            [&session_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(root, Some("/tmp/proj-alpha".to_string()));
+    let title: String = s
+        .core
+        .store()
+        .unwrap()
+        .conn
+        .lock()
+        .unwrap()
+        .query_row("SELECT title FROM session_titles WHERE session_id = ?1", [&session_id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(title.starts_with("codex:"));
+
+    // The same import twice is one session, not two: the id is derived, and `(session_id, seq)`
+    // is the primary key.
+    let second = s
+        .client
+        .post(format!("{}/admin/sources/import", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "source": "codex", "native_id": "cafe" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 200);
+    let body: Value = second.json().await.unwrap();
+    assert_eq!(body["sessionId"].as_str().unwrap(), session_id);
+    let count: i64 = s
+        .core
+        .store()
+        .unwrap()
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1",
+            [&session_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 2);
 }

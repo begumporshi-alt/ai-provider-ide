@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rusqlite::{Connection, OpenFlags};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::core::store::Store;
@@ -41,7 +42,8 @@ pub const PREVIEW_CHARS: usize = 200;
 /// How much of one tool result is kept when a session is read.
 const TOOL_OUTPUT_CHARS: usize = 500;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionRef {
     pub source: String,
     pub native_id: String,

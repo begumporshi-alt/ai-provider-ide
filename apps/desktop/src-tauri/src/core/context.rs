@@ -723,6 +723,11 @@ pub struct SessionMessageRow {
     pub memory_refs: Option<String>,
     #[serde(default)]
     pub ts: i64,
+    /// The project directory this row's transcript lived in. Native sessions leave this `NULL`
+    /// (the Assistant spans whatever the user has open); an imported foreign session sets it so
+    /// the manifest can scope recall to that root. `NULL` is not global.
+    #[serde(default)]
+    pub root: Option<String>,
 }
 
 fn valid_role(role: &str) -> bool {
@@ -757,13 +762,14 @@ fn insert_session_rows(
     let mut stmt = tx
         .prepare(
             "INSERT INTO session_messages
-               (session_id, seq, role, content, tool_calls, tool_call_id, reasoning, attachments, model, memory_refs, ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+               (session_id, seq, role, content, tool_calls, tool_call_id, reasoning, attachments, model, memory_refs, ts, root)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(session_id, seq) DO UPDATE SET
                role=excluded.role, content=excluded.content, tool_calls=excluded.tool_calls,
                tool_call_id=excluded.tool_call_id, reasoning=excluded.reasoning,
                attachments=excluded.attachments, model=excluded.model,
-               memory_refs=excluded.memory_refs, ts=excluded.ts",
+               memory_refs=excluded.memory_refs, ts=excluded.ts,
+               root=excluded.root",
         )
         .map_err(|e| e.to_string())?;
     for r in rows {
@@ -779,6 +785,7 @@ fn insert_session_rows(
             r.model,
             r.memory_refs,
             r.ts,
+            r.root,
         ])
         .map_err(|e| e.to_string())?;
     }
@@ -836,7 +843,7 @@ pub fn session_messages(store: &Store, session_id: &str) -> Result<Vec<SessionMe
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT session_id, seq, role, content, tool_calls, tool_call_id, reasoning, attachments, model, memory_refs, ts
+            "SELECT session_id, seq, role, content, tool_calls, tool_call_id, reasoning, attachments, model, memory_refs, ts, root
                FROM session_messages WHERE session_id = ?1 ORDER BY seq ASC",
         )
         .map_err(|e| e.to_string())?;
@@ -854,6 +861,7 @@ pub fn session_messages(store: &Store, session_id: &str) -> Result<Vec<SessionMe
                 model: row.get(8)?,
                 memory_refs: row.get(9)?,
                 ts: row.get(10)?,
+                root: row.get(11)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -1383,6 +1391,7 @@ mod context_graph_tests {
             model: None,
             memory_refs: None,
             ts: 1_000 + seq,
+            root: None,
         }
     }
 

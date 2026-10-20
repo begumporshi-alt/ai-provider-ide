@@ -2473,6 +2473,11 @@ pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, St
         .route("/admin/memory/{id}/pin", post(admin::memory_set_pinned_h))
         .route("/admin/memory/{id}/scope", post(admin::memory_assign_scope_h))
         .route("/admin/memory/{id}/unsupersede", post(admin::memory_unsupersede_h))
+        // Cross-agent session sources. `import` is a static segment and must precede the
+        // `{name}/sessions` pattern the same way the memory statics precede `/admin/memory/{id}`.
+        .route("/admin/sources", get(admin::sources_list_h))
+        .route("/admin/sources/import", post(admin::source_import_h))
+        .route("/admin/sources/{name}/sessions", get(admin::source_sessions_h))
         .route(
             "/admin/context",
             get(admin::context_graph_h)

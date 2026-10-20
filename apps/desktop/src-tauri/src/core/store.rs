@@ -353,6 +353,7 @@ const DATA_MIGRATIONS: &[DataMigration] = &[
     ("0031_axiom_audit_history", create_axiom_audits),
     ("0032_identity_scope", backfill_identity_scope),
     ("0033_memory_metadata", add_memory_metadata),
+    ("0034_session_root", add_session_root),
 ];
 
 /// 0029 — AXIOM's four tables: the version chain, the finding register, the eval results and the
@@ -1106,6 +1107,20 @@ fn add_memory_metadata(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
             "UPDATE memories SET kind = ?1 WHERE id = ?2",
             rusqlite::params![crate::core::memory::classify_kind(&layer, &text), id],
         )?;
+    }
+    Ok(())
+}
+
+/// 0034 — the imported-transcript `root`.
+///
+/// `session_messages` rows from a foreign-agent import carry the project directory their
+/// conversation lived in, so the manifest can scope recall to that root exactly the way it
+/// scopes an in-tree session. The column is nullable: native sessions have no single root
+/// (the Assistant spans whatever the user has open), and legacy rows predate the field —
+/// absence is not global, it is "no root attached".
+fn add_session_root(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    if !table_has_column(tx, "session_messages", "root")? {
+        tx.execute_batch("ALTER TABLE session_messages ADD COLUMN root TEXT")?;
     }
     Ok(())
 }
@@ -1887,11 +1902,11 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0033 data migrations.
-        assert_eq!(info.schema_version, 33);
+        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0034 data migrations.
+        assert_eq!(info.schema_version, 34);
         // The two lists must stay numbered as one sequence: a data migration that reused a SQL
         // version number would be silently skipped on every database that already had it.
-        assert_eq!(33, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
+        assert_eq!(34, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
         // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
         // P6 agent-run, P7 memory and AXIOM evolution tables. `memories_fts` is a virtual table, so it shows up
         // in sqlite_master as a table too — assert it, because BM25 recall silently returns
@@ -2009,8 +2024,8 @@ mod tests {
             .unwrap();
         }
 
-        s.migrate().expect("re-migrate applies 0029..0033");
-        assert_eq!(s.info().unwrap().schema_version, 33);
+        s.migrate().expect("re-migrate applies 0029..0034");
+        assert_eq!(s.info().unwrap().schema_version, 34);
 
         let conn = s.conn.lock().unwrap();
         let runs: i64 = conn
