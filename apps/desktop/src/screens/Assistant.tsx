@@ -16,6 +16,7 @@ import {
   loadHistorySessions,
   resumeSession,
   historyMaxSeq,
+  forgetMemory,
   transcriptAppend,
   transcriptReplace,
   transcriptMaxSeq,
@@ -67,6 +68,7 @@ import { SessionReferencesDrawer } from "../components/SessionReferencesDrawer";
 import { DiffView } from "../components/DiffView";
 import { ProcessCard } from "../components/ProcessCard";
 import { LearnedStrip, RecallCard } from "../components/MemoryMoments";
+import { ManifestCard } from "../components/ManifestCard";
 import { ScreenshotPreview } from "../components/ScreenshotPreview";
 import { backgroundJobIdFromResult } from "../lib/tools/processJob";
 import type { WireToolResult } from "../lib/tools/host";
@@ -1589,6 +1591,41 @@ function Chat({
   const [manifest, setManifest] = useState<ComposedManifest | null>(null);
   const manifestRef = useRef<ComposedManifest | null>(null);
   manifestRef.current = manifest;
+
+  // The manifest tools read the per-turn composition the screen already holds; deletion goes
+  // through the same store call the Memory screen uses, then removes the row from the card
+  // immediately so the echo cannot disagree with the store for the rest of the session.
+  const manifestPort = useMemo(
+    () => ({
+      read: async () =>
+        (manifestRef.current?.entries ?? []).map((e) => ({
+          id: e.id,
+          kind: e.kind,
+          text: e.text,
+          scope: e.scope.global
+            ? "global"
+            : e.scope.project
+              ? `project:${e.scope.project}`
+              : "unscoped",
+          verified: e.kind === "capability" ? e.verified : null,
+        })),
+      forget: async (id: string) => {
+        const ok = await forgetMemory(id);
+        if (ok) {
+          const next = manifestRef.current
+            ? {
+                ...manifestRef.current,
+                entries: manifestRef.current.entries.filter((e) => e.id !== id),
+              }
+            : null;
+          manifestRef.current = next;
+          setManifest(next);
+        }
+        return ok;
+      },
+    }),
+    [],
+  );
   /**
    * The durable transcript's next sequence number (0027).
    *
@@ -2449,6 +2486,7 @@ function Chat({
           // Mapping here rather than in the loop keeps the loop ignorant of which backend served
           // the rows — and a failure here surfaces as the tool's "session lookup failed" result,
           // not as a broken turn.
+          manifest: manifestPort,
           sessions: {
             list: (limit) =>
               invoke<
@@ -3318,6 +3356,14 @@ function Chat({
             </div>
           </div>
         )}
+        {manifest && manifest.entries.length > 0 ? (
+          <ManifestCard
+            manifest={manifest}
+            onForget={(id) => {
+              void manifestPort.forget(id);
+            }}
+          />
+        ) : null}
         {msgs.map((m, i) =>
           // A tool turn already shown inside its turn's group card: rendering it again here is what
           // produced the flat run of anonymous "tool result" bubbles.

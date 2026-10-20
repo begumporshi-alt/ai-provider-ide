@@ -673,6 +673,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     loadSkill,
     cacheImage,
     sessions,
+    manifest,
     plan,
     runId,
     subagentRecorder,
@@ -1639,6 +1640,32 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
                 } catch (e) {
                   resultText = `session lookup failed: ${e instanceof Error ? e.message : String(e)}`;
                   ok = false;
+                }
+              }
+            } else if (name === "read_manifest" || name === "forget_memory") {
+              // The manifest lives in the screen, not the loop: it is composed per turn from the
+              // scoped store. Absent means this run has no manifest (tests, subagents), and the
+              // tool must say so rather than return an empty list that reads as "nothing known".
+              if (!manifest) {
+                resultText = "the session manifest is not available in this run.";
+                ok = false;
+              } else if (name === "read_manifest") {
+                const entries = await manifest.read();
+                resultText = entries.length
+                  ? `${entries.length} manifest entr${entries.length === 1 ? "y" : "ies"}:\n\n${JSON.stringify(entries, null, 2)}`
+                  : "the session manifest is empty.";
+                ok = true;
+              } else {
+                const id = typeof args.id === "string" ? args.id.trim() : "";
+                if (!id) {
+                  resultText = 'forget_memory needs an "id" — get one from read_manifest.';
+                  ok = false;
+                } else {
+                  const forgotten = await manifest.forget(id);
+                  resultText = forgotten
+                    ? `forgot ${id}; it will not be injected again.`
+                    : `no memory with id ${id}.`;
+                  ok = forgotten;
                 }
               }
             } else if (name === "read_notebook" || name === "edit_notebook") {

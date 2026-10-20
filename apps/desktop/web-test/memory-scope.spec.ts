@@ -118,3 +118,23 @@ test("a contradicted capability stays out of the prompt", async ({ page }) => {
   expect(body).toContain("identity");
   expect(body).not.toContain("cannot run git clone");
 });
+
+test("the manifest card lists entries and forgets one by id", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  const id = await seed(page, "L3", "I am Tushu", true);
+  await scope(page, id, { kind: "global" });
+
+  await page.getByRole("button", { name: "Assistant", exact: true }).click();
+  await pickModel(page, /oracle-mini/);
+  await page.getByPlaceholder(/Message your assistant/).fill("hello");
+  await page.getByRole("button", { name: "Send" }).click();
+
+  const card = page.getByTestId("manifest-card");
+  await expect(card).toBeVisible({ timeout: 30_000 });
+  // The card is a <details>: its entries are not in the accessibility tree until it is opened.
+  await card.locator("summary").click();
+  // The session-skills rail floats over the card's right edge; dispatch on the element itself so
+  // the test exercises the handler rather than fighting the layout overlay.
+  await card.getByRole("button", { name: `Forget ${id}` }).dispatchEvent("click");
+  await expect(card.getByText("I am Tushu")).toHaveCount(0);
+});

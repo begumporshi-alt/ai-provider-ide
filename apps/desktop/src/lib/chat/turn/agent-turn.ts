@@ -72,6 +72,11 @@ export interface AgentTurnRequest extends TurnRequestBase {
    */
   sessions?: Parameters<typeof runAgentLoop>[0]["sessions"];
   /**
+   * The manifest behind `read_manifest` / `forget_memory` — see `AgentLoopOptions.manifest`. The
+   * screen owns both the composed manifest and the memory store; the loop only serves the tools.
+   */
+  manifest?: Parameters<typeof runAgentLoop>[0]["manifest"];
+  /**
    * The plan-mode facilities behind `enter_plan_mode` / `exit_plan_mode`: the review modal, the
    * mode switch the gate reads, and the plan file. The screen owns all three — it holds the
    * approval ref, the session id and the workspace root — and the loop only forwards them.
@@ -313,6 +318,7 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
       loadSkill: req.loadSkill,
       cacheImage: req.cacheImage,
       sessions: req.sessions,
+      manifest: req.manifest,
       plan: req.plan,
       subagentMaxIterations: req.subagentMaxIterations,
       // The user-authored specialists: the loop resolves `agent` ids to their prompt, toolset,

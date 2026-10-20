@@ -24,7 +24,7 @@ describe("toolEffect", () => {
     // composite that writes through read_file + write_file, `generate_image` writes through
     // write_file's base64 encoding — one approval each for one logical edit. `process_kill`
     // stops a process and the browser tools act on the user's real browser, both as much a
-    // mutation as starting one is.
+    // mutation as starting one is. `forget_memory` deletes a durable memory row.
     expect(mutate).toEqual([
       "apply_patch",
       "browser_click",
@@ -37,6 +37,7 @@ describe("toolEffect", () => {
       "device_screenshot",
       "edit_file",
       "edit_notebook",
+      "forget_memory",
       "generate_image",
       "http_request",
       "mkdir",

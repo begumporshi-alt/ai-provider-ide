@@ -14,7 +14,7 @@
  * silently un-gate a writing tool, so the names are pinned in both places.
  */
 import { describe, expect, it } from "vitest";
-import { AGENT_TOOLS, SUBAGENT_TOOLS, registryToOpenAI, toolEffect } from "./registry";
+import { AGENT_TOOLS, SUBAGENT_TOOLS, registryToOpenAI, subagentTools, toolEffect } from "./registry";
 
 /** The write-effect tools. The Rust `MUTATING_TOOLS` additionally gates the web tools as egress;
  *  those carry the `network` effect here, not `mutate`. */
@@ -37,6 +37,9 @@ const ASSISTANT_MUTATING = [
   "device_screenshot",
   "edit_notebook",
   "generate_image",
+  // Deletes one durable memory row. The gateway has no route for it (the host owns the memory
+  // store), so it is a frontend-only mutation and is approved as one.
+  "forget_memory",
   "process_kill",
 ];
 const MUTATING = [...GATEWAY_MUTATING, ...ASSISTANT_MUTATING];
@@ -100,6 +103,7 @@ describe("AGENT_TOOLS", () => {
       "read_document",
       "read_file",
       "read_image",
+      "read_manifest",
       "read_notebook",
       "read_session",
       "search_files",
@@ -191,6 +195,14 @@ describe("AGENT_TOOLS", () => {
     expect(toolEffect("read_file")).toBe("read");
     expect(toolEffect("run_command")).toBe("mutate");
     expect(toolEffect("not_a_tool")).toBe("mutate");
+  });
+
+  it("exposes the manifest tools and keeps delete out of subagents", () => {
+    const names = AGENT_TOOLS.map((t) => t.name);
+    expect(names).toContain("read_manifest");
+    expect(names).toContain("forget_memory");
+    expect(subagentTools(false).map((t) => t.name)).not.toContain("forget_memory");
+    expect(toolEffect("forget_memory")).toBe("mutate");
   });
 });
 

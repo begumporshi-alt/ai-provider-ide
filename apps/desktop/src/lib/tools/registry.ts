@@ -799,6 +799,25 @@ export const AGENT_TOOLS: ToolSpec[] = [
       required: ["session_id"],
     },
   },
+  {
+    name: "read_manifest",
+    effect: "read",
+    description:
+      "Read this session's manifest: the scoped identity, preferences, decisions and verified capabilities the assistant was given. Each entry has a stable id you can quote to the user. Use it when asked what you remember or where a belief came from.",
+    parameters: { properties: {} },
+  },
+  {
+    name: "forget_memory",
+    effect: "mutate",
+    description:
+      "Delete one memory by id. Only call this when the user explicitly asks to forget it. The id comes from read_manifest or a recall card.",
+    parameters: {
+      properties: {
+        id: { type: "string", description: "The memory id to delete." },
+      },
+      required: ["id"],
+    },
+  },
 ];
 
 /**
@@ -824,6 +843,11 @@ const SUBAGENT_NEVER = new Set([
   "list_sessions",
   "search_sessions",
   "read_session",
+  // The manifest is this session's own header and `forget_memory` deletes from the user's durable
+  // memory. A child's task is self-contained; neither read nor delete belongs in its hands, and a
+  // deletion a parent cannot see is the exact shape of a silent destructive action.
+  "read_manifest",
+  "forget_memory",
 ]);
 
 /**

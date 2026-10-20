@@ -214,6 +214,24 @@ export interface SessionPorts {
   read(sessionId: string): Promise<SessionTurn[]>;
 }
 
+/**
+ * One row as `read_manifest` hands it to the model: the stable id, what kind of row it is, the
+ * text, the scope it applies to, and — for a capability — what the live policy said about it.
+ */
+export interface ManifestToolEntry {
+  id: string;
+  kind: string;
+  text: string;
+  scope: string;
+  verified: string | null;
+}
+
+/** The manifest tools' seam: read the session's composed manifest, delete one entry by id. */
+export interface ManifestPorts {
+  read(): Promise<ManifestToolEntry[]>;
+  forget(id: string): Promise<boolean>;
+}
+
 export interface AgentLoopOptions {
   model: string;
   /** Initial conversation (user turns). The loop appends assistant/tool turns internally. */
@@ -261,6 +279,13 @@ export interface AgentLoopOptions {
    * contract `generateImage` has — because an empty list and "no store" are different facts.
    */
   sessions?: SessionPorts;
+  /**
+   * The manifest behind `read_manifest` / `forget_memory`: the scoped rows this turn was given,
+   * and deletion by id. The screen owns the composed manifest (it builds it per turn) and the
+   * memory store; the loop only serves the tools. Absent — tests, the gateway bridge — both
+   * refuse with a sentence rather than reading as "the manifest is empty".
+   */
+  manifest?: ManifestPorts;
   /**
    * The plan-mode facilities behind `enter_plan_mode` / `exit_plan_mode`. Absent — tests, the
    * gateway bridge — both tools refuse with a sentence telling the model to present the plan in
