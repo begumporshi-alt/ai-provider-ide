@@ -96,14 +96,17 @@ fn mtime_ms(path: &Path) -> i64 {
 ///
 /// Streaming rather than `read_to_end`: a Claude or Codex transcript with tool output reaches tens
 /// of megabytes, and a `Vec<Value>` of that is several times the file in memory — while `list()`
-/// touches every discovered file on every call.
-fn for_each_json_line(path: &Path, mut visit: impl FnMut(Value)) {
+/// touches every discovered file on every call. Returning `false` stops the walk, which is what
+/// lets a reader dismiss a non-target rollout after its header line.
+fn for_each_json_line(path: &Path, mut visit: impl FnMut(Value) -> bool) {
     let Ok(file) = fs::File::open(path) else {
         return;
     };
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         if let Ok(value) = serde_json::from_str::<Value>(&line) {
-            visit(value);
+            if !visit(value) {
+                return;
+            }
         }
     }
 }
@@ -288,7 +291,10 @@ impl AgentSource for JsonlSource {
             let mut root: Option<String> = None;
             let mut preview = String::new();
             let mut title = None;
-            let mut updated = mtime_ms(&path);
+            // The file mtime is only a fallback: a transcript's last envelope is older than the
+            // file's write time, so folding the mtime into a running max would erase every real
+            // timestamp.
+            let mut parsed_ts: Option<i64> = None;
             let mut turns = 0usize;
             let mut looks_like_transcript = false;
             for_each_json_line(&path, |line| {
@@ -304,7 +310,7 @@ impl AgentSource for JsonlSource {
                 }
                 if let Some(ts) = line.get("timestamp").and_then(Value::as_str).and_then(rfc3339_ms)
                 {
-                    updated = updated.max(ts);
+                    parsed_ts = Some(parsed_ts.map_or(ts, |cur| cur.max(ts)));
                 }
                 if kind == "user" && preview.is_empty() {
                     let text = line.get("message").map(message_text).unwrap_or_default();
@@ -314,7 +320,9 @@ impl AgentSource for JsonlSource {
                         title = Some(clip(trimmed, 60));
                     }
                 }
+                true
             });
+            let updated = parsed_ts.unwrap_or_else(|| mtime_ms(&path));
             // A claude/qoder project dir should hold only its own transcripts, but a stray JSONL
             // must not become a session: require the envelope's session id and a real turn.
             if !looks_like_transcript {
@@ -354,30 +362,34 @@ impl AgentSource for JsonlSource {
             return Ok(Vec::new());
         };
         let mut turns = Vec::new();
-        let mut fallback_ts = mtime_ms(&path);
+        let fallback_ts = mtime_ms(&path);
         for_each_json_line(&path, |line| {
             let kind = line.get("type").and_then(Value::as_str).unwrap_or("");
             if kind != "user" && kind != "assistant" {
-                return;
+                return true;
             }
             let message = line.get("message").unwrap_or(&Value::Null);
             let text = message_text(message);
             if text.trim().is_empty() {
-                return;
+                return true;
             }
             // A user envelope holding only a tool_result is machine output, not something the
             // human typed; the label is what the importer keys off to keep the distinction.
             let label = envelope_label(message.get("content").unwrap_or(&Value::Null));
             let role = if label == Some("tool") { "assistant" } else { kind };
-            if let Some(ts) = line.get("timestamp").and_then(Value::as_str).and_then(rfc3339_ms) {
-                fallback_ts = fallback_ts.max(ts);
-            }
             turns.push(NormalizedTurn {
                 role: role.to_string(),
                 content: text,
-                ts: fallback_ts,
+                // Per-turn, never the file mtime: this turn's own stamp, or the fallback only
+                // when the envelope carries none.
+                ts: line
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(rfc3339_ms)
+                    .unwrap_or(fallback_ts),
                 label: label.map(str::to_string),
             });
+            true
         });
         Ok(turns)
     }
@@ -426,7 +438,8 @@ impl AgentSource for CodexSource {
             let mut root: Option<String> = None;
             let mut preview = String::new();
             let mut title = None;
-            let mut updated = mtime_ms(&path);
+            // Parsed timestamps only; the mtime is a fallback, never a contender for the max.
+            let mut parsed_ts: Option<i64> = None;
             let mut turns = 0usize;
             for_each_json_line(&path, |line| {
                 if line.get("type").and_then(Value::as_str) == Some("session_meta") {
@@ -439,7 +452,7 @@ impl AgentSource for CodexSource {
                             .to_string();
                         root = line.get("cwd").and_then(Value::as_str).map(str::to_string);
                     }
-                    return;
+                    return true;
                 }
                 if line.get("type").and_then(Value::as_str) == Some("response_item") {
                     turns += 1;
@@ -459,9 +472,11 @@ impl AgentSource for CodexSource {
                 }
                 if let Some(ts) = line.get("timestamp").and_then(Value::as_str).and_then(rfc3339_ms)
                 {
-                    updated = updated.max(ts);
+                    parsed_ts = Some(parsed_ts.map_or(ts, |cur| cur.max(ts)));
                 }
+                true
             });
+            let updated = parsed_ts.unwrap_or_else(|| mtime_ms(&path));
             if native_id.is_empty() {
                 continue;
             }
@@ -490,11 +505,11 @@ impl AgentSource for CodexSource {
         collect_jsonl(base, &mut files, 0);
         let mut turns = Vec::new();
         for path in files {
-            // Check the header before touching the rest: a rollout file names its session on
-            // line one, so a non-target file is dismissed after a single line.
+            // A rollout file names its session on line one. Checking the header and stopping on
+            // the first non-matching file is what keeps a read from parsing the whole tree.
             let mut is_target = false;
             let mut header_checked = false;
-            let mut fallback_ts = mtime_ms(&path);
+            let fallback_ts = mtime_ms(&path);
             for_each_json_line(&path, |line| {
                 if !header_checked {
                     header_checked = true;
@@ -506,17 +521,18 @@ impl AgentSource for CodexSource {
                             == Some(native_id);
                 }
                 if !is_target {
-                    return;
+                    return false;
                 }
                 if line.get("type").and_then(Value::as_str) != Some("response_item") {
-                    return;
+                    return true;
                 }
                 let payload = line.get("payload").unwrap_or(&Value::Null);
                 let kind = payload.get("type").and_then(Value::as_str).unwrap_or("");
-                if let Some(ts) = line.get("timestamp").and_then(Value::as_str).and_then(rfc3339_ms)
-                {
-                    fallback_ts = fallback_ts.max(ts);
-                }
+                let ts = line
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(rfc3339_ms)
+                    .unwrap_or(fallback_ts);
                 if kind == "message" {
                     let role = payload
                         .get("role")
@@ -525,12 +541,7 @@ impl AgentSource for CodexSource {
                         .to_string();
                     let text = payload.get("content").map(value_text).unwrap_or_default();
                     if !text.trim().is_empty() {
-                        turns.push(NormalizedTurn {
-                            role,
-                            content: text,
-                            ts: fallback_ts,
-                            label: None,
-                        });
+                        turns.push(NormalizedTurn { role, content: text, ts, label: None });
                     }
                 } else {
                     let body = payload
@@ -541,10 +552,11 @@ impl AgentSource for CodexSource {
                     turns.push(NormalizedTurn {
                         role: "assistant".into(),
                         content: format!("[tool: {body}]"),
-                        ts: fallback_ts,
+                        ts,
                         label: Some("tool".into()),
                     });
                 }
+                true
             });
             if is_target {
                 break;
@@ -645,23 +657,26 @@ impl AgentSource for ZcodeSource {
         let Some(conn) = self.open() else {
             return Ok(Vec::new());
         };
-        let mut stmt = conn
-            .prepare(
-                "SELECT m.id, m.time_created, m.data, COALESCE(p.data,'')
-                 FROM message m LEFT JOIN part p ON p.message_id = m.id
-                 WHERE m.session_id = ?1 ORDER BY m.sequence, p.sequence",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([native_id], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?;
+        let mut stmt = match conn.prepare(
+            "SELECT m.id, m.time_created, m.data, COALESCE(p.data,'')
+             FROM message m LEFT JOIN part p ON p.message_id = m.id
+             WHERE m.session_id = ?1 ORDER BY m.sequence, p.sequence",
+        ) {
+            Ok(s) => s,
+            // Same contract as `list`: an unreadable store is unavailable, not an error.
+            Err(_) => return Ok(Vec::new()),
+        };
+        let rows = match stmt.query_map([native_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        }) {
+            Ok(rows) => rows,
+            Err(_) => return Ok(Vec::new()),
+        };
 
         let mut order: Vec<String> = Vec::new();
         let mut groups: HashMap<String, (i64, String, Vec<String>)> = HashMap::new();
@@ -785,9 +800,13 @@ impl AgentSource for RouterSource {
         };
 
         let mut previews: HashMap<String, String> = HashMap::new();
+        // A correlated MIN subquery rather than `GROUP BY … HAVING seq = MIN(seq)`: the latter
+        // relies on SQLite's bare-column behaviour and is easy to get subtly wrong.
         if let Ok(mut stmt) = conn.prepare(
-            "SELECT session_id, content FROM session_messages
-             WHERE role = 'user' GROUP BY session_id HAVING seq = MIN(seq)",
+            "SELECT m.session_id, m.content FROM session_messages m
+             WHERE m.role = 'user'
+               AND m.seq = (SELECT MIN(s.seq) FROM session_messages s
+                            WHERE s.session_id = m.session_id AND s.role = 'user')",
         ) {
             if let Ok(rows) =
                 stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
@@ -850,23 +869,20 @@ impl AgentSource for RouterSource {
         let Some(store) = &self.store else {
             return Ok(Vec::new());
         };
-        let conn = store.conn.lock().map_err(|e| e.to_string())?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT role, content, ts FROM session_messages
-                 WHERE session_id = ?1 ORDER BY seq",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([native_id], |r| {
-                Ok(NormalizedTurn {
-                    role: r.get(0)?,
-                    content: r.get(1)?,
-                    ts: r.get(2)?,
-                    label: None,
-                })
-            })
-            .map_err(|e| e.to_string())?;
+        let Ok(conn) = store.conn.lock() else {
+            return Ok(Vec::new());
+        };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT role, content, ts FROM session_messages
+             WHERE session_id = ?1 ORDER BY seq",
+        ) else {
+            return Ok(Vec::new());
+        };
+        let Ok(rows) = stmt.query_map([native_id], |r| {
+            Ok(NormalizedTurn { role: r.get(0)?, content: r.get(1)?, ts: r.get(2)?, label: None })
+        }) else {
+            return Ok(Vec::new());
+        };
         Ok(rows.flatten().collect())
     }
 }
@@ -1079,9 +1095,12 @@ INSERT INTO part VALUES ('p2','m2','s1',950,950,'{"type":"text","text":"Draft: t
         {
             let conn = store.conn.lock().unwrap();
             conn.execute_batch(
+                // Two user turns: the preview must be the FIRST one, which is what the
+                // correlated MIN subquery pins.
                 "INSERT INTO session_messages (session_id, seq, role, content, ts)
                  VALUES ('s-own',1,'user','why is the build slow',100),
-                        ('s-own',2,'assistant','the typecheck runs twice',200);
+                        ('s-own',2,'assistant','the typecheck runs twice',200),
+                        ('s-own',3,'user','and the tests too',300);
                  INSERT INTO session_titles (session_id, title, updated_at)
                  VALUES ('s-own','build speed', 100);",
             )
@@ -1091,10 +1110,46 @@ INSERT INTO part VALUES ('p2','m2','s1',950,950,'{"type":"text","text":"Draft: t
         let refs = src.list().unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].title.as_deref(), Some("build speed"));
-        assert!(refs[0].preview.contains("build slow"));
+        assert!(refs[0].preview.starts_with("why is the build slow"));
         let turns = src.read("s-own").unwrap();
-        assert_eq!(turns.len(), 2);
+        assert_eq!(turns.len(), 3);
         assert_eq!(turns[1].role, "assistant");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn jsonl_turns_keep_their_own_timestamps() {
+        let src = JsonlSource::at("claude", fixture("claude"));
+        let turns = src.read("claude-session").unwrap();
+        // Not the file mtime: the envelope's own stamp, in epoch milliseconds.
+        assert_eq!(turns[0].ts, rfc3339_ms("2026-10-01T10:00:00Z").unwrap());
+        assert_eq!(turns[4].ts, rfc3339_ms("2026-10-01T10:00:09Z").unwrap());
+        assert!(turns[0].ts < turns[4].ts);
+    }
+
+    #[test]
+    fn a_non_target_rollout_is_dismissed_after_its_header() {
+        let dir = std::env::temp_dir().join(format!("aip-codex-src-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Two rollouts; the wanted one sorts second, so a reader that stops at the first
+        // non-match still finds it.
+        fs::write(
+            dir.join("a-meta.jsonl"),
+            "{\"type\":\"session_meta\",\"session_id\":\"other\",\"cwd\":\"/tmp/x\"}\n\
+             {\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"wrong session\"}]},\"timestamp\":\"2026-10-01T00:00:00Z\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("b-meta.jsonl"),
+            "{\"type\":\"session_meta\",\"session_id\":\"wanted\",\"cwd\":\"/tmp/y\"}\n\
+             {\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"right session\"}]},\"timestamp\":\"2026-10-02T00:00:00Z\"}\n",
+        )
+        .unwrap();
+        let src = CodexSource::at(dir.clone());
+        let turns = src.read("wanted").unwrap();
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].content.contains("right session"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1115,7 +1170,22 @@ INSERT INTO part VALUES ('p2','m2','s1',950,950,'{"type":"text","text":"Draft: t
         let src = ZcodeSource::new();
         let refs = src.list().unwrap();
         assert!(!refs.is_empty(), "the live store should expose sessions");
-        let turns = src.read(&refs[0].native_id).unwrap();
+        let newest = &refs[0];
+        assert!(newest.preview.len() > 10, "the live preview requires the real data/text keys");
+        assert!(
+            newest.updated_at > 1_600_000_000_000,
+            "session.time_updated is epoch milliseconds, got {}",
+            newest.updated_at
+        );
+        let turns = src.read(&newest.native_id).unwrap();
         assert!(!turns.is_empty(), "the newest session should have a readable transcript");
+        assert!(
+            turns.iter().any(|t| t.role == "user"),
+            "a real transcript contains the user's prompts"
+        );
+        assert!(
+            turns.iter().any(|t| t.ts > 1_600_000_000_000),
+            "message.time_created is epoch milliseconds"
+        );
     }
 }
