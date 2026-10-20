@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"c1a1a1a1-0000-0000-0000-000000000001","cwd":"/tmp/proj-alpha","timestamp":"2026-10-01T10:00:00Z","uuid":"u1","parentUuid":null,"message":{"role":"user","content":"fix the flaky test"}}
+{"type":"assistant","sessionId":"c1a1a1a1-0000-0000-0000-000000000001","cwd":"/tmp/proj-alpha","timestamp":"2026-10-01T10:00:05Z","uuid":"u2","parentUuid":"u1","message":{"role":"assistant","content":[{"type":"text","text":"The retry loop raced the fixture teardown. Patched."}]}}
