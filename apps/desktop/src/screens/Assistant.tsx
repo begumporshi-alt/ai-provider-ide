@@ -1604,9 +1604,11 @@ function Chat({
           text: e.text,
           scope: e.scope.global
             ? "global"
-            : e.scope.project
-              ? `project:${e.scope.project}`
-              : "unscoped",
+            : e.scope.agent
+              ? `agent:${e.scope.agent}`
+              : e.scope.project
+                ? `project:${e.scope.project}`
+                : "unscoped",
           verified: e.kind === "capability" ? e.verified : null,
         })),
       forget: async (id: string) => {
@@ -2850,6 +2852,9 @@ function Chat({
         setUsedSkills([]);
         setManualRefs([]);
         setDismissedUrls(new Set());
+        // The previous conversation's header does not belong to this resume.
+        manifestRef.current = null;
+        setManifest(null);
         // Session-scoped live state belongs to the conversation that was on screen. The progress
         // capsule and a run's "what changed" card must not follow the user into a resumed session;
         // the card is actionable, and its paths are relative to the old turn.
@@ -2930,6 +2935,10 @@ function Chat({
     // reset here.
     setManualRefs([]);
     setDismissedUrls(new Set());
+    // The card is this session's header. A new chat must not inherit the previous session's
+    // manifest — including rows scoped to a different workspace.
+    manifestRef.current = null;
+    setManifest(null);
     useUi.getState().setResumeSessionId(undefined);
   }
 
@@ -2975,6 +2984,9 @@ function Chat({
     setUsedSkills([]);
     setManualRefs([]);
     setDismissedUrls(new Set());
+    // Same rule as `newChat`: the manifest is scoped to the session/workspace on screen.
+    manifestRef.current = null;
+    setManifest(null);
     setTodos([]);
     setRunChanges(null);
     timelineRef.current = [];

@@ -197,11 +197,14 @@ describe("AGENT_TOOLS", () => {
     expect(toolEffect("not_a_tool")).toBe("mutate");
   });
 
-  it("exposes the manifest tools and keeps delete out of subagents", () => {
+  it("exposes the manifest tools and keeps both out of subagents", () => {
     const names = AGENT_TOOLS.map((t) => t.name);
     expect(names).toContain("read_manifest");
     expect(names).toContain("forget_memory");
+    expect(subagentTools(false).map((t) => t.name)).not.toContain("read_manifest");
     expect(subagentTools(false).map((t) => t.name)).not.toContain("forget_memory");
+    expect(subagentTools(true).map((t) => t.name)).not.toContain("read_manifest");
+    expect(subagentTools(true).map((t) => t.name)).not.toContain("forget_memory");
     expect(toolEffect("forget_memory")).toBe("mutate");
   });
 });

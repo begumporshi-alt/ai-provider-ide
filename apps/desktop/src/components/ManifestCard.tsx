@@ -33,15 +33,8 @@ export function ManifestCard({
             >
               {e.kind}
             </span>
-            <span className={e.verified === "contradicted" ? "line-through opacity-70" : ""}>
-              {e.text}
-            </span>
-            <span
-              className="ml-auto shrink-0 font-mono text-[10px]"
-              style={{ color: "var(--text-faint)" }}
-            >
-              {e.id}
-            </span>
+            {/* The session capsules float over the card's right gutter; the only destructive
+                control sits at the left so it stays a real, clickable target. */}
             {onForget ? (
               <button
                 type="button"
@@ -52,6 +45,15 @@ export function ManifestCard({
                 ×
               </button>
             ) : null}
+            <span className={e.verified === "contradicted" ? "line-through opacity-70" : ""}>
+              {e.text}
+            </span>
+            <span
+              className="ml-auto shrink-0 font-mono text-[10px]"
+              style={{ color: "var(--text-faint)" }}
+            >
+              {e.id}
+            </span>
           </li>
         ))}
       </ul>
