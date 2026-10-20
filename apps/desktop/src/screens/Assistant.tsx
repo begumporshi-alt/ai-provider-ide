@@ -3099,6 +3099,31 @@ function Chat({
                 })),
               ),
           },
+          // The foreign-agent session surface behind search_agents / load_session: the host's
+          // `/admin/sources*` routes, mapped to the loop's camelCase shape. Read-only on the foreign
+          // store — load_session is the only write, and it is the host's consenting import route.
+          sources: {
+            listSources: () =>
+              invoke<{ name: string; available: boolean; sessionCount: number; note: string | null }[]>(
+                "admin_sources_list",
+              ).catch(() => []),
+            searchSessions: (query, root, limit) =>
+              invoke<
+                {
+                  source: string; nativeId: string; title: string | null; root: string | null;
+                  turns: number; preview: string; importId: string | null;
+                }[]
+              >("admin_source_sessions", { source: null, query, root, limit }).then((rows) =>
+                rows.map((r) => ({
+                  source: r.source, nativeId: r.nativeId, title: r.title, root: r.root,
+                  turns: r.turns, preview: r.preview, importId: r.importId,
+                })),
+              ),
+            importSession: (source, nativeId) =>
+              invoke<{ sessionId: string; turns: number }>("admin_source_import", {
+                source, native_id: nativeId,
+              }),
+          },
         },
         {
           generate: gatewayGenerate,

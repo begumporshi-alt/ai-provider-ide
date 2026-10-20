@@ -71,6 +71,24 @@ pub trait AgentSource {
     fn read(&self, native_id: &str) -> Result<Vec<NormalizedTurn>, String>;
 }
 
+/// What `admin_sources_list` returns: the host's view of one adapter.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceListing {
+    pub name: String,
+    pub available: bool,
+    pub session_count: usize,
+    pub note: Option<String>,
+}
+
+/// What `admin_source_import` returns: the derived session id and the turn count stored.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportResult {
+    pub session_id: String,
+    pub turns: usize,
+}
+
 // ---------- shared helpers ----------
 
 fn home() -> Option<PathBuf> {

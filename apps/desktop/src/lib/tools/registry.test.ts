@@ -14,11 +14,24 @@
  * silently un-gate a writing tool, so the names are pinned in both places.
  */
 import { describe, expect, it } from "vitest";
-import { AGENT_TOOLS, SUBAGENT_TOOLS, registryToOpenAI, subagentTools, toolEffect } from "./registry";
+import {
+  AGENT_TOOLS,
+  SUBAGENT_TOOLS,
+  registryToOpenAI,
+  subagentTools,
+  toolEffect,
+} from "./registry";
 
 /** The write-effect tools. The Rust `MUTATING_TOOLS` additionally gates the web tools as egress;
  *  those carry the `network` effect here, not `mutate`. */
-const GATEWAY_MUTATING = ["write_file", "edit_file", "mkdir", "run_command", "http_request", "apply_patch"];
+const GATEWAY_MUTATING = [
+  "write_file",
+  "edit_file",
+  "mkdir",
+  "run_command",
+  "http_request",
+  "apply_patch",
+];
 /** Assistant-only composites the gateway never sees: `edit_notebook` is read_file + write_file
  *  assembled in the agent loop, `generate_image` writes through the base64 encoding the loop
  *  adds to write_file, `process_kill` stops a job only this sandbox's background table knows
@@ -59,7 +72,10 @@ describe("AGENT_TOOLS", () => {
   it("every required field is declared in properties", () => {
     for (const t of AGENT_TOOLS) {
       for (const field of t.parameters.required ?? []) {
-        expect(Object.keys(t.parameters.properties), `${t.name}.${field}`).toContain(field);
+        expect(
+          Object.keys(t.parameters.properties),
+          `${t.name}.${field}`,
+        ).toContain(field);
       }
     }
   });
@@ -69,17 +85,24 @@ describe("AGENT_TOOLS", () => {
       for (const [key, raw] of Object.entries(t.parameters.properties)) {
         const spec = raw as { type?: string; description?: string };
         expect(spec.type, `${t.name}.${key}`).toBeTruthy();
-        expect(spec.description?.trim().length ?? 0, `${t.name}.${key}`).toBeGreaterThan(0);
+        expect(
+          spec.description?.trim().length ?? 0,
+          `${t.name}.${key}`,
+        ).toBeGreaterThan(0);
       }
     }
   });
 
   it("the mutating set is exactly the four the gateway gates", () => {
-    expect(MUTATING.filter((m) => AGENT_TOOLS.some((t) => t.name === m))).toEqual(MUTATING);
+    expect(
+      MUTATING.filter((m) => AGENT_TOOLS.some((t) => t.name === m)),
+    ).toEqual(MUTATING);
     // The complement must be read-only: a tool that is neither listed nor read-only is a
     // tool that writes without being gated. `todo_write` only feeds the progress capsule —
     // it never touches the workspace — so it belongs on the read-only side.
-    const readOnly = AGENT_TOOLS.filter((t) => !MUTATING.includes(t.name)).map((t) => t.name);
+    const readOnly = AGENT_TOOLS.filter((t) => !MUTATING.includes(t.name)).map(
+      (t) => t.name,
+    );
     expect(readOnly.sort()).toEqual([
       "browser_console",
       "browser_expect",
@@ -98,6 +121,7 @@ describe("AGENT_TOOLS", () => {
       "glob",
       "list_dir",
       "list_sessions",
+      "load_session",
       "load_skill",
       "process_output",
       "read_document",
@@ -106,6 +130,7 @@ describe("AGENT_TOOLS", () => {
       "read_manifest",
       "read_notebook",
       "read_session",
+      "search_agents",
       "search_files",
       "search_sessions",
       "todo_write",
@@ -113,7 +138,9 @@ describe("AGENT_TOOLS", () => {
       "web_fetch",
       "web_search",
     ]);
-    expect(ASSISTANT_MUTATING.every((m) => AGENT_TOOLS.some((t) => t.name === m))).toBe(true);
+    expect(
+      ASSISTANT_MUTATING.every((m) => AGENT_TOOLS.some((t) => t.name === m)),
+    ).toBe(true);
   });
 
   it("editing is possible without rewriting a whole file", () => {
@@ -201,10 +228,18 @@ describe("AGENT_TOOLS", () => {
     const names = AGENT_TOOLS.map((t) => t.name);
     expect(names).toContain("read_manifest");
     expect(names).toContain("forget_memory");
-    expect(subagentTools(false).map((t) => t.name)).not.toContain("read_manifest");
-    expect(subagentTools(false).map((t) => t.name)).not.toContain("forget_memory");
-    expect(subagentTools(true).map((t) => t.name)).not.toContain("read_manifest");
-    expect(subagentTools(true).map((t) => t.name)).not.toContain("forget_memory");
+    expect(subagentTools(false).map((t) => t.name)).not.toContain(
+      "read_manifest",
+    );
+    expect(subagentTools(false).map((t) => t.name)).not.toContain(
+      "forget_memory",
+    );
+    expect(subagentTools(true).map((t) => t.name)).not.toContain(
+      "read_manifest",
+    );
+    expect(subagentTools(true).map((t) => t.name)).not.toContain(
+      "forget_memory",
+    );
     expect(toolEffect("forget_memory")).toBe("mutate");
   });
 });
@@ -213,7 +248,10 @@ describe("registryToOpenAI", () => {
   it("renders one function per tool and forces additionalProperties off", () => {
     const wire = registryToOpenAI(AGENT_TOOLS) as {
       type: string;
-      function: { name: string; parameters: { additionalProperties: boolean; required: string[] } };
+      function: {
+        name: string;
+        parameters: { additionalProperties: boolean; required: string[] };
+      };
     }[];
     expect(wire).toHaveLength(AGENT_TOOLS.length);
     for (const w of wire) {

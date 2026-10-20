@@ -40,15 +40,18 @@ export const AGENT_TOOLS: ToolSpec[] = [
       properties: {
         path: {
           type: "string",
-          description: 'Workspace-relative path, e.g. "src/main.rs". Cannot be absolute or escape the root.',
+          description:
+            'Workspace-relative path, e.g. "src/main.rs". Cannot be absolute or escape the root.',
         },
         offset: {
           type: "number",
-          description: "Optional first line to return, 1-based. Omit to start at the top.",
+          description:
+            "Optional first line to return, 1-based. Omit to start at the top.",
         },
         limit: {
           type: "number",
-          description: "Optional number of lines to return. Omit to read to the end.",
+          description:
+            "Optional number of lines to return. Omit to read to the end.",
         },
       },
       required: ["path"],
@@ -70,16 +73,19 @@ export const AGENT_TOOLS: ToolSpec[] = [
   {
     name: "list_dir",
     effect: "read",
-    description: "List the entries of a workspace directory. Defaults to the workspace root.",
+    description:
+      "List the entries of a workspace directory. Defaults to the workspace root.",
     parameters: {
       properties: {
         path: {
           type: "string",
-          description: "Workspace-relative directory path. Optional; defaults to \".\".",
+          description:
+            'Workspace-relative directory path. Optional; defaults to ".".',
         },
         recursive: {
           type: "boolean",
-          description: "Optional. true to include subdirectories instead of just one level.",
+          description:
+            "Optional. true to include subdirectories instead of just one level.",
         },
       },
       required: [],
@@ -89,17 +95,22 @@ export const AGENT_TOOLS: ToolSpec[] = [
     name: "search_files",
     effect: "read",
     description:
-      "Search the workspace for a LITERAL string (no regex) and return matching lines as path:line: text. Case-insensitive by default. Good for a name you already know. For a PATTERN — a regex, alternative spellings, a whole-word match, or finding definitions by shape — use run_command with rg instead (rg -n \"fn handle_(request|response)\" src; rg -nw MyType). This tool cannot express those.",
+      'Search the workspace for a LITERAL string (no regex) and return matching lines as path:line: text. Case-insensitive by default. Good for a name you already know. For a PATTERN — a regex, alternative spellings, a whole-word match, or finding definitions by shape — use run_command with rg instead (rg -n "fn handle_(request|response)" src; rg -nw MyType). This tool cannot express those.',
     parameters: {
       properties: {
-        pattern: { type: "string", description: "Literal text to find. Not a regex." },
+        pattern: {
+          type: "string",
+          description: "Literal text to find. Not a regex.",
+        },
         path: {
           type: "string",
-          description: "Optional workspace-relative file or directory to search. Defaults to \".\".",
+          description:
+            'Optional workspace-relative file or directory to search. Defaults to ".".',
         },
         case_sensitive: {
           type: "boolean",
-          description: "Optional. true to match case exactly (default is case-insensitive).",
+          description:
+            "Optional. true to match case exactly (default is case-insensitive).",
         },
       },
       required: ["pattern"],
@@ -124,12 +135,23 @@ export const AGENT_TOOLS: ToolSpec[] = [
       "Replace an exact snippet in a file. The snippet must match exactly — including indentation — and must occur exactly once unless replace_all is true. Safer than rewriting a whole file.",
     parameters: {
       properties: {
-        path: { type: "string", description: "Workspace-relative path of the file to edit." },
-        old: { type: "string", description: "Exact text to find. Quote enough surrounding lines to make it unique." },
-        new: { type: "string", description: "Replacement text. May be empty to delete the snippet." },
+        path: {
+          type: "string",
+          description: "Workspace-relative path of the file to edit.",
+        },
+        old: {
+          type: "string",
+          description:
+            "Exact text to find. Quote enough surrounding lines to make it unique.",
+        },
+        new: {
+          type: "string",
+          description: "Replacement text. May be empty to delete the snippet.",
+        },
         replace_all: {
           type: "boolean",
-          description: "Optional. true to replace every occurrence instead of refusing an ambiguous match.",
+          description:
+            "Optional. true to replace every occurrence instead of refusing an ambiguous match.",
         },
       },
       required: ["path", "old", "new"],
@@ -138,10 +160,14 @@ export const AGENT_TOOLS: ToolSpec[] = [
   {
     name: "mkdir",
     effect: "mutate",
-    description: "Create a directory inside the workspace, including any missing parents.",
+    description:
+      "Create a directory inside the workspace, including any missing parents.",
     parameters: {
       properties: {
-        path: { type: "string", description: "Workspace-relative directory path." },
+        path: {
+          type: "string",
+          description: "Workspace-relative directory path.",
+        },
       },
       required: ["path"],
     },
@@ -165,7 +191,8 @@ export const AGENT_TOOLS: ToolSpec[] = [
         },
         timeout_ms: {
           type: "number",
-          description: "Optional wall-clock timeout in ms (enforced upper bound is 60 000).",
+          description:
+            "Optional wall-clock timeout in ms (enforced upper bound is 60 000).",
         },
         background: {
           type: "boolean",
@@ -183,7 +210,10 @@ export const AGENT_TOOLS: ToolSpec[] = [
       "Point the connected browser tab at a URL and wait for the page to settle. Drives the user's own Chrome (or Chromium/Edge) started with --remote-debugging-port=9222 — nothing is spawned. Follow with browser_snapshot to see what the page offers.",
     parameters: {
       properties: {
-        url: { type: "string", description: "The page to open — an http(s) or file:// URL." },
+        url: {
+          type: "string",
+          description: "The page to open — an http(s) or file:// URL.",
+        },
         port: {
           type: "number",
           description: "Optional debugger port. Defaults to 9222.",
@@ -199,7 +229,10 @@ export const AGENT_TOOLS: ToolSpec[] = [
       "List the connected page's visible interactive elements — buttons, links, inputs — each as [N] with its label. The [N] indexes are how browser_click and browser_fill address elements, and they go stale when the page changes: re-snapshot after navigating or clicking.",
     parameters: {
       properties: {
-        port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+        port: {
+          type: "number",
+          description: "Optional debugger port. Defaults to 9222.",
+        },
       },
       required: [],
     },
@@ -211,8 +244,14 @@ export const AGENT_TOOLS: ToolSpec[] = [
       "Click a snapshot element with real mouse events at its position — hover, focus and the page's own event path run exactly as a user's click. The index is valid only for the most recent browser_snapshot.",
     parameters: {
       properties: {
-        element: { type: "number", description: "The [N] index from the latest browser_snapshot." },
-        port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+        element: {
+          type: "number",
+          description: "The [N] index from the latest browser_snapshot.",
+        },
+        port: {
+          type: "number",
+          description: "Optional debugger port. Defaults to 9222.",
+        },
       },
       required: ["element"],
     },
@@ -224,9 +263,15 @@ export const AGENT_TOOLS: ToolSpec[] = [
       "Type a value into a snapshot element — text input, textarea, select or contenteditable. Delivered the way React and other frameworks listen for (native setter + input/change events), so controlled inputs update. The index is valid only for the most recent browser_snapshot.",
     parameters: {
       properties: {
-        element: { type: "number", description: "The [N] index from the latest browser_snapshot." },
+        element: {
+          type: "number",
+          description: "The [N] index from the latest browser_snapshot.",
+        },
         text: { type: "string", description: "The value to enter." },
-        port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+        port: {
+          type: "number",
+          description: "Optional debugger port. Defaults to 9222.",
+        },
       },
       required: ["element", "text"],
     },
@@ -240,24 +285,32 @@ export const AGENT_TOOLS: ToolSpec[] = [
       properties: {
         path: {
           type: "string",
-          description: "Optional workspace-relative save path. Defaults to images/browser-<timestamp>.png.",
+          description:
+            "Optional workspace-relative save path. Defaults to images/browser-<timestamp>.png.",
         },
-        port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+        port: {
+          type: "number",
+          description: "Optional debugger port. Defaults to 9222.",
+        },
         viewport_width: {
           type: "number",
-          description: "Optional emulated viewport width in CSS px for a mobile/tablet capture. Requires viewport_height.",
+          description:
+            "Optional emulated viewport width in CSS px for a mobile/tablet capture. Requires viewport_height.",
         },
         viewport_height: {
           type: "number",
-          description: "Optional emulated viewport height in CSS px. Requires viewport_width.",
+          description:
+            "Optional emulated viewport height in CSS px. Requires viewport_width.",
         },
         mobile: {
           type: "boolean",
-          description: "Optional. true enables mobile emulation (meta viewport handling). Defaults to false.",
+          description:
+            "Optional. true enables mobile emulation (meta viewport handling). Defaults to false.",
         },
         device_scale_factor: {
           type: "number",
-          description: "Optional device pixel ratio for the emulated viewport. Defaults to 1.",
+          description:
+            "Optional device pixel ratio for the emulated viewport. Defaults to 1.",
         },
       },
       required: [],
@@ -272,45 +325,58 @@ export const AGENT_TOOLS: ToolSpec[] = [
       properties: {
         path: {
           type: "string",
-          description: "Optional workspace-relative .pdf save path. Defaults to documents/print-<timestamp>.pdf.",
+          description:
+            "Optional workspace-relative .pdf save path. Defaults to documents/print-<timestamp>.pdf.",
         },
-        port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+        port: {
+          type: "number",
+          description: "Optional debugger port. Defaults to 9222.",
+        },
         paper: {
           type: "string",
           enum: ["a4", "letter", "legal"],
-          description: "Optional paper size. Without it Chrome uses the page's CSS @page size (Letter when unspecified).",
+          description:
+            "Optional paper size. Without it Chrome uses the page's CSS @page size (Letter when unspecified).",
         },
         paper_width_in: {
           type: "number",
-          description: "Optional custom paper width in inches. Requires paper_height_in.",
+          description:
+            "Optional custom paper width in inches. Requires paper_height_in.",
         },
         paper_height_in: {
           type: "number",
-          description: "Optional custom paper height in inches. Requires paper_width_in.",
+          description:
+            "Optional custom paper height in inches. Requires paper_width_in.",
         },
         margin_in: {
           type: "number",
-          description: "Optional uniform margin in inches; requires paper or custom paper dimensions. Without paper, CSS @page margins apply.",
+          description:
+            "Optional uniform margin in inches; requires paper or custom paper dimensions. Without paper, CSS @page margins apply.",
         },
         landscape: {
           type: "boolean",
-          description: "Optional. true renders landscape pages. Defaults to portrait.",
+          description:
+            "Optional. true renders landscape pages. Defaults to portrait.",
         },
         viewport_width: {
           type: "number",
-          description: "Optional emulated viewport width in CSS px for mobile/tablet print. Requires viewport_height.",
+          description:
+            "Optional emulated viewport width in CSS px for mobile/tablet print. Requires viewport_height.",
         },
         viewport_height: {
           type: "number",
-          description: "Optional emulated viewport height in CSS px. Requires viewport_width.",
+          description:
+            "Optional emulated viewport height in CSS px. Requires viewport_width.",
         },
         mobile: {
           type: "boolean",
-          description: "Optional. true enables mobile emulation (meta viewport handling). Defaults to false.",
+          description:
+            "Optional. true enables mobile emulation (meta viewport handling). Defaults to false.",
         },
         device_scale_factor: {
           type: "number",
-          description: "Optional device pixel ratio for the emulated viewport. Defaults to 1.",
+          description:
+            "Optional device pixel ratio for the emulated viewport. Defaults to 1.",
         },
       },
       required: [],
@@ -323,7 +389,10 @@ export const AGENT_TOOLS: ToolSpec[] = [
       "Report the console output and uncaught exceptions the connected page has printed since the last browser_console call, oldest first. This is how you learn WHY something did not work — a click that 'did nothing' usually threw. Drains: call it after acting on the page, and it will be quiet the second time.",
     parameters: {
       properties: {
-        port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+        port: {
+          type: "number",
+          description: "Optional debugger port. Defaults to 9222.",
+        },
       },
       required: [],
     },
@@ -335,7 +404,10 @@ export const AGENT_TOOLS: ToolSpec[] = [
       "Report requests that failed since the last browser_network call — 4xx/5xx responses, and requests that never got one (refused connection, CORS, DNS). Drains like browser_console. Only failures are kept; a request that loaded is not reported.",
     parameters: {
       properties: {
-        port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+        port: {
+          type: "number",
+          description: "Optional debugger port. Defaults to 9222.",
+        },
       },
       required: [],
     },
@@ -347,9 +419,18 @@ export const AGENT_TOOLS: ToolSpec[] = [
       "Block until the page's visible text contains the given string (up to 30 000 ms, default 10 000). Use after clicking something asynchronous instead of guessing with repeated snapshots — a wait that times out means the page did not do what you expected.",
     parameters: {
       properties: {
-        text: { type: "string", description: "The string to wait for in the page's visible text." },
-        timeout_ms: { type: "number", description: "Optional deadline in ms (250–30 000, default 10 000)." },
-        port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+        text: {
+          type: "string",
+          description: "The string to wait for in the page's visible text.",
+        },
+        timeout_ms: {
+          type: "number",
+          description: "Optional deadline in ms (250–30 000, default 10 000).",
+        },
+        port: {
+          type: "number",
+          description: "Optional debugger port. Defaults to 9222.",
+        },
       },
       required: ["text"],
     },
@@ -358,16 +439,26 @@ export const AGENT_TOOLS: ToolSpec[] = [
     name: "browser_expect",
     effect: "read",
     description:
-      "Assert that the page satisfies an expectation, retrying until a deadline: kind \"text\" (visible text contains value), \"element\" (a CSS selector matches), \"url\" or \"title\" (contains value). The assertion form of browser_wait_for — a miss reports what the page actually showed (title, URL, or text), so a failed test is a diagnosis, not a guess.",
+      'Assert that the page satisfies an expectation, retrying until a deadline: kind "text" (visible text contains value), "element" (a CSS selector matches), "url" or "title" (contains value). The assertion form of browser_wait_for — a miss reports what the page actually showed (title, URL, or text), so a failed test is a diagnosis, not a guess.',
     parameters: {
       properties: {
-        kind: { type: "string", description: "What to assert: \"text\", \"element\", \"url\", or \"title\"." },
+        kind: {
+          type: "string",
+          description: 'What to assert: "text", "element", "url", or "title".',
+        },
         value: {
           type: "string",
-          description: "For text/url/title: the string that must appear. For element: a CSS selector.",
+          description:
+            "For text/url/title: the string that must appear. For element: a CSS selector.",
         },
-        timeout_ms: { type: "number", description: "Optional deadline in ms (250–30 000, default 10 000)." },
-        port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+        timeout_ms: {
+          type: "number",
+          description: "Optional deadline in ms (250–30 000, default 10 000).",
+        },
+        port: {
+          type: "number",
+          description: "Optional debugger port. Defaults to 9222.",
+        },
       },
       required: ["kind", "value"],
     },
@@ -379,7 +470,10 @@ export const AGENT_TOOLS: ToolSpec[] = [
       "Start the machine's Chrome (or Chromium/Edge/Brave) with the debugger port so the browser tools can attach, using a dedicated throwaway profile. Use after a browser tool reported that no browser is answering. A browser already answering is reported as success, so calling this twice is safe.",
     parameters: {
       properties: {
-        port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+        port: {
+          type: "number",
+          description: "Optional debugger port. Defaults to 9222.",
+        },
       },
       required: [],
     },
@@ -401,14 +495,19 @@ export const AGENT_TOOLS: ToolSpec[] = [
       "Open a URL in the connected Android device's browser and wait briefly for it to load. From the standard emulator, 10.0.2.2 reaches the host. Use device_list first if unsure.",
     parameters: {
       properties: {
-        url: { type: "string", description: "http:// or https:// URL to open." },
+        url: {
+          type: "string",
+          description: "http:// or https:// URL to open.",
+        },
         serial: {
           type: "string",
-          description: "Optional adb serial from device_list. Defaults to the first ready device.",
+          description:
+            "Optional adb serial from device_list. Defaults to the first ready device.",
         },
         wait_ms: {
           type: "number",
-          description: "Optional wait after launching, in ms (default 1500, max 10000).",
+          description:
+            "Optional wait after launching, in ms (default 1500, max 10000).",
         },
       },
       required: ["url"],
@@ -423,11 +522,13 @@ export const AGENT_TOOLS: ToolSpec[] = [
       properties: {
         serial: {
           type: "string",
-          description: "Optional adb serial from device_list. Defaults to the first ready device.",
+          description:
+            "Optional adb serial from device_list. Defaults to the first ready device.",
         },
         path: {
           type: "string",
-          description: "Optional workspace-relative .png save path. Defaults to images/device-<serial>-<timestamp>.png.",
+          description:
+            "Optional workspace-relative .png save path. Defaults to images/device-<serial>-<timestamp>.png.",
         },
       },
       required: [],
@@ -477,11 +578,13 @@ export const AGENT_TOOLS: ToolSpec[] = [
       properties: {
         pattern: {
           type: "string",
-          description: 'Glob relative to the workspace root, e.g. "src/**/*.rs". May not contain "..".',
+          description:
+            'Glob relative to the workspace root, e.g. "src/**/*.rs". May not contain "..".',
         },
         path: {
           type: "string",
-          description: 'Optional workspace-relative base directory to match within. Defaults to ".".',
+          description:
+            'Optional workspace-relative base directory to match within. Defaults to ".".',
         },
       },
       required: ["pattern"],
@@ -494,7 +597,10 @@ export const AGENT_TOOLS: ToolSpec[] = [
       "Read text from a PDF or Word (.docx) document in the workspace — the binary documents read_file cannot serve. Text is capped.",
     parameters: {
       properties: {
-        path: { type: "string", description: "Workspace-relative path of the .pdf or .docx." },
+        path: {
+          type: "string",
+          description: "Workspace-relative path of the .pdf or .docx.",
+        },
       },
       required: ["path"],
     },
@@ -506,7 +612,10 @@ export const AGENT_TOOLS: ToolSpec[] = [
       "Read a workspace image (png/jpg/gif/webp, 4 MB cap) so a vision-capable model can see it in the next turn.",
     parameters: {
       properties: {
-        path: { type: "string", description: "Workspace-relative path of the image." },
+        path: {
+          type: "string",
+          description: "Workspace-relative path of the image.",
+        },
       },
       required: ["path"],
     },
@@ -519,7 +628,10 @@ export const AGENT_TOOLS: ToolSpec[] = [
     parameters: {
       properties: {
         url: { type: "string", description: "The page's public http(s) URL." },
-        question: { type: "string", description: "What you want to know from that page." },
+        question: {
+          type: "string",
+          description: "What you want to know from that page.",
+        },
       },
       required: ["url", "question"],
     },
@@ -531,13 +643,24 @@ export const AGENT_TOOLS: ToolSpec[] = [
       "Run one HTTP request against a public URL: method, headers, body; returns the response. It sends data out, so it is always confirmed; private hosts are refused.",
     parameters: {
       properties: {
-        url: { type: "string", description: "Public http(s) URL. Redirects are reported, not followed." },
+        url: {
+          type: "string",
+          description:
+            "Public http(s) URL. Redirects are reported, not followed.",
+        },
         method: {
           type: "string",
-          description: "Optional: GET (default), POST, PUT, PATCH, DELETE, HEAD, OPTIONS.",
+          description:
+            "Optional: GET (default), POST, PUT, PATCH, DELETE, HEAD, OPTIONS.",
         },
-        headers: { type: "object", description: "Optional request headers as name/value strings." },
-        body: { type: "string", description: "Optional request body (POST/PUT/PATCH only)." },
+        headers: {
+          type: "object",
+          description: "Optional request headers as name/value strings.",
+        },
+        body: {
+          type: "string",
+          description: "Optional request body (POST/PUT/PATCH only).",
+        },
       },
       required: ["url"],
     },
@@ -551,7 +674,8 @@ export const AGENT_TOOLS: ToolSpec[] = [
       properties: {
         patch: {
           type: "string",
-          description: "The full unified diff, ---/+++ and @@ hunks included. New files start from /dev/null.",
+          description:
+            "The full unified diff, ---/+++ and @@ hunks included. New files start from /dev/null.",
         },
       },
       required: ["patch"],
@@ -570,8 +694,14 @@ export const AGENT_TOOLS: ToolSpec[] = [
           items: {
             type: "object",
             properties: {
-              content: { type: "string", description: "The task, one sentence." },
-              status: { type: "string", enum: ["pending", "in_progress", "completed"] },
+              content: {
+                type: "string",
+                description: "The task, one sentence.",
+              },
+              status: {
+                type: "string",
+                enum: ["pending", "in_progress", "completed"],
+              },
             },
             required: ["content", "status"],
           },
@@ -606,7 +736,8 @@ export const AGENT_TOOLS: ToolSpec[] = [
       properties: {
         plan: {
           type: "string",
-          description: "The complete plan, in markdown. This exact text is what the user reviews.",
+          description:
+            "The complete plan, in markdown. This exact text is what the user reviews.",
         },
       },
       required: ["plan"],
@@ -621,7 +752,8 @@ export const AGENT_TOOLS: ToolSpec[] = [
       properties: {
         url: {
           type: "string",
-          description: "The page's public http(s) URL. Redirects are reported, not followed — call again on the Location.",
+          description:
+            "The page's public http(s) URL. Redirects are reported, not followed — call again on the Location.",
         },
       },
       required: ["url"],
@@ -634,7 +766,10 @@ export const AGENT_TOOLS: ToolSpec[] = [
       "Search the public web (keyless, automatic fallback between backends) and get the top results: title, URL and snippet. Follow up with web_fetch to read a result.",
     parameters: {
       properties: {
-        query: { type: "string", description: "What to search for, in the user's terms." },
+        query: {
+          type: "string",
+          description: "What to search for, in the user's terms.",
+        },
       },
       required: ["query"],
     },
@@ -703,7 +838,11 @@ export const AGENT_TOOLS: ToolSpec[] = [
       "Load the full instructions of an installed skill. The system prompt lists the available skills by name with a one-line summary; when the current task matches one, load it here and follow its procedure before acting.",
     parameters: {
       properties: {
-        name: { type: "string", description: "The skill's name, exactly as the system prompt's skill list shows it." },
+        name: {
+          type: "string",
+          description:
+            "The skill's name, exactly as the system prompt's skill list shows it.",
+        },
       },
       required: ["name"],
     },
@@ -715,15 +854,19 @@ export const AGENT_TOOLS: ToolSpec[] = [
       "Generate an image from a text prompt through the gateway's image route and save it into the workspace (images/ by default). The saved file is also attached as an image part, so a vision-capable model can see what it made. REQUIRES a provider that serves image generations (OpenRouter, OpenAI, Replicate…): none of the providers configured by default does, so this call fails with NO_ROUTE until one is added in Settings → Providers. Check that before promising an image; sips through run_command can resize or convert an existing file, but cannot create one.",
     parameters: {
       properties: {
-        prompt: { type: "string", description: "What the image should show. Be specific and concrete." },
+        prompt: {
+          type: "string",
+          description: "What the image should show. Be specific and concrete.",
+        },
         path: {
           type: "string",
-          description: "Optional workspace-relative save path. Defaults to images/generated-<timestamp>.png.",
+          description:
+            "Optional workspace-relative save path. Defaults to images/generated-<timestamp>.png.",
         },
         model: {
           type: "string",
           description:
-            "Optional image model as \"provider/model\". Defaults to the configured default image model.",
+            'Optional image model as "provider/model". Defaults to the configured default image model.',
         },
       },
       required: ["prompt"],
@@ -736,7 +879,10 @@ export const AGENT_TOOLS: ToolSpec[] = [
       "List the cells of a Jupyter notebook (.ipynb): index, type, execution count, outputs and a one-line preview of each — the map that edit_notebook targets by index.",
     parameters: {
       properties: {
-        path: { type: "string", description: "Workspace-relative path of the .ipynb." },
+        path: {
+          type: "string",
+          description: "Workspace-relative path of the .ipynb.",
+        },
       },
       required: ["path"],
     },
@@ -748,11 +894,27 @@ export const AGENT_TOOLS: ToolSpec[] = [
       "Edit one cell of a Jupyter notebook (.ipynb): replace its source, insert a new code/markdown cell, or delete one. Everything untouched — outputs, metadata, kernel spec — is preserved. Read the notebook first so the index matches the listing.",
     parameters: {
       properties: {
-        path: { type: "string", description: "Workspace-relative path of the .ipynb." },
-        action: { type: "string", description: '"replace", "insert" or "delete".' },
-        index: { type: "number", description: "0-based cell position, as read_notebook's listing shows." },
-        cell_type: { type: "string", description: 'insert only: "code" or "markdown".' },
-        source: { type: "string", description: "replace/insert only: the full new cell text." },
+        path: {
+          type: "string",
+          description: "Workspace-relative path of the .ipynb.",
+        },
+        action: {
+          type: "string",
+          description: '"replace", "insert" or "delete".',
+        },
+        index: {
+          type: "number",
+          description:
+            "0-based cell position, as read_notebook's listing shows.",
+        },
+        cell_type: {
+          type: "string",
+          description: 'insert only: "code" or "markdown".',
+        },
+        source: {
+          type: "string",
+          description: "replace/insert only: the full new cell text.",
+        },
       },
       required: ["path", "action", "index"],
     },
@@ -766,7 +928,8 @@ export const AGENT_TOOLS: ToolSpec[] = [
       properties: {
         limit: {
           type: "number",
-          description: "Optional maximum to return (default 25, capped at 100).",
+          description:
+            "Optional maximum to return (default 25, capped at 100).",
         },
       },
     },
@@ -778,10 +941,14 @@ export const AGENT_TOOLS: ToolSpec[] = [
       "Full-text search across every past session's transcript — both sides of every conversation, not just titles. Returns hits with the matched words bracketed, so you can judge context before reading a whole session. This is the only way to find where something was said; list_sessions only shows previews.",
     parameters: {
       properties: {
-        query: { type: "string", description: "Words to look for. Case and word form don't matter." },
+        query: {
+          type: "string",
+          description: "Words to look for. Case and word form don't matter.",
+        },
         limit: {
           type: "number",
-          description: "Optional maximum hits to return (default 30, capped at 200).",
+          description:
+            "Optional maximum hits to return (default 30, capped at 200).",
         },
       },
       required: ["query"],
@@ -794,9 +961,57 @@ export const AGENT_TOOLS: ToolSpec[] = [
       "Read one past session's transcript in order: each turn's role, text and timestamps, with tool calls and their results. Get the session id from list_sessions or search_sessions. Long turns are clipped; ask for a session whose search hits looked relevant rather than reading many whole sessions.",
     parameters: {
       properties: {
-        session_id: { type: "string", description: "The session's id, exactly as list_sessions or search_sessions returned it." },
+        session_id: {
+          type: "string",
+          description:
+            "The session's id, exactly as list_sessions or search_sessions returned it.",
+        },
       },
       required: ["session_id"],
+    },
+  },
+  {
+    name: "search_agents",
+    effect: "read",
+    description:
+      "Search conversations from other AI coding agents (Claude, Codex, Qoder, router sessions) that live outside this app. Returns the adapter name, native id, title, project root, turn count, and a preview. Use this when you need context from a different agent's session — then load_session to pull it in. The native store is read-only; load_session is the only write.",
+    parameters: {
+      properties: {
+        query: {
+          type: "string",
+          description:
+            "Words to match against titles, previews, and project roots. Case-insensitive.",
+        },
+        root: {
+          type: "string",
+          description:
+            "Optional workspace root to scope the search to. When omitted, searches every adapter. When blank, searches none — use this only with a real workspace path.",
+        },
+        limit: {
+          type: "number",
+          description: "Optional maximum matches (default 25, capped at 100).",
+        },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "load_session",
+    effect: "read",
+    description:
+      "Import a session from another AI coding agent into this conversation's transcript store, scoped to its original project root. The foreign store is untouched — this copies the transcript, scrubs secrets, and writes rows under a derived id so re-importing is idempotent. Use search_agents to get the source and native_id. One session at a time, never a sweep.",
+    parameters: {
+      properties: {
+        source: {
+          type: "string",
+          description: 'The adapter name from search_agents (e.g. "claude").',
+        },
+        native_id: {
+          type: "string",
+          description: "The session's native id from search_agents.",
+        },
+      },
+      required: ["source", "native_id"],
     },
   },
   {
@@ -843,6 +1058,8 @@ const SUBAGENT_NEVER = new Set([
   "list_sessions",
   "search_sessions",
   "read_session",
+  "search_agents",
+  "load_session",
   // The manifest is this session's own header and `forget_memory` deletes from the user's durable
   // memory. A child's task is self-contained; neither read nor delete belongs in its hands, and a
   // deletion a parent cannot see is the exact shape of a silent destructive action.
@@ -865,7 +1082,9 @@ export const SUBAGENT_TOOLS: ToolSpec[] = AGENT_TOOLS.filter(
  * [`SUBAGENT_NEVER`] — writes, edits and commands are available; recursion, self-narration and plan
  * mode are not.
  */
-export const SUBAGENT_WRITE_TOOLS: ToolSpec[] = AGENT_TOOLS.filter((t) => !SUBAGENT_NEVER.has(t.name));
+export const SUBAGENT_WRITE_TOOLS: ToolSpec[] = AGENT_TOOLS.filter(
+  (t) => !SUBAGENT_NEVER.has(t.name),
+);
 
 /**
  * Which set a sub-agent gets.
@@ -914,14 +1133,20 @@ export function withSubagentDefs(
   defs: { id: string; name: string; description: string }[],
   opts: { canWrite?: boolean } = {},
 ): ToolSpec[] {
-  const list = defs.map((d) => `- ${d.id} (${d.name}): ${d.description}`).join("\n");
+  const list = defs
+    .map((d) => `- ${d.id} (${d.name}): ${d.description}`)
+    .join("\n");
   const description =
-    (opts.canWrite === true ? DISPATCH_WRITE_DESCRIPTION : DISPATCH_READ_ONLY_DESCRIPTION) +
+    (opts.canWrite === true
+      ? DISPATCH_WRITE_DESCRIPTION
+      : DISPATCH_READ_ONLY_DESCRIPTION) +
     (list
-      ? "\n\nAvailable specialist sub-agents (pass one as \"agent\"; omit for the general researcher):\n" +
+      ? '\n\nAvailable specialist sub-agents (pass one as "agent"; omit for the general researcher):\n' +
         list
       : "");
-  return AGENT_TOOLS.map((t) => (t.name === "dispatch_agent" ? { ...t, description } : t));
+  return AGENT_TOOLS.map((t) =>
+    t.name === "dispatch_agent" ? { ...t, description } : t,
+  );
 }
 
 /** Render the OpenAI `tools` array from a registry. Empty registry yields undefined so the

@@ -306,6 +306,122 @@ pub fn session_search(
     context::search_sessions(&store, &query, limit.unwrap_or(30).min(200)).map_err(CommandError)
 }
 
+// ---------- cross-agent session sources (v1) ----------
+
+/// One adapter the host can see, with a live session count. Read-only on the foreign store.
+#[tauri::command]
+pub fn admin_sources_list(
+    store: State<'_, Arc<Store>>,
+) -> Result<Vec<crate::core::agent_sources::SourceListing>, CommandError> {
+    Ok(crate::core::agent_sources::all_sources(Some(Arc::clone(&*store)))
+        .into_iter()
+        .map(|s| {
+            let refs = s.list().unwrap_or_default();
+            crate::core::agent_sources::SourceListing {
+                name: s.name().to_string(),
+                available: !refs.is_empty(),
+                session_count: refs.len(),
+                note: if refs.is_empty() { Some("no sessions found".into()) } else { None },
+            }
+        })
+        .collect())
+}
+
+/// Foreign sessions from one source (`source` empty = search all). Read-only.
+#[tauri::command]
+pub fn admin_source_sessions(
+    store: State<'_, Arc<Store>>,
+    source: Option<String>,
+    query: Option<String>,
+    root: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::core::agent_sources::SessionRef>, CommandError> {
+    let sources = crate::core::agent_sources::all_sources(Some(Arc::clone(&*store)));
+    let q = query.as_deref().map(|q| q.trim().to_lowercase()).filter(|q| !q.is_empty());
+    let root = root.as_deref().map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
+    let limit = limit.unwrap_or(25).min(100);
+    let mut refs = Vec::new();
+    for s in &sources {
+        if source.is_none() || s.name() == source.as_deref().unwrap() {
+            refs.extend(s.list().unwrap_or_default());
+        }
+    }
+    let mut hits: Vec<crate::core::agent_sources::SessionRef> = refs
+        .into_iter()
+        .filter(|r| match (&root, &q) {
+            (Some(root), _) => r.root.as_deref() == Some(root.as_str()),
+            _ => true,
+        })
+        .filter(|r| match &q {
+            Some(qq) => {
+                r.title.as_deref().unwrap_or("").to_lowercase().contains(qq)
+                    || r.preview.to_lowercase().contains(qq)
+                    || r.root.as_deref().unwrap_or("").to_lowercase().contains(qq)
+            }
+            None => true,
+        })
+        .collect();
+    hits.sort_by(|a, b| {
+        let a_home = root.as_deref().is_some_and(|r| a.root.as_deref() == Some(r));
+        let b_home = root.as_deref().is_some_and(|r| b.root.as_deref() == Some(r));
+        b_home.cmp(&a_home).then_with(|| b.updated_at.cmp(&a.updated_at))
+    });
+    hits.truncate(limit);
+    Ok(hits)
+}
+
+/// Pull one foreign session into this app's transcript store. Read-only on the foreign store;
+/// the write lands in `session_messages` under a derived id. Idempotent.
+#[tauri::command]
+pub fn admin_source_import(
+    store: State<'_, Arc<Store>>,
+    source: String,
+    native_id: String,
+) -> Result<crate::core::agent_sources::ImportResult, CommandError> {
+    let sources = crate::core::agent_sources::all_sources(Some(Arc::clone(&*store)));
+    let Some(src) = sources.iter().find(|s| s.name() == source) else {
+        return Err(CommandError(format!("unknown source '{source}'")));
+    };
+    let turns = src.read(&native_id).map_err(|e| CommandError(format!("could not read: {e}")))?;
+    if turns.is_empty() {
+        return Err(CommandError(format!(
+            "no readable turns in '{source}' for '{native_id}'"
+        )));
+    }
+    let session_id = format!(
+        "imp-{}-{:016x}",
+        source,
+        crate::core::gateway::context_scope::fnv1a(&native_id),
+    );
+    let root = src
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|r| r.native_id == native_id)
+        .and_then(|r| r.root);
+    let rows: Vec<crate::core::context::SessionMessageRow> = turns
+        .iter()
+        .enumerate()
+        .map(|(i, t)| crate::core::context::SessionMessageRow {
+            session_id: session_id.clone(),
+            seq: i as i64,
+            role: t.role.clone(),
+            content: crate::core::capture::scrub(&t.content),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: None,
+            attachments: None,
+            model: None,
+            memory_refs: None,
+            ts: t.ts,
+            root: root.clone(),
+        })
+        .collect();
+    crate::core::context::append_session_messages(&store, &rows)
+        .map_err(|e| CommandError(format!("write failed: {e}")))?;
+    Ok(crate::core::agent_sources::ImportResult { session_id, turns: rows.len() })
+}
+
 // ---------- skills (P5) ----------
 // Skills are procedures, not capabilities: nothing here can widen the agent's tool surface.
 
@@ -1040,6 +1156,9 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         transcript_replace,
         transcript_max_seq,
         session_search,
+        admin_sources_list,
+        admin_source_sessions,
+        admin_source_import,
         skills_list,
         skills_catalog,
         skills_install,
