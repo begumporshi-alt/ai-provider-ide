@@ -146,6 +146,10 @@ export function composeManifest(
   let tokens = estimateMessageTokens({ role: "system", content: header });
   for (const e of entries) {
     if (e.kind === "capability" && e.verified !== "live") continue;
+    // Project facts are query-shaped: they are what recall exists to surface, and forcing them
+    // into a 400-token header both crowds out identity and duplicates the recall block. They stay
+    // in `entries` so the echo can show them, but the block and the recall path own different jobs.
+    if (e.kind === "project_fact") continue;
     const line = `- [${e.kind} ${e.id}] ${e.text}`;
     const cost = estimateMessageTokens({ role: "system", content: line });
     if (tokens + cost > budgetTokens) continue;

@@ -2310,10 +2310,13 @@ function Chat({
         policy: await fetchToolsPolicy().catch(() => ({ git_subcommands: [] as string[] })),
       }).catch(() => ({ entries: [], block: "", tokens: 0 }));
     }
-    // Every entry counts for de-duplication, included or not: a contradicted capability must not
-    // re-enter through relevance recall, and a budget-dropped row must not appear twice either.
+    // Only rows the header actually carries, plus contradicted capabilities, are de-duplicated
+    // against recall. Project facts stay out of the manifest block, so excluding them here would
+    // silently disable the recall path that presents them and their trail.
     const manifestIds: ReadonlySet<string> = new Set(
-      (nextManifest?.entries ?? []).map((e) => e.id),
+      (nextManifest?.entries ?? [])
+        .filter((e) => e.included || e.verified === "contradicted")
+        .map((e) => e.id),
     );
     // Written unconditionally: switching memory off must not keep the previous turn's header.
     manifestRef.current = nextManifest;

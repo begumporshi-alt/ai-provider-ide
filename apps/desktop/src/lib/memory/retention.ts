@@ -36,10 +36,12 @@ export interface RetentionResult {
   memories?: MemoryPruneStats;
   live?: LiveContextPruneStats;
   /**
-   * True when nothing ran because a pass was already in flight. Distinct from "removed nothing"
-   * so the UI can say the right thing.
+   * True when nothing ran: a pass was already in flight, or the host was unreachable. Distinct
+   * from "removed nothing" so the UI can say the right thing.
    */
   skipped: boolean;
+  /** Why the pass did not run, when it failed rather than being skipped. */
+  error?: string;
 }
 
 /** A prune is a table scan; two overlapping passes would each re-scan what the other is deleting. */
@@ -55,6 +57,10 @@ export async function pruneOnce(): Promise<RetentionResult> {
     const memories = await pruneMemories();
     const live = await pruneLiveContext();
     return { memories, live, skipped: false };
+  } catch (e) {
+    // "Gateway not running" is a supported state, and this pass runs at boot. A rejection here
+    // would surface as an uncaught page error that reads like a corrupt store; degrade instead.
+    return { skipped: true, error: e instanceof Error ? e.message : String(e) };
   } finally {
     running = false;
   }

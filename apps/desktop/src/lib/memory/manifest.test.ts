@@ -72,7 +72,22 @@ describe("composeManifest", () => {
     );
 
     const order = out.entries.filter((e) => e.included).map((e) => e.id);
-    expect(order).toEqual(["id", "pref", "dec", "cap", "fact"]);
+    expect(order).toEqual(["id", "pref", "dec", "cap"]);
+    // Project facts are query-shaped: they stay in `entries` for the echo, but the block leaves
+    // them to recall rather than crowding the header with them.
+    const fact = out.entries.find((e) => e.id === "fact")!;
+    expect(fact.included).toBe(false);
+    expect(out.block).not.toContain("project fact");
+  });
+
+  it("keeps project facts out of the block so recall owns them", () => {
+    const out = composeManifest(
+      [mem("fact", "project_fact", "the graph has 4 node kinds")],
+      snap(),
+      10_000,
+    );
+    expect(out.block).toBe("");
+    expect(out.entries.map((e) => e.id)).toEqual(["fact"]);
   });
 
   it("drops expired rows and keeps contradicted capabilities out of the prompt", () => {
@@ -95,7 +110,7 @@ describe("composeManifest", () => {
 
   it("stops at the token budget rather than truncating a line", () => {
     const big = Array.from({ length: 50 }, (_, i) =>
-      mem(`f${i}`, "project_fact", `fact number ${i} `.repeat(10), { updated_at: i }),
+      mem(`d${i}`, "decision", `decision number ${i} `.repeat(10), { updated_at: i }),
     );
     const out = composeManifest(big, snap(), 100, 100);
     expect(out.tokens).toBeLessThanOrEqual(100);

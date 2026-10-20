@@ -409,10 +409,12 @@ export interface RecallOptions {
   /** Workspace root. When set, every read is scoped to that workspace. */
   root?: string;
   /**
-   * Ids already carried by another block this turn — the manifest's entries, included or not.
-   * Filtered from the merged result before it is returned, so one row cannot be injected twice in
-   * the same request. Contradicted capabilities are in this set too: without that, a claim the
-   * composer just refused would re-enter through relevance recall and defeat verification.
+   * Ids the manifest actually put in its block, plus contradicted capabilities. Filtered from the
+   * merged result before it is returned, so a row cannot be injected twice in the same request.
+   * Contradicted capabilities are in this set even though the block omits them: without that, a
+   * claim the composer just refused would re-enter through relevance recall and defeat
+   * verification. Project facts are deliberately absent — the manifest keeps them out of the
+   * block so recall remains their path.
    */
   excludeIds?: ReadonlySet<string>;
 }
