@@ -147,6 +147,8 @@ test("the manifest card does not survive a new chat", async ({ page }) => {
   await page.getByPlaceholder(/Message your assistant/).fill("hello");
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByTestId("manifest-card")).toBeVisible({ timeout: 30_000 });
+  // New Chat is a no-op while the turn is busy; wait for the mock answer first.
+  await expect(page.getByText("Hello from oracle-mini")).toBeVisible({ timeout: 30_000 });
 
   await page.getByRole("button", { name: "New Chat", exact: true }).click();
   await expect(page.getByTestId("manifest-card")).toHaveCount(0);
