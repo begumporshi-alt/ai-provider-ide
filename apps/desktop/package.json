@@ -27,7 +27,7 @@
     "@aiprovider/router-core": "workspace:*",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
-    "markdown-it": "^15.0.2",
+    "markdown-it": "^15.0.3",
     "pdfjs-dist": "^6.4.299",
     "prismjs": "^1.30.0",
     "react": "^19.1.0",
@@ -46,7 +46,7 @@
     "@vitest/coverage-v8": "^4.1.11",
     "tailwindcss": "^4.3.3",
     "typescript": "6.0.3",
-    "vite": "^8.0.16",
+    "vite": "^8.3.3",
     "vitest": "^4.1.11"
   }
 }

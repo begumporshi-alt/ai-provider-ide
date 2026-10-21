@@ -267,9 +267,7 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 /// pure reasoning. Reporting those as ordinary prose would import machine output as something the
 /// human said — the role/label pair is what keeps the distinction.
 fn envelope_label(parts: &Value) -> Option<&'static str> {
-    let Some(items) = parts.as_array() else {
-        return None;
-    };
+    let items = parts.as_array()?;
     let kinds: Vec<&str> =
         items.iter().filter_map(|p| p.get("type").and_then(Value::as_str)).collect();
     if kinds.is_empty() {
@@ -382,7 +380,7 @@ impl AgentSource for JsonlSource {
                 import_id: None,
             });
         }
-        out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        out.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
         Ok(out)
     }
 
@@ -530,7 +528,7 @@ impl AgentSource for CodexSource {
                 import_id: None,
             });
         }
-        out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        out.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
         Ok(out)
     }
 

@@ -1939,25 +1939,19 @@ pub async fn source_import_h(
         Err(r) => return *r,
     };
     let sources = agent_sources::all_sources(core.store().cloned());
-    let Some((source, ref_root)) = sources
-        .iter()
-        .find_map(|s| if s.name() == body.source { Some(s) } else { None })
-        .map(|s| {
-            let root = s
-                .list()
-                .unwrap_or_default()
-                .into_iter()
-                .find(|r| r.native_id == body.native_id)
-                .and_then(|r| r.root);
-            (s, root)
-        })
-    else {
+    let Some(source) = sources.iter().find(|s| s.name() == body.source) else {
         return admin_error(
             StatusCode::NOT_FOUND,
             &format!("unknown session source '{}'", body.source),
             Some("unknown_source"),
         );
     };
+    let ref_root = source
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|r| r.native_id == body.native_id)
+        .and_then(|r| r.root);
 
     let turns = match source.read(&body.native_id) {
         Ok(t) => t,

@@ -725,7 +725,7 @@ fn recall_inner(
     // Expiry means "stop injecting", not "delete" — the row stays in the table for the Memory
     // screen; it just cannot reach a prompt any more.
     let now = now_ms();
-    rows.retain(|m| m.expires_at.map_or(true, |e| e > now));
+    rows.retain(|m| m.expires_at.is_none_or(|e| e > now));
 
     rerank(&mut rows, now);
     rows.truncate(limit);

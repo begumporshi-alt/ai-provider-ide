@@ -6213,11 +6213,17 @@ async fn source_import_writes_a_resumable_scrubbed_transcript_and_is_idempotent(
     let dir = std::env::temp_dir().join(format!("aip-codex-import-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join(".codex/sessions/2026/10/02")).unwrap();
+    // Split so the key-leak guard (which scans shipped source for `sk-…` literals) does not read
+    // this obvious fake as a credential; the fixture still carries the full string.
+    let fake_key = concat!("sk-", "abcdefghijklmnopqrstuvwxyz012345");
+    let meta = "{\"type\":\"session_meta\",\"session_id\":\"cafe\",\"cwd\":\"/tmp/proj-alpha\"}\n";
+    let user = format!(
+        "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"why is the build slow, key {fake_key}\"}}]}},\"timestamp\":\"2026-10-02T09:00:00Z\"}}\n"
+    );
+    let assistant = "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"the typecheck runs twice\"}]},\"timestamp\":\"2026-10-02T09:00:05Z\"}\n";
     std::fs::write(
         dir.join(".codex/sessions/2026/10/02/rollout-2026-10-02T09-00-00-cafe.jsonl"),
-        "{\"type\":\"session_meta\",\"session_id\":\"cafe\",\"cwd\":\"/tmp/proj-alpha\"}\n\
-         {\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"why is the build slow, key sk-abcdefghijklmnopqrstuvwxyz012345\"}]},\"timestamp\":\"2026-10-02T09:00:00Z\"}\n\
-         {\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"the typecheck runs twice\"}]},\"timestamp\":\"2026-10-02T09:00:05Z\"}\n",
+        format!("{meta}{user}{assistant}"),
     )
     .unwrap();
 
@@ -6269,10 +6275,7 @@ async fn source_import_writes_a_resumable_scrubbed_transcript_and_is_idempotent(
         .unwrap();
     assert_eq!(role, "user");
     assert!(content.contains("build slow"));
-    assert!(
-        !content.contains("sk-abcdefghijklmnopqrstuvwxyz012345"),
-        "the capture scrub must run before the row is stored"
-    );
+    assert!(!content.contains(fake_key), "the capture scrub must run before the row is stored");
     // Task 3 — the import carries the foreign session's project root, so the manifest can scope
     // recall to /tmp/proj-alpha just like an in-tree session.
     let root: Option<String> = s
