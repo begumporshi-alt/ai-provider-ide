@@ -6,7 +6,7 @@ import { create } from "zustand";
 import type { RecalledMemory } from "./lib/chat/turn/memory-refs";
 import type { AttachmentMeta } from "./lib/chat/turn/messages";
 
-export type ScreenId = "providers" | "models" | "assistant" | "axiom" | "compare" | "activity" | "context" | "history" | "skills" | "agents" | "subagents" | "memory" | "settings" | "gateway" | "control" | "onboarding";
+export type ScreenId = "providers" | "models" | "assistant" | "axiom" | "compare" | "activity" | "context" | "history" | "sources" | "skills" | "agents" | "subagents" | "memory" | "settings" | "gateway" | "control" | "onboarding";
 
 export interface OnboardingPrefill {
   name: string;

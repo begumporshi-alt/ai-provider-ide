@@ -129,6 +129,18 @@ test("listSourceSessions scopes by root and filters by query", async ({
 
   const miss = await admin(page, "GET", "/sources/sessions?q=zzznopezz");
   expect((miss as { sessions: RelatedSession[] }).sessions).toHaveLength(0);
+
+  // The named listing is a separate four-segment route, not a filter on the all list. A shim
+  // that only implemented `/sources/sessions` made the Sources screen's adapter filter 404.
+  const perSource = (await admin(page, "GET", "/sources/claude/sessions")) as {
+    sessions: RelatedSession[];
+  };
+  expect(perSource.sessions).toHaveLength(1);
+  expect(perSource.sessions[0].source).toBe("claude");
+  const emptySource = (await admin(page, "GET", "/sources/zcode/sessions")) as {
+    sessions: RelatedSession[];
+  };
+  expect(emptySource.sessions).toHaveLength(0);
 });
 
 test("importSourceSession is idempotent and returns the derived session id", async ({

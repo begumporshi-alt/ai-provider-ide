@@ -42,7 +42,7 @@ import { gatewayGenerate, gatewayGenerateImage } from "../lib/gateway-turn";
 import { userContent } from "@aiprovider/router-core";
 import { useUi } from "../ui-state";
 import { useHeaderSlot } from "../components/Shell";
-import { Button, Modal, inputCls, inputStyle } from "../components/atoms";
+import { Button, EmptyState, Modal, Spinner, inputCls, inputStyle } from "../components/atoms";
 import { Markdown } from "../components/Markdown";
 import { RunConfig } from "../components/assistant/RunConfig";
 import { RichMarkdown } from "../components/RichMarkdown";
@@ -166,7 +166,8 @@ import {
   rememberTurn,
   type LearnedMemory,
 } from "../lib/memory/engine";
-import { buildManifest, type ComposedManifest } from "../lib/memory/manifest";
+import { buildManifest, type ComposedManifest, type RelatedSourceSession } from "../lib/memory/manifest";
+import { exactTime, timeAgo } from "../lib/time-ago";
 import {
   newMsgId,
   replayHistory,
@@ -2048,6 +2049,9 @@ function Chat({
   const [renaming, setRenaming] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
   const [switcherOpen, setSwitcherOpen] = useState(false);
+  // The source-session picker: another agent's conversation can become this Assistant's current
+  // session (import is a snapshot; the foreign store stays read-only).
+  const [sourcePickerOpen, setSourcePickerOpen] = useState(false);
   const [sessions, setSessions] = useState<HistorySession[]>([]);
   // P5: enabled skills are listed in the agent's instructions by name and summary, and the
   // `load_skill` tool fetches the full procedure in the turn where the model decides the task
@@ -3605,6 +3609,20 @@ function Chat({
     setSessionTitle(sessions.find((s) => s.session_id === sid)?.title ?? "");
   }
 
+  /**
+   * Adopt a foreign session as this conversation.
+   *
+   * The picker imports it first (a snapshot; idempotent), then this continues it in place through
+   * the same `openSession` path History uses. An imported session has no History row yet, so the
+   * chip's name comes from the source row rather than the local list.
+   */
+  async function adoptSourceSession(nextId: string, title: string) {
+    setSourcePickerOpen(false);
+    await openSession(nextId);
+    titleLoadedFor.current = nextId;
+    setSessionTitle(title);
+  }
+
   function commitTitle() {
     const t = titleDraft.trim();
     setRenaming(false);
@@ -3875,6 +3893,20 @@ function Chat({
               title="Start a new chat"
             >
               ＋ New session
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              disabled={busy}
+              className="block w-full rounded px-2 py-1.5 text-left text-[12px] font-medium transition-opacity hover:opacity-80 disabled:opacity-50"
+              style={{ color: "var(--text-dim)" }}
+              onClick={() => {
+                setSwitcherOpen(false);
+                setSourcePickerOpen(true);
+              }}
+              title="Pull in a conversation from another AI coding agent"
+            >
+              ⌕ Browse sources…
             </button>
             <div
               className="my-1 border-t"
@@ -4661,6 +4693,12 @@ function Chat({
             pendingPlanEntry.resolve(ok);
             setPendingPlanEntry(null);
           }}
+        />
+      )}
+      {sourcePickerOpen && (
+        <SourceSessionPicker
+          onClose={() => setSourcePickerOpen(false)}
+          onAdopt={(id, title) => void adoptSourceSession(id, title)}
         />
       )}
     </div>
@@ -5497,3 +5535,163 @@ function AgentLive({
 /* The per-call gate used to live here as `ConfirmModal` — allow/deny and nothing else. It is now
    `components/ApproveModal`, because the answer set grew a scope (this call / this tool / this
    session) and the component has one job worth testing on its own. */
+
+/**
+ * The Assistant's source-session picker: choose a conversation from another AI coding agent and
+ * continue it here.
+ *
+ * Read-only on the foreign store until the user presses Use; the import is a snapshot under a
+ * deterministic id, so choosing the same session again re-adopts it instead of duplicating it.
+ * The picker fetches through the same admin surface the Sources screen uses.
+ */
+function SourceSessionPicker({
+  onClose,
+  onAdopt,
+}: {
+  onClose: () => void;
+  onAdopt: (sessionId: string, title: string) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [debounced, setDebounced] = useState("");
+  const [rows, setRows] = useState<RelatedSourceSession[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(query.trim()), 180);
+    return () => clearTimeout(t);
+  }, [query]);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    setError(null);
+    listSourceSessions({ query: debounced || undefined, limit: 50 })
+      .then((hits) => {
+        if (alive) setRows(hits);
+      })
+      .catch((e: unknown) => {
+        if (!alive) return;
+        setRows([]);
+        setError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [debounced]);
+
+  async function use(row: RelatedSourceSession) {
+    const key = `${row.source}:${row.nativeId}`;
+    setBusyKey(key);
+    setError(null);
+    try {
+      const result = await importSourceSession(row.source, row.nativeId);
+      onAdopt(result.sessionId, row.title || row.preview || row.nativeId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  return (
+    <Modal title="Sessions from other agents" onClose={onClose} width={680}>
+      <p className="mb-3 text-[12px]" style={{ color: "var(--text-dim)" }}>
+        Read-only on the other agent's store. Using one imports a snapshot into this app and opens
+        it as the current conversation; the original is untouched.
+      </p>
+      <input
+        className={`${inputCls} mb-3`}
+        style={inputStyle}
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        placeholder="Search sessions, workspaces and previews…"
+        aria-label="Search sessions from other agents"
+      />
+      {error ? (
+        <div
+          className="mb-3 rounded border p-3 text-[12px]"
+          style={{ borderColor: "var(--danger)", color: "var(--danger)" }}
+          data-testid="source-picker-error"
+        >
+          <p>{error}</p>
+          <p className="mt-1" style={{ color: "var(--text-dim)" }}>
+            Source data comes from the local gateway. Start it under Control → Local Gateway.
+          </p>
+        </div>
+      ) : null}
+      {loading ? (
+        <Spinner label="Scanning agent stores…" />
+      ) : rows.length === 0 ? (
+        <EmptyState title="No sessions match." />
+      ) : (
+        <ul
+          className="max-h-[50vh] overflow-y-auto rounded-lg border"
+          style={{ borderColor: "var(--border)" }}
+          data-testid="source-picker"
+        >
+          {rows.map((s) => {
+            const key = `${s.source}:${s.nativeId}`;
+            return (
+              <li
+                key={key}
+                data-testid="source-picker-row"
+                data-source={s.source}
+                data-native-id={s.nativeId}
+                className="flex items-start gap-3 border-t px-3 py-2.5 first:border-t-0"
+                style={{ borderColor: "var(--border)" }}
+              >
+                <span
+                  className="mono mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[10px]"
+                  style={{ background: "var(--surface-2)" }}
+                >
+                  {s.source}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-[13px]">
+                    {s.title || s.preview || s.nativeId}
+                  </div>
+                  <div
+                    className="truncate text-[11px]"
+                    style={{ color: "var(--text-dim)" }}
+                  >
+                    {s.preview}
+                  </div>
+                  <div
+                    className="mono mt-0.5 truncate text-[10px]"
+                    style={{ color: "var(--text-faint)" }}
+                    title={`Updated ${exactTime(s.updatedAt)}`}
+                  >
+                    updated {timeAgo(s.updatedAt)} · {s.root ?? "no workspace"} ·{" "}
+                    {s.turns} turn(s)
+                  </div>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  {s.importId ? (
+                    <span
+                      className="mono text-[10px]"
+                      style={{ color: "var(--text-faint)" }}
+                    >
+                      imported
+                    </span>
+                  ) : null}
+                  <Button
+                    onClick={() => void use(s)}
+                    disabled={busyKey === key}
+                    ariaLabel={`Use ${s.nativeId} from ${s.source}`}
+                  >
+                    {busyKey === key ? "opening…" : "Use"}
+                  </Button>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </Modal>
+  );
+}

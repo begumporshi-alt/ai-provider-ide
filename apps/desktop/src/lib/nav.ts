@@ -55,6 +55,7 @@ export const NAV: readonly NavGroup[] = [
     items: [
       { id: "context", label: "Context", icon: "file" },
       { id: "history", label: "History", icon: "history" },
+      { id: "sources", label: "Sources", icon: "nodes" },
       { id: "memory", label: "Memory", icon: "memory" },
       { id: "skills", label: "Skills", icon: "star" },
     ],

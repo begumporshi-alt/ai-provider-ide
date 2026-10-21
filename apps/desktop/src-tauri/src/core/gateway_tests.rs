@@ -4594,6 +4594,7 @@ async fn admin_routes_refuse_without_the_master_key() {
         // Cross-agent session sources. `import` writes rows, so it authenticates like every
         // other mutating admin route.
         ("GET", "/admin/sources", json!(null)),
+        ("GET", "/admin/sources/sessions", json!(null)),
         ("GET", "/admin/sources/claude/sessions", json!(null)),
         ("POST", "/admin/sources/import", json!({ "source": "claude", "native_id": "x" })),
         // The master switch. Listed with the memory statics because it is one, and because a reader
@@ -6172,6 +6173,31 @@ async fn source_sessions_rejects_an_unknown_source_but_searches_everything_with_
         .unwrap();
     assert_eq!(searched.status(), 200);
     let body: Value = searched.json().await.unwrap();
+    assert!(body.get("sessions").and_then(|v| v.as_array()).is_some());
+
+    // The all-sources listing is its own three-segment route — the UI's no-source path. It must
+    // exist independently of `{name}/sessions`, or every "browse everything" call 404s.
+    let all = s
+        .client
+        .get(format!("{}/admin/sources/sessions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(all.status(), 200, "the all-sources listing is a route, not a 404");
+    let body: Value = all.json().await.unwrap();
+    assert!(body.get("sessions").and_then(|v| v.as_array()).is_some());
+
+    // A named listing answers even when that adapter has nothing: an empty store is not "unknown".
+    let named = s
+        .client
+        .get(format!("{}/admin/sources/claude/sessions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(named.status(), 200);
+    let body: Value = named.json().await.unwrap();
     assert!(body.get("sessions").and_then(|v| v.as_array()).is_some());
 }
 

@@ -15,6 +15,7 @@ import { CompareScreen } from "./screens/Compare";
 import { ActivityScreen } from "./screens/Activity";
 import { ContextScreen } from "./screens/Context";
 import { HistoryScreen } from "./screens/History";
+import { SourcesScreen } from "./screens/Sources";
 import { SkillsScreen } from "./screens/Skills";
 import { AgentsScreen } from "./screens/Agents";
 import { SubagentsScreen } from "./screens/Subagents";
@@ -122,6 +123,7 @@ export default function App() {
       {screen === "activity" && <ActivityScreen />}
       {screen === "context" && <ContextScreen />}
       {screen === "history" && <HistoryScreen />}
+      {screen === "sources" && <SourcesScreen />}
       {screen === "skills" && <SkillsScreen />}
       {screen === "agents" && <AgentsScreen />}
       {screen === "subagents" && <SubagentsScreen />}
