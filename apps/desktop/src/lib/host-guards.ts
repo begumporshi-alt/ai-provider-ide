@@ -30,6 +30,7 @@ import type {
   LiveContextPruneStats,
   Memory,
   MemoryConflict,
+  MemoryKind,
   MemoryLayer,
   MemoryPruneStats,
   MemoryScope,
@@ -172,6 +173,14 @@ export const isMemory = shape<Memory>({
   scope: isMemoryScope,
   score: maybe(isNum),
   superseded_at: nullable(isNum),
+  kind: nullable(
+    oneOf<MemoryKind>("identity", "preference", "decision", "project_fact", "capability", "conversation"),
+  ),
+  source: isStr,
+  verified: nullable(oneOf<"live" | "unverified" | "contradicted">("live", "unverified", "contradicted")),
+  expires_at: nullable(isNum),
+  retrieval_count: isNum,
+  last_retrieved_at: nullable(isNum),
 });
 
 export const isMemoryConflict = shape<MemoryConflict>({ held: isMemory, newer: isMemory });

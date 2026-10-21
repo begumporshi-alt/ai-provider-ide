@@ -33,6 +33,9 @@ export interface RunFileChange {
   /** True when the pre-run contents could not be read — the revert for this file is unknown,
    *  not "empty", and the review must not pretend otherwise. */
   beforeUnknown?: boolean;
+  /** True when the pre-run contents hit `read_file`'s cap. Restoring a partial file would
+   *  silently truncate it, so this is also an unknown revert. */
+  beforeTruncated?: boolean;
 }
 
 export interface RunChangeSet {
@@ -83,6 +86,14 @@ async function readOrNull(host: ToolHost, path: string): Promise<string | null> 
   }
 }
 
+/** `read_file` says this when it stopped at `MAX_READ_BYTES`. A checkpoint built from that
+ *  output is a prefix, not the file; writing it back would truncate the rest. */
+const TRUNCATED_READ = "… truncated at ";
+
+function isTruncatedRead(text: string | null): boolean {
+  return text?.includes(TRUNCATED_READ) ?? false;
+}
+
 /**
  * Accumulates one run's mutations. Mutable by design — it is written to from inside the tool
  * host during the run — with `snapshot()` handing React a frozen plain object.
@@ -99,9 +110,15 @@ export class RunCheckpoint {
    * Record the pre-run contents, once per path. The second call for the same path is a no-op:
    * the interesting "before" is the one from before the run, not the one from before this write.
    */
-  captureBefore(path: string, before: string | null, unknown = false): void {
+  captureBefore(path: string, before: string | null, unknown = false, truncated = false): void {
     if (this.files.has(path)) return;
-    this.files.set(path, { path, before, after: null, ...(unknown ? { beforeUnknown: true } : {}) });
+    this.files.set(path, {
+      path,
+      before,
+      after: null,
+      ...(unknown ? { beforeUnknown: true } : {}),
+      ...(truncated ? { beforeTruncated: true } : {}),
+    });
   }
 
   /** Record the contents once the write returned. */
@@ -154,7 +171,10 @@ export function createCheckpointingHost(inner: ToolHost, checkpoint: RunCheckpoi
           return inner.run(name, args, opts);
         }
         for (const p of paths) {
-          if (!checkpoint.has(p)) checkpoint.captureBefore(p, await readOrNull(inner, p));
+          if (!checkpoint.has(p)) {
+            const before = await readOrNull(inner, p);
+            checkpoint.captureBefore(p, before, false, isTruncatedRead(before));
+          }
         }
         const res = await inner.run(name, args, opts);
         // Same rule as the single-file writers: a cancelled write never happened. A *failed* patch
@@ -181,12 +201,24 @@ export function createCheckpointingHost(inner: ToolHost, checkpoint: RunCheckpoi
           checkpoint.noteUntracked(
             `saved a browser screenshot${path ? ` to ${path}` : " into images/"} — a new capture, never an overwrite of tracked content`,
           );
+        } else if (name === "browser_print") {
+          checkpoint.noteUntracked(
+            `rendered a print PDF${path ? ` to ${path}` : " into documents/"} — a new render, never an overwrite of tracked content`,
+          );
+        } else if (name === "device_screenshot") {
+          checkpoint.noteUntracked(
+            `saved a device screenshot${path ? ` to ${path}` : " into images/"} — a new capture, never an overwrite of tracked content`,
+          );
+        } else if (name === "device_open_url") {
+          const url = typeof args.url === "string" ? args.url : "a URL";
+          checkpoint.noteUntracked(`opened ${url} in the connected Android device's browser`);
         }
         return inner.run(name, args, opts);
       }
 
       if (!checkpoint.has(path)) {
-        checkpoint.captureBefore(path, await readOrNull(inner, path));
+        const before = await readOrNull(inner, path);
+        checkpoint.captureBefore(path, before, false, isTruncatedRead(before));
       }
       const res = await inner.run(name, args, opts);
       // A cancelled write never happened: a stopped `edit_file` must not be recorded as the
@@ -227,6 +259,11 @@ export function revertPlan(set: RunChangeSet): RevertPlan {
   for (const f of set.files) {
     if (f.beforeUnknown) {
       skipped.push({ path: f.path, reason: "its previous contents could not be read" });
+    } else if (f.beforeTruncated) {
+      skipped.push({
+        path: f.path,
+        reason: "its previous contents were larger than the read cap and cannot be restored in full",
+      });
     } else if (f.before === null) {
       if (f.after === null) {
         skipped.push({ path: f.path, reason: "it did not exist before the run and could not be read back" });

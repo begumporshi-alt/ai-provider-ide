@@ -20,6 +20,7 @@ use crate::core::egress::{self, EgressRequest, EgressState, StreamEvent};
 use crate::core::error::CommandError;
 use crate::core::memory;
 use crate::core::orchestrator;
+use crate::core::retention;
 use crate::core::skills;
 use crate::core::store::{self, Store};
 use crate::core::vault;
@@ -231,6 +232,25 @@ pub fn history_delete_session(
     context::delete_session(&store, &session_id).map_err(CommandError)
 }
 
+/// How much a history prune would remove. `days == 0` means retention is off.
+#[tauri::command]
+pub fn history_retention_preview(
+    store: State<'_, Arc<Store>>,
+    days: u32,
+) -> Result<retention::HistoryRetentionCounts, CommandError> {
+    retention::preview_history(&store, days).map_err(CommandError)
+}
+
+/// Delete sessions whose last activity is older than `days`. Manual and opt-in: the Settings
+/// screen previews, then the user confirms. Memories and the run ledger are not touched.
+#[tauri::command]
+pub fn history_retention_prune(
+    store: State<'_, Arc<Store>>,
+    days: u32,
+) -> Result<retention::HistoryRetentionCounts, CommandError> {
+    retention::prune_history(&store, days).map_err(CommandError)
+}
+
 // ---------- the transcript (0027) ----------
 // The durable copy of what the Assistant's transcript rendered. Until this existed a resumed
 // session was *reconstructed* from the context graph, which clips a message's text and derives its
@@ -254,6 +274,17 @@ pub fn transcript_list(
     context::session_messages(&store, &session_id).map_err(CommandError)
 }
 
+/// Replace a session's transcript with the view the screen now shows. Edit, retry, delete,
+/// compaction and fork all use this; see `context::replace_session_messages`.
+#[tauri::command]
+pub fn transcript_replace(
+    store: State<'_, Arc<Store>>,
+    session_id: String,
+    rows: Vec<context::SessionMessageRow>,
+) -> Result<(), CommandError> {
+    context::replace_session_messages(&store, &session_id, &rows).map_err(CommandError)
+}
+
 /// Highest message sequence already stored, so a resumed session continues past its own turns
 /// instead of upserting over them — the transcript's sibling of `history_max_seq`.
 #[tauri::command]
@@ -273,6 +304,124 @@ pub fn session_search(
     limit: Option<usize>,
 ) -> Result<Vec<context::SessionSearchHit>, CommandError> {
     context::search_sessions(&store, &query, limit.unwrap_or(30).min(200)).map_err(CommandError)
+}
+
+// ---------- cross-agent session sources (v1) ----------
+
+/// One adapter the host can see, with a live session count. Read-only on the foreign store.
+#[tauri::command]
+pub fn admin_sources_list(
+    store: State<'_, Arc<Store>>,
+) -> Result<Vec<crate::core::agent_sources::SourceListing>, CommandError> {
+    Ok(crate::core::agent_sources::all_sources(Some(Arc::clone(&*store)))
+        .into_iter()
+        .map(|s| {
+            let refs = s.list().unwrap_or_default();
+            crate::core::agent_sources::SourceListing {
+                name: s.name().to_string(),
+                available: !refs.is_empty(),
+                session_count: refs.len(),
+                note: if refs.is_empty() { Some("no sessions found".into()) } else { None },
+            }
+        })
+        .collect())
+}
+
+/// Foreign sessions from one source (`source` empty = search all). Read-only.
+#[tauri::command]
+pub fn admin_source_sessions(
+    store: State<'_, Arc<Store>>,
+    source: Option<String>,
+    query: Option<String>,
+    root: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::core::agent_sources::SessionRef>, CommandError> {
+    let sources = crate::core::agent_sources::all_sources(Some(Arc::clone(&*store)));
+    let q = query.as_deref().map(|q| q.trim().to_lowercase()).filter(|q| !q.is_empty());
+    let root = root.as_deref().map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
+    let limit = limit.unwrap_or(25).min(100);
+    let mut refs = Vec::new();
+    for s in &sources {
+        if source.is_none() || s.name() == source.as_deref().unwrap() {
+            refs.extend(s.list().unwrap_or_default());
+        }
+    }
+    let mut hits: Vec<crate::core::agent_sources::SessionRef> = refs
+        .into_iter()
+        .filter(|r| match (&root, &q) {
+            (Some(root), _) => r.root.as_deref() == Some(root.as_str()),
+            _ => true,
+        })
+        .filter(|r| match &q {
+            Some(qq) => {
+                r.title.as_deref().unwrap_or("").to_lowercase().contains(qq)
+                    || r.preview.to_lowercase().contains(qq)
+                    || r.root.as_deref().unwrap_or("").to_lowercase().contains(qq)
+            }
+            None => true,
+        })
+        .collect();
+    hits.sort_by(|a, b| {
+        let a_home = root.as_deref().is_some_and(|r| a.root.as_deref() == Some(r));
+        let b_home = root.as_deref().is_some_and(|r| b.root.as_deref() == Some(r));
+        b_home.cmp(&a_home).then_with(|| b.updated_at.cmp(&a.updated_at))
+    });
+    hits.truncate(limit);
+    // Mark already-imported rows the same way the HTTP listing does: the derived id is
+    // deterministic, so existence is the whole answer.
+    for hit in &mut hits {
+        let id = crate::core::agent_sources::imported_session_id(&hit.source, &hit.native_id);
+        if crate::core::context::session_exists(&store, &id).unwrap_or(false) {
+            hit.import_id = Some(id);
+        }
+    }
+    Ok(hits)
+}
+
+/// Pull one foreign session into this app's transcript store. Read-only on the foreign store;
+/// the write lands in `session_messages` under a derived id. Idempotent.
+#[tauri::command]
+pub fn admin_source_import(
+    store: State<'_, Arc<Store>>,
+    source: String,
+    native_id: String,
+) -> Result<crate::core::agent_sources::ImportResult, CommandError> {
+    let sources = crate::core::agent_sources::all_sources(Some(Arc::clone(&*store)));
+    let Some(src) = sources.iter().find(|s| s.name() == source) else {
+        return Err(CommandError(format!("unknown source '{source}'")));
+    };
+    let turns = src.read(&native_id).map_err(|e| CommandError(format!("could not read: {e}")))?;
+    if turns.is_empty() {
+        return Err(CommandError(format!("no readable turns in '{source}' for '{native_id}'")));
+    }
+    let session_id = crate::core::agent_sources::imported_session_id(&source, &native_id);
+    let root = src
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|r| r.native_id == native_id)
+        .and_then(|r| r.root);
+    let rows: Vec<crate::core::context::SessionMessageRow> = turns
+        .iter()
+        .enumerate()
+        .map(|(i, t)| crate::core::context::SessionMessageRow {
+            session_id: session_id.clone(),
+            seq: i as i64,
+            role: t.role.clone(),
+            content: crate::core::capture::scrub(&t.content),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: None,
+            attachments: None,
+            model: None,
+            memory_refs: None,
+            ts: t.ts,
+            root: root.clone(),
+        })
+        .collect();
+    crate::core::context::append_session_messages(&store, &rows)
+        .map_err(|e| CommandError(format!("write failed: {e}")))?;
+    Ok(crate::core::agent_sources::ImportResult { session_id, turns: rows.len() })
 }
 
 // ---------- skills (P5) ----------
@@ -412,7 +561,15 @@ pub fn memory_capture(
 ) -> Result<memory::Memory, CommandError> {
     memory::capture(
         &store,
-        &memory::MemoryInput { layer, text, session_id, subject, pinned: pinned.unwrap_or(false) },
+        &memory::MemoryInput {
+            layer,
+            text,
+            session_id,
+            subject,
+            pinned: pinned.unwrap_or(false),
+            kind: None,
+            source: None,
+        },
     )
     .map_err(CommandError)
 }
@@ -950,6 +1107,16 @@ pub fn axiom_audits_list(
     axiom::list_audits(&store, limit.unwrap_or(200)).map_err(CommandError)
 }
 
+/// One audit pass with its report. The list command deliberately omits the body; this is the
+/// read that opens it, and it only ever crosses IPC when a user asks for that pass.
+#[tauri::command]
+pub fn axiom_audit_get(
+    store: State<'_, Arc<Store>>,
+    id: String,
+) -> Result<Option<serde_json::Value>, CommandError> {
+    axiom::audit(&store, &id).map_err(CommandError)
+}
+
 pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
         vault_put,
@@ -984,10 +1151,16 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         history_rename_session,
         history_max_seq,
         history_delete_session,
+        history_retention_preview,
+        history_retention_prune,
         transcript_append,
         transcript_list,
+        transcript_replace,
         transcript_max_seq,
         session_search,
+        admin_sources_list,
+        admin_source_sessions,
+        admin_source_import,
         skills_list,
         skills_catalog,
         skills_install,
@@ -1131,6 +1304,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         axiom_decisions_list,
         axiom_audit_put,
         axiom_audits_list,
+        axiom_audit_get,
     ]
 }
 

@@ -41,7 +41,7 @@ describe("resumeSession", () => {
       '[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\"a.txt\\"}"}}]';
     h.rows = [
       { sessionId: "s1", seq: 1, role: "user", content: "read it", ts: 1 },
-      { sessionId: "s1", seq: 2, role: "assistant", content: "", toolCalls: calls, ts: 2 },
+      { sessionId: "s1", seq: 2, role: "assistant", content: "", toolCalls: calls, reasoning: "weighing it", ts: 2 },
       { sessionId: "s1", seq: 3, role: "tool", content: "file body", toolCallId: "call_1", ts: 2 },
     ];
 
@@ -49,8 +49,30 @@ describe("resumeSession", () => {
     expect(out.map((m) => m.role)).toEqual(["user", "assistant", "tool"]);
     // The pair, parsed back into the object the wire needs — not the serialized string.
     expect(out[1]!.tool_calls).toEqual(JSON.parse(calls));
+    // The thinking panel is part of the turn the user saw; resume must not drop it.
+    expect(out[1]!.reasoning).toBe("weighing it");
     expect(out[2]!.tool_call_id).toBe("call_1");
     expect(out[2]!.content).toBe("file body");
+  });
+
+  it("restores attachment metadata as a placeholder, without inventing bytes", async () => {
+    const meta = [{ name: "diagram.png", mediaType: "image/png", bytes: 2048 }];
+    h.rows = [
+      {
+        sessionId: "s1",
+        seq: 1,
+        role: "user",
+        content: "look at this",
+        attachments: JSON.stringify(meta),
+        ts: 1,
+      },
+    ];
+
+    const out = await resumeSession("s1");
+    // The durable row says an image was sent; the bytes were never stored, so the UI gets a
+    // named placeholder rather than a silent disappearance or a fake thumbnail.
+    expect(out[0]!.attachmentMeta).toEqual(meta);
+    expect(out[0]!.content).toBe("look at this");
   });
 
   it("falls back to the graph-derived timeline when the session predates 0027", async () => {

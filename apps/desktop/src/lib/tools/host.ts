@@ -65,19 +65,22 @@ export function createTauriToolHost(root: string): ToolHost {
       // child's whole process group — and resolves immediately. The invoke above still settles
       // when the Rust side returns `stopped by you`; whichever lands first, the caller gets the
       // honest reason. Nothing is left dangling: `race` handles both promises.
+      let removeAbort = () => {};
       const stopped = new Promise<WireToolResult>((resolve) => {
         if (!signal) return; // never settles — the race is then just `inflight`
-        signal.addEventListener(
-          "abort",
-          () => {
-            if (callId) void invoke<boolean>("tool_cancel", { callId }).catch(() => undefined);
-            resolve({ ok: false, output: "", error: "stopped by you" });
-          },
-          { once: true },
-        );
+        const onAbort = () => {
+          if (callId) void invoke<boolean>("tool_cancel", { callId }).catch(() => undefined);
+          resolve({ ok: false, output: "", error: "stopped by you" });
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        // `{ once: true }` only removes the listener when abort fires. A tool that finishes
+        // normally would otherwise leave one listener per call on the turn's shared signal —
+        // retaining the closure and re-cancelling finished calls on every later Stop.
+        removeAbort = () => signal.removeEventListener("abort", onAbort);
       });
 
       const res = await Promise.race([inflight, stopped]);
+      removeAbort();
       // A refusal carries its reason in `error`, not `output` — on the failure path `output` is
       // deliberately empty (`ToolResult::err`). Returning it as-is handed the model a blank tool
       // result for every denied or refused call, which is how a run ends with "the tool results

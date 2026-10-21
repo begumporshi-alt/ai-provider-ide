@@ -214,6 +214,31 @@ pub(crate) async fn chat_h(
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(payload.to_string()));
                     }
                     BridgeMsg::Result(_) => {}
+                    // A contentless progress frame. `delta: {}` keeps it a valid OpenAI chunk for
+                    // clients that ignore unknown fields; `aip_retry` is what the Assistant reads.
+                    // It does not open the message: no role and no content ride here.
+                    BridgeMsg::Retry { provider, key, attempt, max, delay_ms, reason } => {
+                        let payload = json!({
+                            "id": format!("gw-{id}"),
+                            "object": "chat.completion.chunk",
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {},
+                                "aip_retry": {
+                                    "provider": provider,
+                                    "key": key,
+                                    "attempt": attempt,
+                                    "max": max,
+                                    "delay_ms": delay_ms,
+                                    "reason": reason
+                                }
+                            }]
+                        });
+                        yield Ok::<Event, std::convert::Infallible>(
+                            Event::default().data(payload.to_string()),
+                        );
+                    }
                     BridgeMsg::Finish(reason) => finish_reason = Some(reason),
                     BridgeMsg::Done => {
                         if let Some(p) = &prep {
@@ -335,6 +360,8 @@ pub(crate) async fn chat_h(
             // Carries nothing by design; see the streaming arm (audit 2026-10-03 R2).
             BridgeMsg::Liveness => {}
             BridgeMsg::Reasoning(t) => reasoning.push_str(&t),
+            // Progress only; a non-streaming client has nowhere to paint it.
+            BridgeMsg::Retry { .. } => {}
             BridgeMsg::Result(_) => {}
             BridgeMsg::Finish(reason) => finish_reason = Some(reason),
             BridgeMsg::Done => {
@@ -464,6 +491,8 @@ pub(crate) async fn models_h(State(core): State<Arc<GatewayCore>>, headers: Head
             }
             // Serving attribution is a text-turn frame; models and images do not emit it.
             BridgeMsg::Served { .. } => {}
+            // Progress only; this dialect has no client surface for it.
+            BridgeMsg::Retry { .. } => {}
             BridgeMsg::Error { status, message, retry_after_ms } => {
                 return err_with_cooldown(
                     worker_status(status),
@@ -568,6 +597,8 @@ pub(crate) async fn image_h(
         match msg {
             // Serving attribution is a text-turn frame; images do not emit it.
             BridgeMsg::Served { .. } => {}
+            // Progress only; this dialect has no client surface for it.
+            BridgeMsg::Retry { .. } => {}
             BridgeMsg::Result(v) => {
                 return (
                     StatusCode::OK,

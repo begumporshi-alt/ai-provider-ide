@@ -1110,8 +1110,8 @@ function ToolsTab({ d, loading, detail, onToggle }: TabProps & { d: ControlData;
           }}
         />
         <SwitchRow
-          label="Allow writes and commands"
-          hint="The Assistant asks for confirmation per call; the gateway path has no human in the loop, so this is off by default and enforced host-side."
+          label="Allow writes, commands and web fetches"
+          hint="The Assistant asks for confirmation per call; the gateway path has no human in the loop, so tools that write or send data out are off by default and enforced host-side."
           checked={d.mutation === true}
           disabled={d.hostError !== null || d.mutation === null}
           error={mutError}

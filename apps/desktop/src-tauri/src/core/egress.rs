@@ -594,7 +594,7 @@ pub const UPSTREAM_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(20);
 /// send only events the manifest's delta selector does not match (an OpenAI-shaped stream's
 /// role-only first delta is the common one) before going silent. The interpreter then has no
 /// output, the egress waits out [`UPSTREAM_IDLE_TIMEOUT`] (120s) for an event that never comes,
-/// and the gateway's `FIRST_MSG_TIMEOUT` — **30s when this was measured, 40s since 2026-10-13** —
+/// and the gateway's `FIRST_MSG_TIMEOUT` — **30s when this was measured, 48s since 2026-10-19** —
 /// wins the race it was always going to win: the request dies as `CANCELLED` with *"the router
 /// produced no response within 30000ms — the request was abandoned; retry"* (the number in that
 /// message is the bound of the day), a message that describes our own bound while reading like an
@@ -2043,17 +2043,24 @@ mod stall_tests {
     /// UPSTREAM_HEADER_TIMEOUT <= UPSTREAM_FIRST_BYTE_TIMEOUT <= UPSTREAM_FIRST_OUTPUT_TIMEOUT
     ///          20s                          20s                         20s
     ///   <= PLAN_BUDGET < FIRST_MSG_TIMEOUT
-    ///       36s              40s
+    ///       44s              48s
     /// ```
     ///
-    /// **Every term but the middle one is unchanged; `PLAN_BUDGET` moved 26s -> 36s and
-    /// `FIRST_MSG_TIMEOUT` with it, on 2026-10-13.** The pair has to move together — the right
-    /// inequality is what keeps a budget refusal legible as the real error class instead of a
-    /// gateway `CANCELLED` — and the plan budget had to grow because the re-probe admission rule
-    /// (`elapsed + wait + UPSTREAM_HEADER_TIMEOUT <= PLAN_BUDGET`) left only a 4s window at 26s,
-    /// which made more than one same-key re-probe unreachable in production. See
-    /// `engine::SERVER_ERROR_REPROBES_MAX`. The left inequality is unaffected: a full attempt is
-    /// still fundable inside the plan, and it is now fundable with room to re-dial.
+    /// **Two full attempts are now part of the ordering, and that is the 2026-10-19 correction.**
+    /// The previous pair was 36s/40s. It funded one attempt plus a same-key re-probe, but not a
+    /// second *candidate*: after the first spent its whole header budget, `20s + 20s > 36s` refused
+    /// the next one. Ledger rows 7092/7099 are the result — a one-entry chain on `key-03` while
+    /// `key-04` served the same provider and model seconds earlier. A per-attempt bound that is more
+    /// than half the plan budget makes failover after a timeout unreachable by construction, so the
+    /// `per_attempt * 2 <= plan` clause is asserted below rather than left implied.
+    ///
+    /// **The pair moved 26s -> 36s -> 44s and the gateway bound 30s -> 40s -> 48s, each time
+    /// together.** The right inequality is what keeps a budget refusal legible as the real error
+    /// class instead of a gateway `CANCELLED` — and the plan budget had to grow because the
+    /// re-probe admission rule (`elapsed + wait + UPSTREAM_HEADER_TIMEOUT <= PLAN_BUDGET`) left
+    /// only a 4s window at 26s, which made more than one same-key re-probe unreachable in
+    /// production. See `engine::SERVER_ERROR_REPROBES_MAX`. The left inequality is unaffected: a
+    /// full attempt is still fundable inside the plan, and it is now fundable with room to re-dial.
     ///
     /// **The leftmost term was added hours after the two beside it, because this ordering was
     /// still one constant short.** It ordered the *header wait* against the plan, but the first
@@ -2105,6 +2112,13 @@ mod stall_tests {
             "one attempt may cost {first_output:?}, but the whole plan is budgeted {plan:?} — a \
              candidate admitted for a full attempt could then overrun the plan. Raise PLAN_BUDGET \
              or lower UPSTREAM_FIRST_OUTPUT_TIMEOUT."
+        );
+        assert!(
+            per_attempt.saturating_mul(2) <= plan,
+            "one attempt may cost {per_attempt:?}, but two of them do not fit in {plan:?} — so a \
+             candidate that times out on headers leaves no room to start the next one, and the \
+             failover `egress::stream` promises is unreachable. Raise PLAN_BUDGET or lower the \
+             per-attempt bound."
         );
         assert!(
             plan < gateway_bound,

@@ -23,7 +23,13 @@ export const AGENT_SYSTEM =
   "create a whole file, mkdir to make a directory, run_command for allowlisted commands. " +
   "Run a project's own toolchain through run_command rather than asserting a change is correct: " +
   "cargo build / cargo test / cargo clippy / cargo fmt in a Rust project, npm or pnpm test and " +
-  "npm run for a JavaScript one. " +
+  "npm run for a JavaScript one. If there is no test script, run the checks the project does " +
+  "define — typecheck, lint, build — and name which ones ran; never say \"nothing to run\" when " +
+  "those exist. " +
+  "For print output, render at the paper sizes and viewports that matter — browser_print takes " +
+  "paper (a4/letter/legal or custom inches), margin_in, and viewport_width/viewport_height with " +
+  "mobile — instead of only Chrome's default. For a connected Android device or emulator, use " +
+  "device_list, device_open_url (10.0.2.2 is the host from the emulator), and device_screenshot. " +
   "For the public web, web_search (keyless, with fallback backends) finds pages, web_fetch reads one, " +
   "and web_ask answers a question about a page without loading it into this conversation. " +
   "read_document reads PDFs and Word files; read_image shows you an image if you support vision. " +
@@ -97,6 +103,12 @@ export interface AgentSystemParts {
   /** The session-references block, same convention as `skillsBlock` (see lib/chat/turn/
    *  session-references). The conversation's source links, listed so every reply can prefer them. */
   referencesBlock?: string;
+  /**
+   * The verified session manifest for this turn, empty when memory is off or nothing is scoped.
+   * It reads above `recalledMemory` because it is the stable half of the context: identity,
+   * decisions and live capabilities change slowly, while recall is this question's specifics.
+   */
+  manifest?: string;
   /** The recalled-memory text for this turn, empty when memory is off or nothing recalled. */
   recalledMemory?: string;
   planMode?: boolean;
@@ -112,9 +124,9 @@ export interface AgentSystemParts {
 }
 
 /**
- * The agent request's system turn: base prompt → AXIOM's patches → skills → recalled memory → plan
- * mode → the per-turn instruction, each absent piece omitted. Order matters — the per-turn
- * constraint is the most specific and reads last, directly above the user's turn.
+ * The agent request's system turn: base prompt → AXIOM's patches → skills → manifest → recalled
+ * memory → plan mode → the per-turn instruction, each absent piece omitted. Order matters — the
+ * per-turn constraint is the most specific and reads last, directly above the user's turn.
  *
  * The patches go immediately after the base rather than at the end because that is what they are:
  * amendments to the agent's standing instructions, measured against this prompt and promoted as a
@@ -134,6 +146,7 @@ export function buildAgentSystem(parts: AgentSystemParts): string {
     base +
     parts.skillsBlock +
     (parts.referencesBlock ?? "") +
+    (parts.manifest ? `\n\n${parts.manifest}` : "") +
     (parts.recalledMemory ? `\n\n${parts.recalledMemory}` : "") +
     (parts.planMode ? PLAN_MODE_SYSTEM : "") +
     (parts.perTurn ? `\n\n${parts.perTurn}` : "")
@@ -141,14 +154,16 @@ export function buildAgentSystem(parts: AgentSystemParts): string {
 }
 
 /**
- * The plain-chat request's message array: system → recalled memory → per-turn instruction →
- * replayed history → the user's turn. Same ordering rule as the agent path; the user's turn is
- * content-parts when it carries images and a plain string otherwise.
+ * The plain-chat request's message array: system → manifest → recalled memory → per-turn
+ * instruction → replayed history → the user's turn. Same ordering rule as the agent path; the
+ * user's turn is content-parts when it carries images and a plain string otherwise.
  */
 export function buildPlainRequestMessages(
   /** The resolved no-tools/custom prompt; `undefined` means "no system turn at all" (the blank
    *  editor's third state — the model gets its provider default). */
   systemPromptText: string | undefined,
+  /** The verified session manifest, in its own system message above the recalled block. */
+  manifestMsg: string | undefined,
   recallMsg: string | undefined,
   perTurn: string,
   history: ChatMessage[],
@@ -156,6 +171,7 @@ export function buildPlainRequestMessages(
 ): ChatMessage[] {
   return [
     ...(systemPromptText ? [{ role: "system" as const, content: systemPromptText }] : []),
+    ...(manifestMsg ? [{ role: "system" as const, content: manifestMsg }] : []),
     ...(recallMsg ? [{ role: "system" as const, content: recallMsg }] : []),
     // Last, and directly above the user's turn: a per-turn constraint is the most specific
     // instruction in the request, and its own message keeps it from reading as the user's words.

@@ -8,7 +8,7 @@ import { replayHistory, recalledLight } from "./messages";
 import { clip } from "./graph-record";
 import type { TurnPorts, TurnRequestBase } from "./ports";
 import { attachmentMeta } from "./ports";
-import type { ServedBy } from "../../gateway-turn";
+import { retryNoticeLabel, type ServedBy } from "../../gateway-turn";
 
 /** The model's reasoning paints at most every 80 ms. Time-based rather than count-based: a fixed
  *  "every Nth delta" is wrong at both ends of the range — the measured failure carried **8197**
@@ -16,6 +16,11 @@ import type { ServedBy } from "../../gateway-turn";
  *  would render its first delta and then nothing until the stream ended, showing an open but
  *  effectively empty panel for the whole turn. A clock interval is right for both. */
 export const REASONING_PAINT_MS = 80;
+
+/** The answer text paints at most every 50 ms. The same argument as reasoning, with a tighter
+ *  clock because this is the text the user is reading: a per-delta render re-parses the whole
+ *  accumulated answer and rebuilds the transcript on every token. */
+export const CONTENT_PAINT_MS = 50;
 
 export interface PlainTurnRequest extends TurnRequestBase {
   /** The resolved system prompt: custom, built-in no-tools guard, or `undefined` for none. */
@@ -45,17 +50,37 @@ export async function runPlainTurn(req: PlainTurnRequest, ports: TurnPorts): Pro
    *  durable copy disagree with the conversation the user can see. */
   let recordedText = "";
   let lastReasoningPaint = 0;
+  let lastContentPaint = 0;
+  let lastPaintedContent = "";
   // Charged to the session totals in the `finally`, once per turn. No initializer: `onUsage`
   // (a closure TS cannot see run) is what assigns it, and an `= null` start would narrow the
   // `finally` read to `never`. Locals because `served` is only known after the stream ends and
   // the `finally` must see both.
   let turnUsage: { prompt_tokens: number; completion_tokens: number } | undefined;
   let turnServed: ServedBy | undefined;
+  /** The retry line is cleared once the first token arrives, not on every chunk. */
+  let retryCleared = false;
+  /** Only patch the clear when a retry line was actually painted — otherwise the clear becomes a
+   *  spurious final patch on turns that never retried. */
+  let retryPainted = false;
   try {
     // The same replay the agent path uses. Sharing it is the fix: this path used to map only
     // {role, content}, so a session that had used agent mode sent its tool results with no
     // tool_call_id and the provider answered 400.
-    const history = replayHistory(req.baseMsgs);
+    let history = replayHistory(req.baseMsgs);
+    // Automatic compaction. `compressWithSummary` is a no-op (and makes no model call) when the
+    // history fits, so this only pays when the request would otherwise overflow the window.
+    if (req.compact && req.compactBudget) {
+      const compacted = await req.compact(history, req.compactBudget);
+      if (compacted.compressed) {
+        history = compacted.messages;
+        req.onCompacted?.({
+          dropped: compacted.dropped,
+          beforeTokens: compacted.beforeTokens,
+          afterTokens: compacted.afterTokens,
+        });
+      }
+    }
     // Recalled memory goes in its own system message, never spliced into the user's text:
     // the model must be able to tell the difference between what was just said and what was
     // remembered from an earlier conversation.
@@ -66,10 +91,17 @@ export async function runPlainTurn(req: PlainTurnRequest, ports: TurnPorts): Pro
     const exec = await ports.generate(
       {
         model: req.model,
-        messages: buildPlainRequestMessages(req.systemPromptText, recallMsg, req.perTurn, history, {
-          content: req.text,
-          attachments: req.attachments,
-        }),
+        messages: buildPlainRequestMessages(
+          req.systemPromptText,
+          req.manifestBlock,
+          recallMsg,
+          req.perTurn,
+          history,
+          {
+            content: req.text,
+            attachments: req.attachments,
+          },
+        ),
         onFinish: ports.onFinishReason,
         onReasoning: (t: string) => {
           reasoned += t;
@@ -91,14 +123,35 @@ export async function runPlainTurn(req: PlainTurnRequest, ports: TurnPorts): Pro
           turnUsage = u;
           ports.onLastUsage(u);
         },
+        // The engine's retry notice: paint `attempt N/M` in the assistant bubble so a 40s wait
+        // is visibly progress rather than a frozen screen.
+        onRetry: (n) => {
+          retryPainted = true;
+          ports.patchMsg(req.assistantMsgId, { retryStatus: retryNoticeLabel(n) });
+        },
       },
       { signal: req.signal },
     );
     for await (const chunk of exec.chunks) {
+      if (retryPainted && !retryCleared) {
+        retryCleared = true;
+        ports.patchMsg(req.assistantMsgId, { retryStatus: undefined });
+      }
       streamed += chunk;
-      ports.patchMsg(req.assistantMsgId, { content: streamed });
+      const now = ports.now();
+      if (now - lastContentPaint >= CONTENT_PAINT_MS) {
+        lastContentPaint = now;
+        lastPaintedContent = streamed;
+        ports.patchMsg(req.assistantMsgId, { content: streamed });
+      }
       // Scroll is handled by the sticky-follow effect on `msgs` — following per token here would
       // also fight the user when they have scrolled up to read.
+    }
+    // The tail the throttle above skipped. The final text matters more than any intermediate
+    // paint: it is what the transcript records and what the user sees when the stream stops.
+    if (streamed) {
+      lastPaintedContent = streamed;
+      ports.patchMsg(req.assistantMsgId, { content: streamed });
     }
     // The tail the throttle above skipped. This is the flush that matters most: the last deltas
     // before a model runs out of output budget are the ones that say what it was doing when it
@@ -143,9 +196,20 @@ export async function runPlainTurn(req: PlainTurnRequest, ports: TurnPorts): Pro
     } else {
       ports.onTrace({ ms: ports.now() - req.startedAt, fallbacks: [], error: (e as Error).message });
       recordedText = streamed || `⚠ ${(e as Error).message}`;
+      lastPaintedContent = recordedText;
       ports.patchMsg(req.assistantMsgId, { content: recordedText });
     }
   } finally {
+    // A retry line must not outlive the turn: success, failure and stop all land here. Only when
+    // one was painted, so a turn that never retried leaves its last content patch untouched.
+    if (retryPainted && !retryCleared) {
+      ports.patchMsg(req.assistantMsgId, { retryStatus: undefined });
+    }
+    // A stopped or failed stream may have left the last few deltas inside the paint interval.
+    // The catch above patches the error text; this makes the successful/aborted tail visible too.
+    if (recordedText && recordedText !== lastPaintedContent) {
+      ports.patchMsg(req.assistantMsgId, { content: recordedText });
+    }
     // Flush even on error or stop: a partial turn is still a turn, and the graph is a record
     // of what happened, not of what succeeded.
     void rec.flush();

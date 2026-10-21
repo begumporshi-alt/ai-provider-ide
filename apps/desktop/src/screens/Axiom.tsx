@@ -36,6 +36,7 @@ import {
 } from "@aiprovider/axiom-core";
 import {
   axiomActiveConfig,
+  axiomGetAudit,
   axiomListAudits,
   axiomListDecisions,
   axiomListFindings,
@@ -62,6 +63,7 @@ const fmtTime = (ts: number) => new Date(ts).toLocaleString([], { month: "short"
 
 export function AxiomScreen() {
   const tick = useUi((s) => s.tick);
+  const screen = useUi((s) => s.screen);
   const [model, setModel] = useState("");
   const [repeats, setRepeats] = useState(2);
   const [suiteText, setSuiteText] = useState(DEFAULT_SUITE_JSON);
@@ -123,15 +125,41 @@ export function AxiomScreen() {
     // clobber a report the user is mid-way through reading.
     if (opts?.restoreReport && h.status === "fulfilled") {
       const latest = h.value.find((x) => x.status === "completed");
-      const rep = latest && isImproveReport(latest.report) ? (latest.report as unknown as ImproveReport) : null;
-      if (rep) setReport(rep);
+      if (latest) {
+        // The list command deliberately omits the report body; open the one pass we need.
+        const full = await axiomGetAudit(latest.id).catch(() => null);
+        const rep =
+          full?.report && isImproveReport(full.report)
+            ? (full.report as unknown as ImproveReport)
+            : null;
+        if (rep) setReport(rep);
+      }
     }
   }, []);
 
+  /** Open one older pass's report. The list carries metadata only; the body is fetched here,
+   *  by primary key, so the timeline can still inspect history without shipping every report. */
+  const openAuditReport = useCallback(async (id: string) => {
+    const full = await axiomGetAudit(id).catch(() => null);
+    if (full?.report && isImproveReport(full.report)) {
+      setReport(full.report as unknown as ImproveReport);
+    }
+  }, []);
+
+  const reloadInFlight = useRef(false);
   useEffect(() => {
-    void reload({ restoreReport: true });
+    // A hidden screen must not reload. The global tick moves on every user action, and this
+    // screen is kept mounted after its first visit — without this guard a hidden AXIOM re-reads
+    // every store (including the audit ledger) each time the Assistant touches the tick.
+    if (screen !== "axiom" || reloadInFlight.current) return;
+    reloadInFlight.current = true;
+    void reload({ restoreReport: true })
+      .catch(() => undefined)
+      .finally(() => {
+        reloadInFlight.current = false;
+      });
     void fetchDefaultRoot().then(setRoot);
-  }, [reload, tick]);
+  }, [reload, tick, screen]);
 
   /** Consent as a port: the question belongs to the user, so the answer comes from the UI. */
   const consentPort: ConsentPort = useMemo(
@@ -902,7 +930,9 @@ export function AxiomScreen() {
                 {e.at !== history[history.length - 1]?.at && (
                   <span aria-hidden className="absolute left-[10px] top-6 bottom-0 w-px" style={{ background: "var(--border)" }} />
                 )}
-                {e.audit ? <AuditEntry audit={e.audit} onAutopsy={openAutopsy} /> : null}
+                {e.audit ? (
+                  <AuditEntry audit={e.audit} onAutopsy={openAutopsy} onOpen={openAuditReport} />
+                ) : null}
                 {e.decision ? <DecisionEntry decision={e.decision} /> : null}
               </li>
             ))}
@@ -1268,12 +1298,54 @@ function entryTone(e: { audit: StoredAuditPass | null; decision: PromotionDecisi
 
 const shortId = (id: string | null) => (id ? (id.length > 10 ? `…${id.slice(-8)}` : id) : "—");
 
+/** The delta chips a decision report carries. */
+type AuditDelta = {
+  metric: string;
+  baseline: number;
+  candidate: number;
+  delta: number;
+  beyondNoise: boolean;
+};
+
 /** One audit pass on the timeline: verdict, delta chips, and the pass's own seven-stage summary. */
-function AuditEntry({ audit, onAutopsy }: { audit: StoredAuditPass; onAutopsy: (runId: string) => void }) {
+function AuditEntry({
+  audit,
+  onAutopsy,
+  onOpen,
+}: {
+  audit: StoredAuditPass;
+  onAutopsy: (runId: string) => void;
+  onOpen: (id: string) => void;
+}) {
   const tone = entryTone({ audit, decision: null });
-  const rep = isImproveReport(audit.report) ? (audit.report as unknown as ImproveReport) : null;
-  const error = typeof audit.report.error === "string" ? audit.report.error : null;
-  const deltas = rep?.decision?.deltas ?? [];
+  const [loadedReport, setLoadedReport] = useState<ImproveReport | null>(null);
+  const [loadingReport, setLoadingReport] = useState(false);
+  // The list sends metadata plus the two small fields the row renders. The seven-stage body is
+  // fetched only when the reader expands it — a timeline row must not pull an 8 MB report.
+  const rep =
+    loadedReport ??
+    (audit.report && isImproveReport(audit.report) ? (audit.report as unknown as ImproveReport) : null);
+  const error =
+    audit.reportError ?? (typeof audit.report?.error === "string" ? audit.report.error : null);
+  let listedDeltas: AuditDelta[] = [];
+  if (audit.reportDeltas) {
+    try {
+      const parsed: unknown = JSON.parse(audit.reportDeltas);
+      if (Array.isArray(parsed)) listedDeltas = parsed as AuditDelta[];
+    } catch {
+      // A malformed chip list is not worth losing the row over.
+    }
+  }
+  const deltas = rep?.decision?.deltas ?? listedDeltas;
+  const ensureReport = async () => {
+    if (rep || loadingReport) return;
+    setLoadingReport(true);
+    const full = await axiomGetAudit(audit.id).catch(() => null);
+    if (full?.report && isImproveReport(full.report)) {
+      setLoadedReport(full.report as unknown as ImproveReport);
+    }
+    setLoadingReport(false);
+  };
   return (
     <div className="border-b py-2.5 last:border-b-0" style={{ borderColor: "var(--border)" }}>
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
@@ -1288,6 +1360,16 @@ function AuditEntry({ audit, onAutopsy }: { audit: StoredAuditPass; onAutopsy: (
           {audit.status}
         </span>
       </div>
+      {!rep && (
+        <button
+          type="button"
+          onClick={() => onOpen(audit.id)}
+          className="mt-1 text-[11px] underline"
+          style={{ color: "var(--text-dim)" }}
+        >
+          open this pass's report
+        </button>
+      )}
       {error && <div className="mt-0.5 text-[11px]" style={{ color: "var(--danger)" }}>{error}</div>}
       {deltas.length > 0 && (
         <div className="mt-1 flex flex-wrap gap-1">
@@ -1303,13 +1385,22 @@ function AuditEntry({ audit, onAutopsy }: { audit: StoredAuditPass; onAutopsy: (
           ))}
         </div>
       )}
-      {(rep || (audit.suiteId && error)) && (
-        <details className="mt-1">
+      {(rep || audit.status === "completed") && (
+        <details
+          className="mt-1"
+          onToggle={(e) => {
+            if ((e.currentTarget as HTMLDetailsElement).open) void ensureReport();
+          }}
+        >
           <summary className="cursor-pointer select-none text-[11px]" style={{ color: "var(--text-faint)" }}>
             the pass in seven stages
           </summary>
           <div className="mt-1.5 pl-3">
-            {rep ? (
+            {loadingReport ? (
+              <p className="text-[11px]" style={{ color: "var(--text-dim)" }}>
+                Loading the pass report…
+              </p>
+            ) : rep ? (
               <>
                 <StageSummary rep={rep} />
                 {rep.notDone.length > 0 && (

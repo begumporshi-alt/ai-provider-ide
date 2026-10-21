@@ -293,6 +293,32 @@ it, and `pnpm check-version-sync` fails the build when one does not.
   report there is noise that trains the reader to skip the line that matters. See
   `docs/dev-book/07-drift-register.md` D110, which this closes the *diagnosability* half of.
 
+- **The Assistant can render print output.** `browser_print` drives the same CDP page as the other
+  browser tools with `Emulation.setEmulatedMedia` set to `print`, calls `Page.printToPDF`, and saves
+  the result into the workspace (`documents/` by default). This is the only path that applies
+  `@media print` and `@page`: `browser_screenshot` captures screen media, so a print stylesheet could
+  be confirmed as served but never seen. The emulation is restored to `screen` before the call
+  returns, because the connection is cached across tool calls. Paper is selectable too — `paper:
+  a4|letter|legal`, custom inches and `margin_in` — and both print and screenshot accept an emulated
+  `viewport_width`/`viewport_height` with `mobile`, so A4 and phone/tablet layouts can be rendered
+  instead of only Chrome's default Letter. The model reads the PDF's text back with
+  `read_document`; the tool is approval-gated like the other browser drivers. The real-Chrome round
+  trip navigates to a page with distinct screen/print markers, renders it at A4 with a phone
+  viewport, and asserts the PDF contains `PRINTONLY` and not `SCREENONLY` and that the mobile PNG's
+  IHDR is the emulated 390×844.
+
+- **The Assistant verifies the checks a project actually has, and can see a real Android device.**
+  `AGENT_SYSTEM` now names `typecheck`/`lint`/`build` as the fallback when a project has no `test`
+  script — never "nothing to run" when those exist — and points print verification at paper sizes
+  and phone/tablet viewports instead of Chrome's default alone. Three Assistant-only tools drive an
+  already-running Android emulator or USB device over adb: `device_list` reports serial, state and
+  model; `device_open_url` opens a URL in the device browser (`10.0.2.2` is the host from the
+  emulator); `device_screenshot` saves a PNG into the workspace and returns the same `READ_IMAGE`
+  marker the vision path already handles. All three are approval-gated for mutations, never install
+  apps or run arbitrary shell commands, and every failure names the missing adb/device precondition.
+  Verified against the Pixel 6 AVD: `device_list` sees `emulator-5554`, and `device_screenshot`
+  returns a real 1080×2400 PNG.
+
 ### Changed
 
 - **The assistant can build, test and lint Rust — and `pnpm` works too.** Two independent defects
@@ -464,6 +490,71 @@ it, and `pnpm check-version-sync` fails the build when one does not.
   form *absent*.
 
 ### Fixed
+
+- **`browser_screenshot` could not save a new capture, which made screenshots unavailable in
+  practice.** `do_browser_screenshot` resolved its target with `resolve_within(root, &rel, false)`;
+  that argument means "the target must already exist", and every default capture is a fresh
+  `images/browser-<timestamp>.png`, so the tool failed with "no such file or directory" before the
+  write. The dead `create_dir_all` below it showed the intended behaviour. Binary tool output now
+  goes through `save_tool_binary`, which resolves with `create_parents = true` (the same discipline
+  `write_file` uses), checks the extension, and writes; the real-Chrome round trip captures into a
+  directory that does not exist yet and asserts a real PNG lands there.
+
+- **The package test suites no longer count generated `.verify-build/` copies as empty tests.**
+  `pnpm --filter @aiprovider/axiom-core test` reported 11 "No test suite found" failures beside the
+  252 passing cases because Vitest's default exclude covers `build`/`dist` but not the compiled
+  verification copies. The three package configs append `**/.verify-build/**` to
+  `configDefaults.exclude` (still no `include` glob), and `.gitignore` covers the directory.
+
+- **A pre-headers timeout had no failover: the plan budget refused the next candidate, so the
+  router reported `all attempts failed` after one attempt (drift D123).** `PLAN_BUDGET` was 36 s,
+  and `candidate_is_affordable` admits a later candidate only when
+  `elapsed + UPSTREAM_HEADER_TIMEOUT <= PLAN_BUDGET`. One candidate spending its whole 20 s header
+  budget therefore left `20 s + 20 s > 36 s`, so the second candidate was refused by construction.
+  `egress::stream` states that the engine is the recovery for this arm and `attempt_disposition`
+  does return `Next`, but `engine::text` ended the plan `Spent` before the next dial — the chain
+  showed one entry and the message named one attempt while the plan had two. Ledger rows
+  7092/7099 (2026-10-19) are the case: `agent-router/key-03` timed out at 20 056/20 072 ms and was
+  the only entry, while `key-04` served the same provider and model at 14:54:00 and 15:02:15. The
+  positive control is row 5198 (2026-10-15): a first attempt that failed in ~12.7 s left
+  `12.7 + 20 <= 36`, and `vice/key-01` was dialled. The arithmetic, not the provider, decided
+  whether failover happened.
+
+  The missing invariant is now asserted: `2 × UPSTREAM_FIRST_BYTE_TIMEOUT <= PLAN_BUDGET <
+  FIRST_MSG_TIMEOUT`. `PLAN_BUDGET` moves 36 s → 44 s and `gateway::FIRST_MSG_TIMEOUT` 40 s → 48 s
+  together, so the engine still fails before the gateway and the real class survives. The
+  `the_plan_budget_fits_inside_the_gateway_bound` test gained the two-attempt clause; the
+  per-attempt test that pinned entry 2's refusal is inverted; and
+  `a_header_timeout_still_dials_the_next_candidate` drives the path on a paused clock, advancing the
+  first dial by exactly 20 s. The stated cost: a genuinely dead request now surfaces at up to 44 s
+  instead of 36 s, and a first key that stalls gets one more full attempt instead of failing at
+  20 s.
+
+- **A pre-output timeout now reaches a different provider before the failed host's next key, and the
+  Assistant uses the bare model so a second provider is in the plan at all.** The plan is ordered
+  provider-by-provider, so after `agent-router/key-03` timed out the next candidate was
+  `agent-router/key-04` — the same host, which is exactly why the egress refuses to retry a header
+  timeout. The measured case (ledger 7160, 2026-10-19) had both keys stall for 20 s while `vice`
+  carried the same `deepseek-v4-flash`; the second key was dialled because the plan had no reason to
+  prefer a different carrier. The engine now reorders only the *remaining* candidates after a
+  `NETWORK` failure, moving other providers ahead of the failed one while preserving each group's
+  relative order; a plan with no other carrier is unchanged. The Assistant's stored model moves from
+  the qualified `agent-router/deepseek-v4-flash` to the bare `deepseek-v4-flash`, so the alias's
+  `vice` carrier is planned. Pinned by `a_pre_output_timeout_prefers_a_different_provider`; the
+  full suite is 1,684 green.
+
+- **A network timeout now gets a bounded same-request retry when the plan has no different
+  provider, and the Assistant paints the retry as it happens.** Borrowed from ZCode's AI-SDK
+  policy (`maxRetries 2`, 2 s initial delay): after a `NETWORK` failure with nothing emitted and no
+  other carrier left, the engine sleeps 2 s and re-dials the same candidate, at most twice. The
+  wait is priced by the same plan-budget rule, so after a full 20 s header timeout exactly one
+  retry fits (`20 + 2 + 20 = 42 <= 44`) and a third attempt does not. The notice travels the
+  bridge as a contentless OpenAI chunk carrying `aip_retry` (`provider`, `key`, `attempt`, `max`,
+  `delay_ms`, `reason`); the Assistant renders it as `Retrying agent-router · key-03 — attempt
+  2/2 in 2s…` and clears it on the first token or when the turn settles. Pinned by
+  `a_network_timeout_reprobes_the_same_candidate_when_no_other_provider_exists`, the budget
+  arithmetic test, `a_retry_frame_rides_the_openai_stream_without_becoming_content`, and the
+  gateway-turn parser test.
 
 - **The verification gate's own demand was being answered by the wrong branch of the test oracle, and
   it silently reverted the work under test (drift D121).** `92efa4a` added a gate that holds a turn

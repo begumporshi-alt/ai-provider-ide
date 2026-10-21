@@ -36,7 +36,7 @@ vi.mock("@tauri-apps/api/core", () => ({
   },
 }));
 
-import { gatewayGenerate } from "./gateway-turn";
+import { gatewayGenerate, retryNoticeLabel } from "./gateway-turn";
 import { clearUiSession } from "./gateway-client";
 
 const sse = (frames: string[]): Response =>
@@ -218,4 +218,54 @@ test("does not send tools when the request declares none", async () => {
   const body = JSON.parse(String(last!.init.body));
   expect(body.tools).toBeUndefined();
   expect(body.tool_choice).toBeUndefined();
+});
+
+test("a retry frame reaches onRetry and never becomes answer text", async () => {
+  stubFetch();
+  responses.push(() =>
+    sse([
+      frame({
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            aip_retry: {
+              provider: "agent-router",
+              key: "key-03",
+              attempt: 2,
+              max: 3,
+              delay_ms: 2000,
+              reason: "upstream sent no response headers for 20s",
+            },
+          },
+        ],
+      }),
+      frame({ choices: [{ delta: { content: "Hello" } }] }),
+      "data: [DONE]\n\n",
+    ]),
+  );
+  const onRetry = vi.fn();
+  const exec = await gatewayGenerate({ model: "m", messages: [], onRetry }, {});
+  expect(await drain(exec)).toBe("Hello");
+  expect(onRetry).toHaveBeenCalledWith({
+    provider: "agent-router",
+    key: "key-03",
+    attempt: 2,
+    max: 3,
+    delay_ms: 2000,
+    reason: "upstream sent no response headers for 20s",
+  });
+});
+
+test("retry labels read as progress rather than as an error", () => {
+  expect(
+    retryNoticeLabel({
+      provider: "agent-router",
+      key: "key-03",
+      attempt: 2,
+      max: 2,
+      delay_ms: 2000,
+    }),
+  ).toBe("Retrying agent-router · key-03 — attempt 2/2 in 2s…");
+  expect(retryNoticeLabel({ attempt: 2, max: 2 })).toBe("Retrying attempt 2/2…");
 });

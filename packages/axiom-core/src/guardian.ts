@@ -14,7 +14,9 @@
  * configuration differ. A delta smaller than the spread across repeats is not a result, and the
  * guardian says so rather than reporting it as an improvement. This is also why fewer than two
  * attempts is a hard failure and not a small sample: with one attempt there is no spread to compare
- * against, so *no* delta can be shown to be real.
+ * against, so *no* delta can be shown to be real. The spread is pooled **within** each task
+ * (`valuesByTask`), never across tasks: two tasks that differ in difficulty are not noise, and
+ * averaging them in makes the floor a measure of suite heterogeneity that no repeat count can lower.
  *
  **Preserving what worked is a separate check from improving what didn't.** A change that lifts the
  * targeted metric and breaks two previously-passing tasks is rejected. That is the whole point of
@@ -26,8 +28,8 @@
  * auto-dismissing surface that the conventions chapter warns about: it can never fail, so it never
  * tells you anything.
  */
-import { countPatches, patchChars, PROMPT_CAP, type Proposal } from "./version";
-import type { AgentVersion, Finding, GuardianCheck, MetricDelta, SuiteResult } from "./types";
+import { countPatches, patchChars, PROMPT_CAP, unmarkedChars, type Proposal } from "./version";
+import type { AgentVersion, EvalAttemptSummary, Finding, GuardianCheck, MetricDelta, SuiteResult } from "./types";
 
 /** The metrics a validation run can compare. Each is derived from stored attempt summaries only. */
 export type ComparableMetric =
@@ -74,28 +76,77 @@ export function isComparableMetric(m: string | null): m is ComparableMetric {
 }
 
 function values(r: SuiteResult, m: ComparableMetric): (number | null)[] {
-  return r.attemptSummaries.map((a) => {
-    switch (m) {
-      case "passRate":
-        return a.passed ? 1 : 0;
-      case "iterations":
-        return a.iterations;
-      case "totalTokens":
-        return a.totalTokens;
-      case "durationMs":
-        return a.durationMs;
-      case "toolCalls":
-        return a.toolCalls;
-      case "toolFailures":
-        return a.toolFailures;
-      case "deniedCalls":
-        return a.deniedCalls;
-      case "verificationCalls":
-        return a.verificationCalls;
-      case "repeatRatio":
-        return a.repeatRatio;
+  return r.attemptSummaries.map((a) => valuesOf(a, m));
+}
+
+/**
+ * The same values, grouped by the task each attempt belongs to.
+ *
+ * The grouping is the whole point of this function. The spread the noise floor is meant to measure
+ * is the model sampling differently run to run **on the same task**. Spread across different tasks is
+ * difficulty — a property of the suite, not of the run — and it does not shrink when repeats are
+ * added, because adding repeats adds equal numbers of easy and hard attempts. Pooling the two
+ * together makes the floor a measure of how heterogeneous the suite is, and on `passRate` it pinned
+ * at ~0.47 while the real gain was 0.25, so a change that fixed a whole task could never be promoted
+ * however many repeats the user paid for.
+ */
+function valuesByTask(r: SuiteResult, m: ComparableMetric): Map<string, number[]> {
+  const groups = new Map<string, number[]>();
+  for (const a of r.attemptSummaries) {
+    const v = valuesOf(a, m);
+    if (v === null) continue;
+    const list = groups.get(a.taskId);
+    if (list) list.push(v);
+    else groups.set(a.taskId, [v]);
+  }
+  return groups;
+}
+
+function valuesOf(a: EvalAttemptSummary, m: ComparableMetric): number | null {
+  switch (m) {
+    case "passRate":
+      return a.passed ? 1 : 0;
+    case "iterations":
+      return a.iterations;
+    case "totalTokens":
+      return a.totalTokens;
+    case "durationMs":
+      return a.durationMs;
+    case "toolCalls":
+      return a.toolCalls;
+    case "toolFailures":
+      return a.toolFailures;
+    case "deniedCalls":
+      return a.deniedCalls;
+    case "verificationCalls":
+      return a.verificationCalls;
+    case "repeatRatio":
+      return a.repeatRatio;
+  }
+}
+
+/**
+ * Variance pooled **within** tasks, from every group that has at least two attempts.
+ *
+ * Degrees-of-freedom weighted (each task contributes its own `n - 1`), which is why it is computed
+ * from sums of squared deviations rather than by averaging the per-task standard deviations: the
+ * second weights a 2-repeat task the same as a 5-repeat one.
+ *
+ * `null` when no group has two attempts — the same refusal `stddev` makes, for the same reason.
+ */
+function withinTaskSpread(groups: readonly Map<string, number[]>[]): number | null {
+  let ss = 0;
+  let df = 0;
+  for (const groupsOfOneSide of groups) {
+    for (const vals of groupsOfOneSide.values()) {
+      if (vals.length < 2) continue;
+      const mu = mean(vals);
+      if (mu === null) continue;
+      for (const v of vals) ss += (v - mu) ** 2;
+      df += vals.length - 1;
     }
-  });
+  }
+  return df === 0 ? null : Math.sqrt(ss / df);
 }
 
 export function mean(xs: number[]): number | null {
@@ -137,12 +188,12 @@ export function compareMetric(baseline: SuiteResult, candidate: SuiteResult, m: 
   const cm = mean(c);
   if (bm === null || cm === null) return { delta: null, unavailable: `${m} has no attempts to compare.` };
   const delta = cm - bm;
-  const bs = stddev(b);
-  const cs = stddev(c);
-  // Pooled spread. With one sample per side there is no spread to pool, and the caller — not this
+  // The spread pooled within tasks, not across them — see `valuesByTask`. Across tasks it measures
+  // how heterogeneous the suite is, which is not noise and does not shrink with repeats.
+  const pooled = withinTaskSpread([valuesByTask(baseline, m), valuesByTask(candidate, m)]);
+  // With fewer than two attempts on any task there is no spread to pool, and the caller — not this
   // function — decides what that means; `beyondNoise` is false, so an unreplicated comparison can
   // never be the reason a change is promoted.
-  const pooled = bs !== null && cs !== null ? Math.sqrt((bs * bs + cs * cs) / 2) : null;
   const beyondNoise = pooled === null ? false : pooled === 0 ? delta !== 0 : Math.abs(delta) > pooled;
   return {
     delta: { metric: m, baseline: bm, candidate: cm, delta, beyondNoise },
@@ -166,6 +217,16 @@ export interface GuardianInput {
   proposal: Proposal;
   /** The findings the proposal targeted, so evidence can be resolved rather than assumed. */
   findings: Finding[];
+  /**
+   * The host's built-in system prompt, when the caller has one to hand.
+   *
+   * `buildCandidate` stores `applyPromptPatches(basePrompt, [patch]).prompt` as the override, so a
+   * real override carries the whole base — unmarked, and legitimately so. Supplying the base is what
+   * lets `prompt-budget` tell "the base it claims to amend" from "text appended that no marker can
+   * see". Omitted, the check bounds patch size only and says so by staying silent on the rest rather
+   * than inventing a base to compare against.
+   */
+  builtinPrompt?: string;
   options?: GuardianOptions;
 }
 
@@ -326,13 +387,27 @@ export function runGuardian(input: GuardianInput): GuardianReport {
   const chars = patchChars(prompt);
   const patches = countPatches(prompt);
   const capOk = chars <= PROMPT_CAP.maxPatchChars && patches <= PROMPT_CAP.maxPatches;
+  // A marker the cap cannot see is a character the cap does not count, so the cap alone cannot bound
+  // the prompt: `patchChars` skips everything outside a block. The base prompt is not the problem —
+  // a real override *is* the base plus patches, so it is legitimately unmarked — and the question
+  // worth asking is whether the candidate added unmarked text beyond the base it claims to amend.
+  // With no base to compare against (a caller that supplied none) this half stands down rather than
+  // inventing one; `pipeline` always supplies `builtinPrompt`, so production never takes that path.
+  const base = input.baselineVersion?.config.promptOverride ?? input.builtinPrompt ?? null;
+  const unmarked = unmarkedChars(prompt);
+  const baseUnmarked = base === null ? null : unmarkedChars(base);
+  const baseOk = baseUnmarked === null || unmarked === baseUnmarked;
+  const paidFor = `Every character is paid for on every subsequent turn, so a fix that bloats the prompt trades one waste for another.`;
   checks.push(
     check(
       "prompt-budget",
-      `AXIOM's additions stay within ${PROMPT_CAP.maxPatchChars} characters and ${PROMPT_CAP.maxPatches} patches`,
-      capOk,
-      `${patches} patch(es), ${chars} characters added to the system turn. Every character is paid for on every ` +
-        `subsequent turn, so a fix that bloats the prompt trades one waste for another.`,
+      `AXIOM's additions stay within ${PROMPT_CAP.maxPatchChars} characters and ${PROMPT_CAP.maxPatches} patches, and add no text the markers cannot see`,
+      capOk && baseOk,
+      baseOk
+        ? `${patches} patch(es), ${chars} characters added to the system turn. ${paidFor}`
+        : `The override carries ${unmarked.length} unmarked character(s) where the base it amends has ${baseUnmarked!.length}, ` +
+          `so it contains text outside any recognised patch block — invisible to the cap, and not re-applied at send time. ` +
+          `${patches} patch(es), ${chars} characters of counted patch text. ${paidFor}`,
     ),
   );
 

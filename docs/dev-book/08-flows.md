@@ -32,8 +32,8 @@ the plan — the next key, or the next provider — *is* the retry. There is no 
 - A `401` or `429` **cools the key** rather than deprioritising it, and the planner **drops** cooled keys. So
   the earliest a client can be served is when the *first* cooled key frees up — which is why the client-facing
   `Retry-After` is the **shortest** named wait, not the longest.
-- A whole plan is bounded at **6 attempts** (and a `PLAN_BUDGET` of 26 s bounds the whole chain below the
-  gateway's own 30 s first-message timeout).
+- A whole plan is bounded at **6 attempts** (and a `PLAN_BUDGET` of 44 s bounds the whole chain below the
+  gateway's own 48 s first-message timeout).
 - Drift is **not** a per-request signal: the Rust monitor (`core/drift.rs`) reads the ledger on the 30-minute
   retention pass and flags a provider whose **1-hour window** holds drift-class failures while the same
   requested model *succeeded elsewhere* — see [02](02-architecture.md).

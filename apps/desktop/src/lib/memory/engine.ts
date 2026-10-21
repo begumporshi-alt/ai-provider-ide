@@ -11,9 +11,12 @@
  * specifics. A flat store has to guess how much to hand back; this one does not.
  */
 import {
+  assignMemoryScope,
   captureMemories,
   captureMemory,
   listMemories,
+  listScopedMemories,
+  markMemoriesRetrieved,
   recallMemories,
   sessionMemories,
   updateMemory,
@@ -107,14 +110,31 @@ function emitLearned(stored: readonly Memory[]): void {
   }
 }
 
-/** The exchanges awaiting distillation, oldest first, capped at one batch. */
-const pending: Exchange[] = [];
-let sinceDistil = 0;
+/** One session's exchanges awaiting distillation, oldest first, capped at one batch.
+ *
+ *  **Per session, not module-global.** A shared queue let session A's exchange be distilled under
+ *  session B's id after a switch: the batch was global while the id came from the caller. The map
+ *  keeps each conversation's learning in its own conversation.
+ */
+interface DistilQueue {
+  pending: Exchange[];
+  sinceDistil: number;
+}
 
-/** Test seam: forget the accumulated window and the scenario-pass marker. */
+const queues = new Map<string, DistilQueue>();
+
+function queueFor(sessionId: string): DistilQueue {
+  let q = queues.get(sessionId);
+  if (!q) {
+    q = { pending: [], sinceDistil: 0 };
+    queues.set(sessionId, q);
+  }
+  return q;
+}
+
+/** Test seam: forget every session's accumulated window and the scenario-pass marker. */
 export function resetDistillation(): void {
-  pending.length = 0;
-  sinceDistil = 0;
+  queues.clear();
   lastScenarioAt.clear();
 }
 
@@ -137,11 +157,12 @@ export async function rememberTurn(
   userText: string,
   assistantText: string,
 ): Promise<void> {
-  pending.push({ user: userText, assistant: assistantText });
-  if (pending.length > DISTIL_EVERY) pending.splice(0, pending.length - DISTIL_EVERY);
+  const q = queueFor(sessionId);
+  q.pending.push({ user: userText, assistant: assistantText });
+  if (q.pending.length > DISTIL_EVERY) q.pending.splice(0, q.pending.length - DISTIL_EVERY);
   // A turn is the batching unit, so the counter advances here rather than in distilTurn — which
   // is called once per turn in practice but should not have to be for batching to be correct.
-  sinceDistil += 1;
+  q.sinceDistil += 1;
   try {
     await captureMemories([
       { layer: "L0", text: userText, session_id: sessionId, subject: "user" },
@@ -196,16 +217,18 @@ export async function distilTurn(
 ): Promise<Memory[]> {
   // No model means distillation can never run; returning without touching the counter keeps a
   // later turn — once a model is configured — from having to wait another full batch.
-  if (!model || pending.length === 0) return [];
-  if (sinceDistil < DISTIL_EVERY) return [];
+  const q = queues.get(sessionId);
+  if (!model || !q || q.pending.length === 0) return [];
+  if (q.sinceDistil < DISTIL_EVERY) return [];
 
-  const batch = pending.slice(-DISTIL_EVERY);
+  const batch = q.pending.slice(-DISTIL_EVERY);
   try {
     const atoms = await distillAndStore(sessionId, model, batch, generate);
     // An empty result is a successful look that found nothing durable, so the window is dropped
     // either way — otherwise a model that never returns JSON would be re-asked forever.
-    pending.length = 0;
-    sinceDistil = 0;
+    q.pending.length = 0;
+    q.sinceDistil = 0;
+    queues.delete(sessionId);
     return atoms;
   } catch (err) {
     // Counter and window both survive: a transient failure retries on the next turn instead of
@@ -379,27 +402,60 @@ export function parseScenarios(
     .slice(0, MAX_SCENARIOS_PER_PASS);
 }
 
+/** Options for {@link recallContext}. */
+export interface RecallOptions {
+  limit?: number;
+  layers?: MemoryLayer[];
+  /** Workspace root. When set, every read is scoped to that workspace. */
+  root?: string;
+  /**
+   * Ids the manifest actually put in its block, plus contradicted capabilities. Filtered from the
+   * merged result before it is returned, so a row cannot be injected twice in the same request.
+   * Contradicted capabilities are in this set even though the block omits them: without that, a
+   * claim the composer just refused would re-enter through relevance recall and defeat
+   * verification. Project facts are deliberately absent — the manifest keeps them out of the
+   * block so recall remains their path.
+   */
+  excludeIds?: ReadonlySet<string>;
+}
+
 /**
  * Layered recall: abstract layers first, then specifics, pinned always.
  *
  * Pinned memories are prepended because pinning is the operator saying "this must never be
  * dropped", and BM25 has no notion of importance — only of relevance to this query.
+ *
+ * `root` is the workspace the caller is reading for. When it is set, **every** read is scoped:
+ * the pinned prefetch goes through the scoped list endpoint and each recall forwards the root.
+ * This is the difference between "the assistant knows its workspace" and "the assistant knows
+ * every workspace the operator has ever opened" — the latter is contamination, not context.
  */
 export async function recallContext(
   query: string,
-  opts: { limit?: number; layers?: MemoryLayer[] } = {},
+  opts: RecallOptions = {},
 ): Promise<Memory[]> {
   const limit = Math.max(1, opts.limit ?? 8);
   try {
-    const pinned = (await listMemories(null, 50)).filter((m) => m.pinned).slice(0, 4);
+    // A root *option* present but blank is a caller that has no workspace — the Assistant on a
+    // host with no default root. That must fail closed: no project facts, never the whole corpus.
+    // Absence of the option is the legacy/Memory-screen path, which keeps the unscoped read.
+    const scoped = typeof opts.root === "string";
+    const root = opts.root?.trim() || undefined;
+    if (scoped && !root) return [];
+    // Scoped: ask for the pinned, in-scope rows directly. The old `listMemories` scan saw
+    // every workspace's pinned rows, which is the contamination this path exists to stop.
+    const pinned = root
+      ? (await listScopedMemories({ projectRoot: root, pinnedOnly: true, limit: 50 })).slice(0, 4)
+      : (await listMemories(null, 50)).filter((m) => m.pinned).slice(0, 4);
 
     let hits: Memory[];
     if (opts.layers && opts.layers.length > 0) {
-      hits = await recallMemories(query, limit, opts.layers);
+      hits = await recallMemories(query, limit, opts.layers, root ? { projectRoot: root } : undefined);
     } else {
       // Half the budget is reserved for the distilled layers; whatever they do not use is
       // given to the specific ones, so neither tier can starve the other.
-      const abstract = await recallMemories(query, Math.ceil(limit / 2), ["L3", "L2"]);
+      const scope = root ? { projectRoot: root } : undefined;
+      const abstract = await recallMemories(query, Math.ceil(limit / 2), ["L3", "L2"], scope);
       const remaining = limit - abstract.length;
       // L0 is deliberately NOT recalled here. It is verbatim conversation and this path applies no
       // session filter, so an L0 hit can be another session's turns — the privacy inversion the
@@ -407,7 +463,7 @@ export async function recallContext(
       // dropping it: `replayHistory` already puts this session's turns in the request verbatim, so
       // an L0 recall of the current session only duplicates them.
       const specific =
-        remaining > 0 ? await recallMemories(query, remaining, ["L1"]) : [];
+        remaining > 0 ? await recallMemories(query, remaining, ["L1"], scope) : [];
       hits = [...abstract, ...specific];
     }
 
@@ -418,7 +474,17 @@ export async function recallContext(
       seen.add(m.id);
       merged.push(m);
     }
-    return merged;
+    // The manifest is additive to recall, so the same row must not land in both blocks. Filtering
+    // here — after the merge, before accounting — keeps the returned rows and the retrieval
+    // counters describing the same list.
+    const exclude = opts.excludeIds;
+    const kept = exclude && exclude.size > 0 ? merged.filter((m) => !exclude.has(m.id)) : merged;
+    if (kept.length > 0) {
+      // Fire-and-forget: a usage counter must never delay or fail a turn. This is also why the
+      // blank-root early return above runs before any read — there is nothing to account for.
+      void markMemoriesRetrieved(kept.map((m) => m.id)).catch(() => 0);
+    }
+    return kept;
   } catch {
     return [];
   }
@@ -510,7 +576,16 @@ export async function captureAndRecord(
  * rides along in recall. Session-null so the fact outlives the conversation.
  */
 export async function captureCore(text: string): Promise<Memory | null> {
-  return captureAndRecord("L3", text, null, { pinned: true });
+  const m = await captureAndRecord("L3", text, null, { pinned: true });
+  if (!m) return null;
+  // L3 is identity. Without this it is born capture-only like every other row and never
+  // reaches a prompt — the exact failure the scoped read path cannot fix on its own.
+  try {
+    await assignMemoryScope(m.id, { kind: "global" });
+  } catch {
+    // The row is still pinned and visible in the Memory screen; a later save can re-scope it.
+  }
+  return m;
 }
 
 /** Edit the text of an existing core fact. Returns false when the id was not found. */

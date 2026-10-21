@@ -919,11 +919,18 @@ mod tests {
             "one millisecond later it no longer fits, and admitting it would overrun the plan"
         );
 
-        // The production timeline, stated as the case rather than as arithmetic: entry 1 spent a
-        // full header budget timing out, so entry 2 must be refused rather than cut off.
+        // **Inverted 2026-10-19.** This used to assert the opposite — "entry 1 burned a whole
+        // attempt, so entry 2 must be refused rather than cut off" — and that reading is what made
+        // the egress's recovery unreachable. A pre-headers timeout is exactly when the next
+        // candidate is worth dialling: `egress::stream` says the engine advances to it, and ledger
+        // rows 7092/7099 (2026-10-19) show a request failing with a one-entry chain while the
+        // provider's other key was serving the same model seconds earlier. A candidate that cannot
+        // be funded in full is still refused; the budget is now large enough that one which spent
+        // a whole header budget leaves room for one more.
         assert!(
-            !candidate_is_affordable(ATTEMPT, false),
-            "entry 2 after entry 1 burned a whole attempt is exactly requests 22/25/26/27"
+            candidate_is_affordable(ATTEMPT, false),
+            "entry 2 after entry 1 burned a whole attempt must still be fundable — otherwise a \
+             header timeout has no failover and `all attempts failed` names one attempt"
         );
 
         // A *fast* failure leaves room, so a genuinely different provider still gets its chance —
@@ -1992,6 +1999,7 @@ mod tests {
             on_usage: None,
             on_finish: None,
             on_reasoning: None,
+            on_retry: None,
             max_attempts: None,
             prompt_cache_enabled: false,
         }
@@ -2522,6 +2530,46 @@ mod tests {
         assert_eq!(adapter.calls().len(), 4, "first dial + three re-probes, never a fifth");
     }
 
+    /// PROBE (temporary): does a caller's `max_attempts` bound the re-dials, or only the plan?
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn probe_max_attempts_one_still_dials_four_times() {
+        let adapter = TextScripted::new(vec![
+            refused(503),
+            refused(503),
+            refused(503),
+            refused(503),
+            refused(503),
+        ])
+        .shared();
+        let health = HealthTracker::new();
+        let (_seen, mut on_chunk) = sink();
+        let mut args = text_args(vec![candidate("p1", "k1", "m1")]);
+        args.max_attempts = Some(1);
+
+        let failure = execute_text(
+            &Always(adapter.clone()),
+            &health,
+            None,
+            args,
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect_err("every round 500'd");
+
+        match failure {
+            TextFailure::AllAttemptsFailed { error, .. } => {
+                assert_eq!(error.chain.len(), adapter.calls().len(), "chain shows every dial");
+            }
+            other => panic!("expected AllAttemptsFailed, got {other:?}"),
+        }
+        assert_eq!(
+            adapter.calls().len(),
+            4,
+            "PROBE RESULT: max_attempts=1 still dials the single candidate four times"
+        );
+    }
+
     /// The count above is only meaningful if the *budget* can fund it — and for a day it could not.
     ///
     /// `the_reprobe_budget_is_three_rounds_and_no_fourth_redial` runs on a paused clock, so its
@@ -2564,11 +2612,19 @@ mod tests {
             );
         }
 
-        // The budget is still a bound, not a formality — at this cadence the would-be fourth
-        // round is past it, so the *count* is what stops the loop rather than an accident.
+        // The budget still has to be a bound, but at this cadence it is no longer the limit that
+        // stops the re-probe loop: the configured three rounds fit with room to spare, so the
+        // *count* is what stops it. That is the reachability claim D104 was about — the budget
+        // must not silently deliver fewer rounds than the constant advertises. A hypothetical
+        // sixth round would not fit, which is all this needs to prove: the budget is finite.
         assert!(
-            !candidate_is_affordable(decide(rounds + 1) + wait, false),
-            "a fourth round must not be affordable at the measured cadence"
+            candidate_is_affordable(decide(rounds + 1) + wait, false),
+            "the budget now funds more rounds than the configured count; if this fails the \
+             budget has become the binding limit again"
+        );
+        assert!(
+            !candidate_is_affordable(decide(rounds + 3) + wait, false),
+            "the budget is still a real bound — six rounds at the measured cadence cannot fit"
         );
 
         // And the regression, stated as the numbers: the window is what `PLAN_BUDGET` leaves after
@@ -2576,7 +2632,7 @@ mod tests {
         // a 4 s window, so round two (decided at 7.49 s) could never fit — which is why raising the
         // count alone changed nothing.
         let window = PLAN_BUDGET - (wait + ATTEMPT);
-        assert_eq!(window, Duration::from_secs(14), "the window the current budget leaves");
+        assert_eq!(window, Duration::from_secs(22), "the window the current budget leaves");
         assert!(
             decide(1) < Duration::from_secs(4) && decide(2) > Duration::from_secs(4),
             "round one fits the old 4 s window and round two does not; if this stops holding the \
@@ -2587,6 +2643,230 @@ mod tests {
     /// An adapter whose text stream never yields and never ends — the keep-alive-only stall of
     /// ledger rows 3949/3968, with the selector-unmatched delta folded into the silence (the
     /// interpreter sees nothing either way).
+    /// A first dial that burns the whole pre-headers budget and fails, then a second dial that
+    /// serves.
+    ///
+    /// **The clock movement is the instrument.** A header timeout is *time spent*, and the plan
+    /// budget reads elapsed time; a double that fails instantly cannot reproduce ledger 7092/7099,
+    /// where the first candidate consumed 20s and the second was refused for it. `start_paused`
+    /// makes advancing 20s free.
+    struct HeaderTimeoutThenServe {
+        calls: std::sync::atomic::AtomicUsize,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl HeaderTimeoutThenServe {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// `"<secret_ref>|<model>"` per dial — which key the engine actually reached for.
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl AdapterInstance for HeaderTimeoutThenServe {
+        fn generate_image<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _args: ImageArgs,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, Result<ImageReply, AttemptError>> {
+            Box::pin(async { Err(AttemptError::Transport { message: None }) })
+        }
+
+        fn generate_text<'a>(
+            &'a self,
+            secret_ref: &'a str,
+            args: TextArgs<'a>,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, Result<BoxStream<'a, Result<String, AttemptError>>, AttemptError>>
+        {
+            Box::pin(async move {
+                self.seen.lock().unwrap().push(format!("{secret_ref}|{}", args.model));
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    tokio::time::advance(crate::core::egress::UPSTREAM_HEADER_TIMEOUT).await;
+                    return Err(AttemptError::Transport {
+                        message: Some(
+                            "upstream sent no response headers for 20s — abandoning the request"
+                                .to_string(),
+                        ),
+                    });
+                }
+                Ok(Box::pin(futures_util::stream::iter(vec![Ok("recovered".to_string())]))
+                    as BoxStream<'a, Result<String, AttemptError>>)
+            })
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities { text: true, image: false }
+        }
+
+        fn tag_modality(&self, _entry: &ModelEntry) -> &'static str {
+            "text"
+        }
+
+        fn list_models<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, Result<Vec<ModelEntry>, AttemptError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn ping_key<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, PingResult> {
+            Box::pin(async {
+                PingResult { ok: false, status: 0, rate_limited: false, message: None }
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_header_timeout_still_dials_the_next_candidate() {
+        // Ledger 7092/7099, 2026-10-19: `key-03` spent the whole 20s header budget and the next
+        // candidate was never dialled. The engine advanced to it and the plan budget refused it.
+        // This is the whole path in one test: the first dial moves the paused clock exactly as the
+        // egress would, and the next candidate — a *different provider*, the path the same-host
+        // retry must not shadow — is reached, recorded, and serves. The no-other-provider case is
+        // pinned separately by `a_network_timeout_reprobes_the_same_candidate_...`.
+        let adapter = HeaderTimeoutThenServe::new();
+        let health = HealthTracker::new();
+        let (seen, mut on_chunk) = sink();
+
+        let served = execute_text(
+            &Always(adapter.clone()),
+            &health,
+            None,
+            text_args(vec![candidate("p1", "k1", "m1"), candidate("p2", "k2", "m1")]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect("the other provider serves after the first times out on headers");
+
+        assert_eq!(adapter.calls(), 2, "both candidates were dialled");
+        assert_eq!(served.candidate.provider.id, "p2", "the different provider served");
+        assert_eq!(served.candidate.key.label, "k2", "the other provider's key served");
+        assert!(adapter.seen()[1].contains(":k2|"), "the next dial was the other provider");
+        assert_eq!(served.attempts.len(), 1, "the timeout stays in the chain");
+        assert_eq!(served.attempts[0].cls, ErrorClass::Network);
+        assert_eq!(*seen.lock().unwrap(), vec!["recovered".to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pre_output_timeout_prefers_a_different_provider() {
+        // The measured case (2026-10-19, ledger 7160): two keys of agent-router stalled for 20s
+        // each while `vice` carried the same model. The plan is provider-by-provider, so the
+        // second key on the failed host was dialled next. A timeout is evidence about the host;
+        // the remaining candidates from another carrier go first.
+        let adapter = TextScripted::new(vec![
+            Err(AttemptError::Transport {
+                message: Some(
+                    "upstream sent no response headers for 20s — abandoning the request"
+                        .to_string(),
+                ),
+            }),
+            chunks_of(&["recovered"]),
+        ])
+        .shared();
+        let health = HealthTracker::new();
+        let (seen, mut on_chunk) = sink();
+
+        let served = execute_text(
+            &Always(adapter.clone()),
+            &health,
+            None,
+            text_args(vec![
+                candidate("p1", "k1", "m1"),
+                candidate("p1", "k2", "m1"),
+                candidate("p2", "k3", "m1"),
+            ]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect("the different provider serves");
+
+        assert_eq!(adapter.calls().len(), 2, "the second key on the failed host was never dialled");
+        assert!(
+            adapter.calls()[1].contains(":k3|"),
+            "the next dial must be the other provider's key: {:?}",
+            adapter.calls()
+        );
+        assert_eq!(served.candidate.provider.id, "p2", "the other carrier served");
+        assert_eq!(served.candidate.key.label, "k3");
+        assert_eq!(served.attempts.len(), 1);
+        assert_eq!(served.attempts[0].cls, ErrorClass::Network);
+        assert_eq!(*seen.lock().unwrap(), vec!["recovered".to_string()]);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_network_timeout_reprobes_the_same_candidate_when_no_other_provider_exists() {
+        // Borrowed from ZCode: when the plan has no different provider, a pre-output timeout gets
+        // one bounded roll of the *same* request after a pause instead of moving to another key on
+        // the same host. The paused clock advances exactly 20s on the first dial, and the retry
+        // must still fit the 44s plan: 20s + 2s + 20s = 42s.
+        let adapter = HeaderTimeoutThenServe::new();
+        let health = HealthTracker::new();
+        let (seen, mut on_chunk) = sink();
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let notice_sink = Arc::clone(&notices);
+        let mut on_retry = move |n: RetryNotice| notice_sink.lock().unwrap().push(n);
+        let mut args = text_args(vec![candidate("p1", "k1", "m1"), candidate("p1", "k2", "m1")]);
+        args.on_retry = Some(&mut on_retry);
+
+        let served = execute_text(
+            &Always(adapter.clone()),
+            &health,
+            None,
+            args,
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect("the same candidate serves on the retry");
+
+        assert_eq!(
+            adapter.seen(),
+            vec!["key:p1:k1|m1".to_string(), "key:p1:k1|m1".to_string()],
+            "the same key was retried; the provider's second key was never dialled"
+        );
+        assert_eq!(served.candidate.key.label, "k1");
+        assert_eq!(served.attempts.len(), 1);
+        assert_eq!(served.attempts[0].cls, ErrorClass::Network);
+        let notices = notices.lock().unwrap();
+        assert_eq!(notices.len(), 1, "one retry notice reached the progress channel");
+        assert_eq!(notices[0].provider, "p1");
+        assert_eq!(notices[0].key, "k1");
+        assert_eq!(notices[0].attempt, 2);
+        assert_eq!(notices[0].max, NETWORK_REPROBES_MAX + 1);
+        assert_eq!(notices[0].delay_ms, NETWORK_RETRY_BACKOFF.as_millis() as u64);
+        assert_eq!(*seen.lock().unwrap(), vec!["recovered".to_string()]);
+    }
+
+    #[test]
+    fn a_network_reprobe_fits_inside_the_plan_budget_after_a_full_timeout() {
+        use crate::core::egress::UPSTREAM_HEADER_TIMEOUT as ATTEMPT;
+
+        // The first attempt spent its whole header budget; the 2s wait plus a full second attempt
+        // still fits 44s. A *third* attempt does not, which is what keeps this bounded.
+        assert!(candidate_is_affordable(ATTEMPT + NETWORK_RETRY_BACKOFF, false));
+        assert!(!candidate_is_affordable(ATTEMPT + NETWORK_RETRY_BACKOFF + ATTEMPT, false));
+    }
+
     struct Silent;
 
     impl AdapterInstance for Silent {
@@ -2797,6 +3077,63 @@ mod tests {
             // candidate's ref spells p1 even though its provider id is p2.
             vec!["key:p1:k1|m1".to_string(), "key:p1:k2|m2".to_string()],
             "one dial per candidate — p1 was not re-dialled",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_plan_that_runs_out_on_its_last_key_reprobes_only_that_key() {
+        // The production shape of 2026-10-19 (`agent-router` / `deepseek-v4-flash`): two keys, both
+        // 500ing. The chain read `key-03` once and `key-04` four times, which reads like a retry
+        // storm and is not one — it is the failover of the test above composed with the re-probe of
+        // `the_reprobe_budget_is_three_rounds_and_no_fourth_redial`. The first key is never
+        // re-dialled, because a next candidate existed behind it; the last key gets its first dial
+        // plus `SERVER_ERROR_REPROBES_MAX` rounds, because by then failover had nothing left to do.
+        //
+        // Pinned here because the rule lives in `plan.is_empty()` and the shape only shows up in a
+        // *failed* request's chain: without this, the five-dial chain has to be re-derived from
+        // `text.rs` every time somebody reads one and suspects the engine is stuck on a dead key.
+        let adapter = TextScripted::new(vec![
+            refused(500),
+            refused(500),
+            refused(500),
+            refused(500),
+            refused(500),
+        ])
+        .shared();
+        let health = HealthTracker::new();
+        let (_seen, mut on_chunk) = sink();
+
+        let failure = execute_text(
+            &Always(adapter.clone()),
+            &health,
+            None,
+            text_args(vec![candidate("p1", "k1", "m1"), candidate("p2", "k2", "m2")]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect_err("every key 500'd");
+
+        match failure {
+            TextFailure::AllAttemptsFailed { error, .. } => {
+                // All five dials are in the chain, in order — the re-probes are not hidden.
+                let classes: Vec<ErrorClass> = error.chain.iter().map(|a| a.cls).collect();
+                assert_eq!(classes, vec![ErrorClass::ServerError; 5]);
+            }
+            other => panic!("expected AllAttemptsFailed, got {other:?}"),
+        }
+        assert_eq!(
+            adapter.calls(),
+            vec![
+                // The first key: one dial, then failover — never a re-probe.
+                "key:p1:k1|m1".to_string(),
+                // The last key: its first dial, then three re-probes. Never a fifth.
+                "key:p1:k2|m2".to_string(),
+                "key:p1:k2|m2".to_string(),
+                "key:p1:k2|m2".to_string(),
+                "key:p1:k2|m2".to_string(),
+            ],
+            "one dial of the first key and four of the last — failover, then re-probe",
         );
     }
 

@@ -8,17 +8,18 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import type { ProviderRecord } from "@aiprovider/router-core";
 import {
   catalog, clearAllCrashes, clearCrash, exportConfig, getCrashCount,
-  getDiagnosticsBundle, importConfig, listCrashes, readCrash,
+  getDiagnosticsBundle, historyRetentionPreview, historyRetentionPrune, importConfig, listCrashes, readCrash,
   persistRouterSettings, registry, router, setProviderRotation,
 } from "../store";
-import type { CrashReport } from "../store";
+import type { CrashReport, HistoryRetentionCounts } from "../store";
 import { selectableModels } from "../lib/models/selectable";
 import { fetchMcpServers, refreshMcp, saveMcpServers } from "../lib/tools/mcp-client";
 import type { McpServerConfig } from "../lib/tools/mcp";
 import { fetchToolsPolicy, setToolsExtraPrograms } from "../lib/tools";
 import type { ToolsPolicy } from "../lib/tools";
 import { useUi } from "../ui-state";
-import { StatusDot } from "../components/atoms";
+import { Button, StatusDot } from "../components/atoms";
+import { invoke } from "@tauri-apps/api/core";
 
 async function copyText(text: string): Promise<boolean> {
   try {
@@ -269,6 +270,8 @@ export function SettingsScreen() {
       <ToolSandboxSection />
 
       <McpSection />
+
+      <HistoryRetentionSection />
 
       <ConfigDiagnosticsSection />
     </div>
@@ -803,6 +806,153 @@ function DefaultModelPicker({ modality }: { modality: "text" | "image" }) {
       {value && !options.some((o) => o.id === value) && <option value={value}>{value}</option>}
       {options.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}
     </select>
+  );
+}
+
+/**
+ * History retention — **manual and opt-in**, by design.
+ *
+ * The store had no retention for `session_messages` or the context graph, so both grew with every
+ * conversation. Deleting a user's history on a timer is a policy the user has to see and choose,
+ * not a background surprise: this section previews exactly what a prune would remove, requires a
+ * second click to confirm, and defaults to "forever". Memories and the run ledger are not touched;
+ * they have their own retention.
+ */
+function HistoryRetentionSection() {
+  const [days, setDays] = useState(0);
+  const [counts, setCounts] = useState<HistoryRetentionCounts | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [pruned, setPruned] = useState<HistoryRetentionCounts | null>(null);
+
+  useEffect(() => {
+    void invoke<string | null>("settings_get", { key: "historyRetentionDays" })
+      .then((raw) => {
+        if (!raw) return;
+        try {
+          const n = Number(JSON.parse(raw));
+          if (n === 90 || n === 180 || n === 365) setDays(n);
+        } catch {
+          // A malformed stored value reads as the safe default: forever.
+        }
+      })
+      .catch(() => undefined);
+  }, []);
+
+  const choose = (n: number) => {
+    setDays(n);
+    setCounts(null);
+    setConfirming(false);
+    setPruned(null);
+    setError(null);
+    // Persisted on choice, so the next visit remembers the policy even before a prune.
+    void invoke("settings_set", {
+      key: "historyRetentionDays",
+      valueJson: JSON.stringify(n),
+    }).catch(() => undefined);
+  };
+
+  const preview = async () => {
+    setBusy(true);
+    setError(null);
+    setConfirming(false);
+    setPruned(null);
+    try {
+      setCounts(await historyRetentionPreview(days));
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const prune = async () => {
+    if (!confirming) {
+      setConfirming(true);
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const removed = await historyRetentionPrune(days);
+      setPruned(removed);
+      setCounts({ sessions: 0, messages: 0, nodes: 0, edges: 0 });
+      setConfirming(false);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Section
+      title="History retention"
+      hint="Manual and opt-in. Pruning deletes sessions whose last activity is older than the chosen age — their transcript and context graph, not your memories or the run ledger. Nothing is deleted until you preview and confirm."
+    >
+      <div className="flex flex-col gap-3">
+        <label
+          className="flex flex-wrap items-center gap-2 text-[12px]"
+          style={{ color: "var(--text-dim)" }}
+        >
+          Keep history for
+          <select
+            className="rounded border px-2 py-1 text-[12px]"
+            style={{ background: "var(--bg)", borderColor: "var(--border)", color: "var(--text)" }}
+            value={days}
+            disabled={busy}
+            onChange={(e) => choose(Number(e.target.value))}
+          >
+            <option value={0}>forever (default)</option>
+            <option value={90}>90 days</option>
+            <option value={180}>180 days</option>
+            <option value={365}>365 days</option>
+          </select>
+        </label>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Button onClick={() => void preview()} disabled={busy || days === 0}>
+            Preview what would go
+          </Button>
+          <Button
+            variant="danger"
+            onClick={() => void prune()}
+            disabled={busy || days === 0 || !counts || counts.sessions === 0}
+          >
+            {confirming ? "Confirm prune" : "Prune now"}
+          </Button>
+        </div>
+
+        {counts && (
+          <p className="text-[12px]" style={{ color: "var(--text-dim)" }}>
+            {counts.sessions} session{counts.sessions === 1 ? "" : "s"} ·{" "}
+            {counts.messages} message{counts.messages === 1 ? "" : "s"} ·{" "}
+            {counts.nodes} graph node{counts.nodes === 1 ? "" : "s"} ·{" "}
+            {counts.edges} edge{counts.edges === 1 ? "" : "s"}
+          </p>
+        )}
+        {confirming && (
+          <p className="text-[12px]" style={{ color: "var(--warn)" }}>
+            Click “Confirm prune” to delete these rows. This cannot be undone.
+          </p>
+        )}
+        {pruned && (
+          <p className="text-[12px]" style={{ color: "var(--success)" }}>
+            Removed {pruned.sessions} session{pruned.sessions === 1 ? "" : "s"}, {pruned.messages}{" "}
+            message{pruned.messages === 1 ? "" : "s"}, {pruned.nodes} graph node
+            {pruned.nodes === 1 ? "" : "s"} and {pruned.edges} edge
+            {pruned.edges === 1 ? "" : "s"}.
+          </p>
+        )}
+        {error && <p className="text-[12px]" style={{ color: "var(--danger)" }}>{error}</p>}
+        {days === 0 && (
+          <p className="text-[12px]" style={{ color: "var(--text-faint)" }}>
+            Nothing is deleted while retention is set to forever.
+          </p>
+        )}
+      </div>
+    </Section>
   );
 }
 

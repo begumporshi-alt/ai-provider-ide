@@ -670,7 +670,13 @@ pub fn put_audit(store: &Store, a: &AuditPass) -> Result<(), String> {
     }
     let report = serde_json::to_string(&a.report).map_err(|e| e.to_string())?;
     let c = conn(store)?;
-    refuse_taken_id(&c, "axiom_audits", &a.id, "audit pass", "a re-run is a new record, not an edit")?;
+    refuse_taken_id(
+        &c,
+        "axiom_audits",
+        &a.id,
+        "audit pass",
+        "a re-run is a new record, not an edit",
+    )?;
     c.execute(
         "INSERT INTO axiom_audits
            (id, started_at, ended_at, status, suite_id, model, repeats, decision,
@@ -694,12 +700,21 @@ pub fn put_audit(store: &Store, a: &AuditPass) -> Result<(), String> {
     Ok(())
 }
 
+/// The audit ledger, **without the report bodies**.
+///
+/// A report is a full `ImproveReport` and can be megabytes; ten of them made a hidden screen's
+/// list read tens of megabytes on every refresh, parsed and re-serialized on the Tauri main
+/// thread. The list only needs metadata and a size, so the body stays in SQLite until a reader
+/// asks for that one pass with [`audit`].
 pub fn list_audits(store: &Store, limit: usize) -> Result<Vec<serde_json::Value>, String> {
     let c = conn(store)?;
     let mut stmt = c
         .prepare(
             "SELECT id, started_at, ended_at, status, suite_id, model, repeats, decision,
-                    candidate_id, baseline_id, report
+                    candidate_id, baseline_id,
+                    json_extract(report, '$.error'),
+                    json_extract(report, '$.decision.deltas'),
+                    LENGTH(CAST(report AS BLOB))
              FROM axiom_audits ORDER BY started_at DESC, id DESC LIMIT ?1",
         )
         .map_err(|e| e.to_string())?;
@@ -716,20 +731,55 @@ pub fn list_audits(store: &Store, limit: usize) -> Result<Vec<serde_json::Value>
                 "decision": r.get::<_, Option<String>>(7)?,
                 "candidateId": r.get::<_, Option<String>>(8)?,
                 "baselineId": r.get::<_, Option<String>>(9)?,
+                // The two small fields the timeline renders without the body: a refusal's reason
+                // and a decision's delta chips. `json_extract` keeps them out of the Rust value
+                // tree, so the list never parses an 8 MB report just to show one sentence.
+                "reportError": r.get::<_, Option<String>>(10)?,
+                "reportDeltas": r.get::<_, Option<String>>(11)?,
+                "reportBytes": r.get::<_, i64>(12)?,
+            }))
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+/// One audit pass, with its report parsed into the engine's document shape. The read is a single
+/// row by primary key, so opening a report costs its own size and nothing else.
+pub fn audit(store: &Store, id: &str) -> Result<Option<serde_json::Value>, String> {
+    let c = conn(store)?;
+    let mut stmt = c
+        .prepare(
+            "SELECT id, started_at, ended_at, status, suite_id, model, repeats, decision,
+                    candidate_id, baseline_id, report
+             FROM axiom_audits WHERE id = ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query_map([id], |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, String>(0)?,
+                "startedAt": r.get::<_, i64>(1)?,
+                "endedAt": r.get::<_, i64>(2)?,
+                "status": r.get::<_, String>(3)?,
+                "suiteId": r.get::<_, Option<String>>(4)?,
+                "model": r.get::<_, Option<String>>(5)?,
+                "repeats": r.get::<_, Option<i64>>(6)?,
+                "decision": r.get::<_, Option<String>>(7)?,
+                "candidateId": r.get::<_, Option<String>>(8)?,
+                "baselineId": r.get::<_, Option<String>>(9)?,
                 "report": r.get::<_, String>(10)?,
             }))
         })
         .map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    for row in rows {
-        let mut v = row.map_err(|e| e.to_string())?;
-        let obj = v.as_object_mut().ok_or("an audit row is not an object")?;
-        let raw = obj.remove("report").and_then(|x| x.as_str().map(String::from)).unwrap_or_default();
-        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::json!({}));
-        obj.insert("report".to_string(), doc);
-        out.push(v);
-    }
-    Ok(out)
+    let Some(row) = rows.next() else { return Ok(None) };
+    let mut v = row.map_err(|e| e.to_string())?;
+    let obj = v.as_object_mut().ok_or("an audit row is not an object")?;
+    let raw = obj.remove("report").and_then(|x| x.as_str().map(String::from)).unwrap_or_default();
+    let report_bytes = raw.len() as i64;
+    let doc: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::json!({}));
+    obj.insert("report".to_string(), doc);
+    obj.insert("reportBytes".to_string(), serde_json::json!(report_bytes));
+    Ok(Some(v))
 }
 
 // ---------------------------------------------------------------------------
@@ -1130,11 +1180,18 @@ mod axiom_tests {
         // Newest first — the ledger is read top-down.
         assert_eq!(all[0]["id"], "a2");
         assert!(all[0]["decision"].is_null());
-        assert_eq!(all[0]["report"], serde_json::json!({ "runsExamined": 3, "runsClean": 2 }));
+        assert!(all[0].get("report").is_none(), "the list must not ship report bodies");
+        assert!(all[0]["reportBytes"].as_i64().unwrap() > 0);
         assert_eq!(all[1]["id"], "a1");
         assert_eq!(all[1]["decision"], "promote");
         assert_eq!(all[1]["candidateId"], "v2");
-        assert_eq!(all[1]["report"]["totalHits"], 2, "the report is parsed, not a JSON string");
+        assert!(all[1].get("report").is_none(), "the list must not ship report bodies");
+
+        // The single-row read is where the body comes back, parsed.
+        let one = super::audit(&s, "a1").unwrap().expect("a1 exists");
+        assert_eq!(one["report"]["totalHits"], 2, "the report is parsed, not a JSON string");
+        let refused_one = super::audit(&s, "a2").unwrap().expect("a2 exists");
+        assert_eq!(refused_one["report"], serde_json::json!({ "runsExamined": 3, "runsClean": 2 }));
         let _ = std::fs::remove_dir_all(&d);
     }
 

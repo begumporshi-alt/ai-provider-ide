@@ -7,16 +7,31 @@
  * and a tool the host does not implement is a call that can only ever return an error. Neither
  * surfaces until a model tries to use it — so the checks live here instead.
  *
- * The mutating set is asserted against the Rust list in `gateway.rs` (`MUTATING_TOOLS`) plus the
- * frontend composites the gateway never sees. That constant is what keeps gateway mutation
- * opt-in; a rename here without a rename there would silently un-gate a writing tool, so the
- * names are pinned in both places.
+ * The write-effect set is asserted against the Rust list in `gateway.rs` (`MUTATING_TOOLS`) plus
+ * the frontend composites the gateway never sees. The Rust constant also gates `web_fetch` and
+ * `web_search` as egress; the TypeScript `effect` models those separately as `network`, so they
+ * are intentionally absent from the write list below. A rename here without a rename there would
+ * silently un-gate a writing tool, so the names are pinned in both places.
  */
 import { describe, expect, it } from "vitest";
-import { AGENT_TOOLS, SUBAGENT_TOOLS, registryToOpenAI, toolEffect } from "./registry";
+import {
+  AGENT_TOOLS,
+  SUBAGENT_TOOLS,
+  registryToOpenAI,
+  subagentTools,
+  toolEffect,
+} from "./registry";
 
-/** Mirrors `MUTATING_TOOLS` in src-tauri/src/gateway.rs. Keep the two in step. */
-const GATEWAY_MUTATING = ["write_file", "edit_file", "mkdir", "run_command", "http_request", "apply_patch"];
+/** The write-effect tools. The Rust `MUTATING_TOOLS` additionally gates the web tools as egress;
+ *  those carry the `network` effect here, not `mutate`. */
+const GATEWAY_MUTATING = [
+  "write_file",
+  "edit_file",
+  "mkdir",
+  "run_command",
+  "http_request",
+  "apply_patch",
+];
 /** Assistant-only composites the gateway never sees: `edit_notebook` is read_file + write_file
  *  assembled in the agent loop, `generate_image` writes through the base64 encoding the loop
  *  adds to write_file, `process_kill` stops a job only this sandbox's background table knows
@@ -26,12 +41,18 @@ const ASSISTANT_MUTATING = [
   "browser_click",
   "browser_fill",
   "browser_navigate",
+  "browser_print",
   "browser_screenshot",
   // Launches a browser process with the debugger port — an action on the machine, not the
   // workspace, but the approval gate is where "the app started something" belongs.
   "browser_start",
+  "device_open_url",
+  "device_screenshot",
   "edit_notebook",
   "generate_image",
+  // Deletes one durable memory row. The gateway has no route for it (the host owns the memory
+  // store), so it is a frontend-only mutation and is approved as one.
+  "forget_memory",
   "process_kill",
 ];
 const MUTATING = [...GATEWAY_MUTATING, ...ASSISTANT_MUTATING];
@@ -51,7 +72,10 @@ describe("AGENT_TOOLS", () => {
   it("every required field is declared in properties", () => {
     for (const t of AGENT_TOOLS) {
       for (const field of t.parameters.required ?? []) {
-        expect(Object.keys(t.parameters.properties), `${t.name}.${field}`).toContain(field);
+        expect(
+          Object.keys(t.parameters.properties),
+          `${t.name}.${field}`,
+        ).toContain(field);
       }
     }
   });
@@ -61,23 +85,31 @@ describe("AGENT_TOOLS", () => {
       for (const [key, raw] of Object.entries(t.parameters.properties)) {
         const spec = raw as { type?: string; description?: string };
         expect(spec.type, `${t.name}.${key}`).toBeTruthy();
-        expect(spec.description?.trim().length ?? 0, `${t.name}.${key}`).toBeGreaterThan(0);
+        expect(
+          spec.description?.trim().length ?? 0,
+          `${t.name}.${key}`,
+        ).toBeGreaterThan(0);
       }
     }
   });
 
   it("the mutating set is exactly the four the gateway gates", () => {
-    expect(MUTATING.filter((m) => AGENT_TOOLS.some((t) => t.name === m))).toEqual(MUTATING);
+    expect(
+      MUTATING.filter((m) => AGENT_TOOLS.some((t) => t.name === m)),
+    ).toEqual(MUTATING);
     // The complement must be read-only: a tool that is neither listed nor read-only is a
     // tool that writes without being gated. `todo_write` only feeds the progress capsule —
     // it never touches the workspace — so it belongs on the read-only side.
-    const readOnly = AGENT_TOOLS.filter((t) => !MUTATING.includes(t.name)).map((t) => t.name);
+    const readOnly = AGENT_TOOLS.filter((t) => !MUTATING.includes(t.name)).map(
+      (t) => t.name,
+    );
     expect(readOnly.sort()).toEqual([
       "browser_console",
       "browser_expect",
       "browser_network",
       "browser_snapshot",
       "browser_wait_for",
+      "device_list",
       "dispatch_agent",
       "enter_plan_mode",
       "exit_plan_mode",
@@ -89,13 +121,16 @@ describe("AGENT_TOOLS", () => {
       "glob",
       "list_dir",
       "list_sessions",
+      "load_session",
       "load_skill",
       "process_output",
       "read_document",
       "read_file",
       "read_image",
+      "read_manifest",
       "read_notebook",
       "read_session",
+      "search_agents",
       "search_files",
       "search_sessions",
       "todo_write",
@@ -103,7 +138,9 @@ describe("AGENT_TOOLS", () => {
       "web_fetch",
       "web_search",
     ]);
-    expect(ASSISTANT_MUTATING.every((m) => AGENT_TOOLS.some((t) => t.name === m))).toBe(true);
+    expect(
+      ASSISTANT_MUTATING.every((m) => AGENT_TOOLS.some((t) => t.name === m)),
+    ).toBe(true);
   });
 
   it("editing is possible without rewriting a whole file", () => {
@@ -116,8 +153,13 @@ describe("AGENT_TOOLS", () => {
     // Two descriptions of the same fact used to live in a comment and in this list. Phase 5's
     // approval modes read `effect`, so a tool that writes but declares "read" would run with no
     // prompt under "auto-approve reads" — silently, and in the direction that loses work.
+    const network = new Set(["web_ask", "web_fetch", "web_search"]);
     for (const t of AGENT_TOOLS) {
-      const expected = MUTATING.includes(t.name) ? "mutate" : "read";
+      const expected = MUTATING.includes(t.name)
+        ? "mutate"
+        : network.has(t.name)
+          ? "network"
+          : "read";
       expect(t.effect, t.name).toBe(expected);
     }
   });
@@ -149,12 +191,16 @@ describe("AGENT_TOOLS", () => {
     expect(AGENT_TOOLS.some((t) => t.name === "browser_click")).toBe(true);
     expect(AGENT_TOOLS.some((t) => t.name === "browser_fill")).toBe(true);
     expect(AGENT_TOOLS.some((t) => t.name === "browser_screenshot")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "browser_print")).toBe(true);
     // The observers read the same app-session endpoint the drivers do — same reason, same side.
     expect(AGENT_TOOLS.some((t) => t.name === "browser_console")).toBe(true);
     expect(AGENT_TOOLS.some((t) => t.name === "browser_network")).toBe(true);
     expect(AGENT_TOOLS.some((t) => t.name === "browser_wait_for")).toBe(true);
     expect(AGENT_TOOLS.some((t) => t.name === "browser_expect")).toBe(true);
     expect(AGENT_TOOLS.some((t) => t.name === "browser_start")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "device_list")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "device_open_url")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "device_screenshot")).toBe(true);
   });
 
   it("the sub-agent registry is the read-only tools minus delegation, todos and the plan pair", () => {
@@ -177,13 +223,35 @@ describe("AGENT_TOOLS", () => {
     expect(toolEffect("run_command")).toBe("mutate");
     expect(toolEffect("not_a_tool")).toBe("mutate");
   });
+
+  it("exposes the manifest tools and keeps both out of subagents", () => {
+    const names = AGENT_TOOLS.map((t) => t.name);
+    expect(names).toContain("read_manifest");
+    expect(names).toContain("forget_memory");
+    expect(subagentTools(false).map((t) => t.name)).not.toContain(
+      "read_manifest",
+    );
+    expect(subagentTools(false).map((t) => t.name)).not.toContain(
+      "forget_memory",
+    );
+    expect(subagentTools(true).map((t) => t.name)).not.toContain(
+      "read_manifest",
+    );
+    expect(subagentTools(true).map((t) => t.name)).not.toContain(
+      "forget_memory",
+    );
+    expect(toolEffect("forget_memory")).toBe("mutate");
+  });
 });
 
 describe("registryToOpenAI", () => {
   it("renders one function per tool and forces additionalProperties off", () => {
     const wire = registryToOpenAI(AGENT_TOOLS) as {
       type: string;
-      function: { name: string; parameters: { additionalProperties: boolean; required: string[] } };
+      function: {
+        name: string;
+        parameters: { additionalProperties: boolean; required: string[] };
+      };
     }[];
     expect(wire).toHaveLength(AGENT_TOOLS.length);
     for (const w of wire) {

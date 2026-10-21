@@ -128,31 +128,43 @@ pub const MAX_ATTEMPTS_DEFAULT: usize = 6;
 /// request at 30s, so the last candidate was **always** cut off mid-attempt. The old invariant test
 /// pinned only one candidate's budget and so could not see it.
 ///
-/// **36s is chosen so the plan is a real bound *and* the re-probe budget is reachable.** Every
-/// admitted candidate is funded for a full `egress::UPSTREAM_HEADER_TIMEOUT` (20s) inside this
-/// budget, so nothing admitted can run past it; and `36s < 40s` (`gateway::FIRST_MSG_TIMEOUT`)
-/// leaves room for the pre-dispatch work this clock starts after (memory prepend, routing) plus
-/// scheduling slack. The constants form one ordering — `20s <= 36s < 40s` — pinned by
-/// `egress::tests::the_plan_budget_fits_inside_the_gateway_bound`.
+/// **44s is chosen so the plan is a real bound, a second full attempt is reachable, and the
+/// re-probe budget stays reachable.** Every admitted candidate is funded for a full
+/// `egress::UPSTREAM_HEADER_TIMEOUT` (20s) inside this budget, so nothing admitted can run past
+/// it; 44s is two full attempts (40s) plus 4s for the pre-dispatch work this clock starts after
+/// (memory prepend, routing) and scheduling slack; and `44s < 48s` (`gateway::FIRST_MSG_TIMEOUT`)
+/// keeps the engine's failure legible. The constants form one ordering — `20s <= 44s < 48s` —
+/// pinned by `egress::tests::the_plan_budget_fits_inside_the_gateway_bound`.
 ///
-/// **Why 36s and not the 26s this used to be (found 2026-10-13).** A same-key re-probe is admitted
-/// only when `elapsed + wait + UPSTREAM_HEADER_TIMEOUT <= PLAN_BUDGET`, so a re-probe must be
-/// *decided* within `PLAN_BUDGET - 22s`. At 26s that window was **4 s** — and the two keys of a
-/// single provider had already spent ~3.7 s failing before the first re-probe was even decided, so
-/// the second round was refused at ~7.5 s and the third was unreachable *by construction*, whatever
+/// **Why 44s and not the 36s this used to be (found 2026-10-19).** At 36s a second candidate was
+/// structurally unreachable after the first spent its whole header budget: `20s + 20s > 36s`, so
+/// `candidate_is_affordable` refused it and the loop ended `Spent` with a one-entry chain. Ledger
+/// rows 7092/7099 are that state exactly — a pre-headers timeout on `key-03`, `key-04` never
+/// dialled, while `key-04` served the same provider and model seconds earlier. `egress::stream`
+/// claimed "the engine advances to the next candidate"; `attempt_disposition` did, and the budget
+/// did not, so a header timeout — the class failover exists for — had no failover at all. 44s
+/// funds one full second attempt with room for the pre-dispatch work, and keeps the re-probe
+/// window (`PLAN_BUDGET - 22s` = 22s) wide enough for all three configured rounds (see
+/// [`SERVER_ERROR_REPROBES_MAX`]).
+///
+/// **Why 36s before that (found 2026-10-13).** A same-key re-probe is admitted only when
+/// `elapsed + wait + UPSTREAM_HEADER_TIMEOUT <= PLAN_BUDGET`, so a re-probe must be *decided*
+/// within `PLAN_BUDGET - 22s`. At 26s that window was **4 s** — and the two keys of a single
+/// provider had already spent ~3.7 s failing before the first re-probe was even decided, so the
+/// second round was refused at ~7.5 s and the third was unreachable *by construction*, whatever
 /// the timing. Ledger rows 4079/4083 show that ceiling exactly: three dials, then
-/// `all attempts failed` — and no row in the ledger's whole history has ever carried four.
-/// 36s widens the window to 14 s, and since the k-th re-probe is decided at `ka + 2(k-1)` seconds,
-/// three rounds now fit whenever a refused dial costs up to ~2.5 s — which is what
-/// [`SERVER_ERROR_REPROBES_MAX`] has always claimed. See that constant, and
-/// `engine::tests::the_reprobe_budget_is_reachable_at_the_measured_cadence`.
+/// `all attempts failed` — and no row in the ledger's whole history has ever carried four. 36s
+/// widened the window to 14 s; the current 44 s widens it to 22 s. Since the k-th re-probe is
+/// decided at `ka + 2(k-1)` seconds, all three rounds fit whenever a refused dial costs up to
+/// ~2.5 s — which is what [`SERVER_ERROR_REPROBES_MAX`] has always claimed. See that constant,
+/// and `engine::tests::the_reprobe_budget_is_reachable_at_the_measured_cadence`.
 ///
 /// **Being below the gateway bound is also what makes the failure legible.** When this budget
 /// refuses a candidate the loop ends in [`Ended::Spent`], so the router records the real class
 /// from the attempt chain. Above the gateway bound the request is instead cancelled, and the
 /// router files it as `CANCELLED` — which is how four failed requests on 2026-09-27
 /// (rows 1652/1655/1656/1658, 30 010–30 025 ms) came to look like client aborts.
-pub const PLAN_BUDGET: Duration = Duration::from_secs(36);
+pub const PLAN_BUDGET: Duration = Duration::from_secs(44);
 
 /// Whether a candidate may be started, given how long the plan has already run.
 ///
@@ -200,17 +212,19 @@ pub fn candidate_is_affordable(elapsed: Duration, is_first: bool) -> bool {
 ///
 /// **The wait is flat, not growing, and that is measured, not lazy.** The budget's admission rule
 /// (`elapsed + wait + UPSTREAM_HEADER_TIMEOUT <= PLAN_BUDGET`) reserves a full 20 s header timeout
-/// behind every wait, so the number of affordable rounds is set by the room left after that reserve
-/// — a flat 2 s buys three rounds there, while a doubling cadence (2 s, 4 s, 8 s) spends 14 s on
-/// waits alone and loses the third. The cadence that fits the budget beats the one that reads
-/// better.
+/// behind every wait, so the number of affordable rounds is set by the room left after that reserve.
+/// A flat 2 s buys the configured three rounds with ~7 s to spare at the current 44 s budget; a
+/// doubling cadence (2 s, 4 s, 8 s) spends 14 s on waits alone, so its third round fits only
+/// narrowly (41.3 s of 44 s, ~2.7 s of slack) and any extra dial cost loses it. The cadence that
+/// leaves headroom beats the one that reads better.
 ///
 /// **This paragraph used to claim more than the arithmetic allowed, and the correction is the
 /// point.** It said a flat 2 s "keeps every round affordable and puts four dials inside the
-/// request". That is true only once [`PLAN_BUDGET`] was widened to 36 s. Under the 26 s it was
-/// written against, the window was 4 s, so round two was refused and round three was unreachable —
-/// the flat cadence was necessary and nowhere near sufficient. The budget, not the cadence, is what
-/// funds the rounds. See
+/// request". That is true only once [`PLAN_BUDGET`] was widened past 26 s (to 36 s on 2026-10-13,
+/// and to 44 s on 2026-10-19 so a second candidate is reachable). Under the 26 s it was written
+/// against, the window was 4 s, so round two was refused and round three was unreachable — the flat
+/// cadence was necessary and nowhere near sufficient. The budget, not the cadence, is what funds the
+/// rounds. See
 /// `engine::tests::the_reprobe_budget_is_reachable_at_the_measured_cadence`, which pins the
 /// arithmetic instead of the intent.
 pub const SERVER_ERROR_RETRY_BACKOFF: Duration = Duration::from_secs(2);
@@ -233,7 +247,7 @@ pub const SERVER_ERROR_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 /// the first re-probe is even decided. In production the constant therefore behaved as **one**.
 /// Ledger rows 4079/4083 (2026-10-13) are that ceiling: three dials total, then
 /// `all attempts failed`, with the upstream's own `500 Upstream rejected the request as invalid`
-/// preserved in the chain. [`PLAN_BUDGET`] is now 36 s, which is what makes this number reachable;
+/// preserved in the chain. [`PLAN_BUDGET`] is now 44 s, which is what makes this number reachable;
 /// the two constants have to move together, and
 /// `engine::tests::the_reprobe_budget_is_reachable_at_the_measured_cadence` goes red if either
 /// drifts.
@@ -244,6 +258,46 @@ pub const SERVER_ERROR_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 /// backoff, or a fresh request) is the honest remedy for an outage that long. Three keeps the
 /// engine a competent client through a flap without pretending it can outlast an outage.
 pub const SERVER_ERROR_REPROBES_MAX: usize = 3;
+
+/// How many times a pre-output `NETWORK` failure may re-dial the **same** candidate when the plan
+/// has no different provider left.
+///
+/// **Borrowed from ZCode's AI SDK retry**, which uses `maxRetries 2` with a 2 s initial delay and a
+/// factor of 2 (`retryWithExponentialBackoffRespectingRetryHeaders`, measured in the installed
+/// bundle). The engine still does not retry a header timeout while a different host is available —
+/// the egress's own argument is that the prompt and host are unchanged — but when the plan has
+/// nowhere else to go, a second roll after a pause is what a competent client does. The 2026-10-19
+/// incident lacked exactly this: both keys of `agent-router` stalled, the plan had no other
+/// carrier, and the request failed without ever pausing to let the upstream recover.
+///
+/// **The budget is still the bound.** A re-probe is priced by [`candidate_is_affordable`] with the
+/// wait added, so after a full 20 s header timeout exactly one retry fits (`20 + 2 + 20 = 42 <=
+/// 44`); a second does not. The count is 2 rather than 1 so a *fast* network failure can use the
+/// same policy without a second constant.
+pub const NETWORK_REPROBES_MAX: usize = 2;
+
+/// The wait before a network re-probe. 2 s is ZCode's initial AI-SDK delay and, at the measured
+/// cadence, the largest wait that still leaves room for a full 20 s attempt inside [`PLAN_BUDGET`]
+/// after the first one.
+pub const NETWORK_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+
+/// A retry the engine is about to perform, for the client's progress channel.
+///
+/// The bridge turns this into a wire frame the Assistant paints, so a 40 s wait shows
+/// `attempt 2/2` instead of a frozen bubble. It carries only what the UI needs — the provider and
+/// key it is about to redial, the attempt ordinal, the configured maximum, the wait, and the
+/// upstream's own reason when it gave one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryNotice {
+    pub provider: String,
+    pub key: String,
+    /// The upcoming dial, 1-based: the first re-probe is attempt 2.
+    pub attempt: usize,
+    /// The configured total dials for this candidate, including the original.
+    pub max: usize,
+    pub delay_ms: u64,
+    pub reason: String,
+}
 
 /// How many of a plan's candidates this request may actually try.
 ///

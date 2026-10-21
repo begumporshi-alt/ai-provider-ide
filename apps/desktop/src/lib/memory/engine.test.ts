@@ -33,8 +33,11 @@ const captureMemories = vi.spyOn(store, "captureMemories");
 const captureMemory = vi.spyOn(store, "captureMemory");
 const recallMemories = vi.spyOn(store, "recallMemories");
 const listMemories = vi.spyOn(store, "listMemories");
+const listScopedMemories = vi.spyOn(store, "listScopedMemories");
+const markMemoriesRetrieved = vi.spyOn(store, "markMemoriesRetrieved");
 const sessionMemories = vi.spyOn(store, "sessionMemories");
 const updateMemory = vi.spyOn(store, "updateMemory");
+const assignMemoryScope = vi.spyOn(store, "assignMemoryScope");
 const recordContext = vi.spyOn(store, "recordContext");
 
 function mem(id: string, layer: Memory["layer"], text: string, pinned = false): Memory {
@@ -45,6 +48,12 @@ function mem(id: string, layer: Memory["layer"], text: string, pinned = false): 
     scope: { user: "local", project: null, agent: null, global: false },
     score: -1,
     superseded_at: null,
+    kind: layer === "L3" ? "identity" : layer === "L0" ? "conversation" : "project_fact",
+    source: "inferred",
+    verified: null,
+    expires_at: null,
+    retrieval_count: 0,
+    last_retrieved_at: null,
   };
 }
 
@@ -54,8 +63,11 @@ describe("memory engine", () => {
     captureMemory.mockReset();
     recallMemories.mockReset();
     listMemories.mockReset();
+    listScopedMemories.mockReset();
+    markMemoriesRetrieved.mockReset();
     sessionMemories.mockReset();
     updateMemory.mockReset();
+    assignMemoryScope.mockReset();
     recordContext.mockReset();
     captureMemories.mockResolvedValue(0);
     // Echo the capture back with the id a stored row would carry, so the distilled rows a test
@@ -65,8 +77,10 @@ describe("memory engine", () => {
     );
     recallMemories.mockResolvedValue([]);
     listMemories.mockResolvedValue([]);
+    markMemoriesRetrieved.mockResolvedValue(0);
     sessionMemories.mockResolvedValue([]);
     updateMemory.mockResolvedValue(true);
+    assignMemoryScope.mockResolvedValue(true);
     recordContext.mockResolvedValue();
     startSession("mem-test");
   });
@@ -368,6 +382,27 @@ describe("memory engine", () => {
       expect(m).not.toBeNull();
     });
 
+    it("marks a new core fact global so it is not capture-only", async () => {
+      captureMemory.mockResolvedValue(mem("core-1", "L3", "I am Tushu", true));
+      assignMemoryScope.mockResolvedValue(true);
+
+      const m = await captureCore("I am Tushu");
+
+      expect(m?.id).toBe("core-1");
+      expect(assignMemoryScope).toHaveBeenCalledWith("core-1", { kind: "global" });
+    });
+
+    it("keeps the fact when the scope write fails", async () => {
+      // A memory write must never fail a chat: the row is already stored and pinned, and a later
+      // save can re-scope it, so a failed promotion is swallowed rather than thrown.
+      captureMemory.mockResolvedValue(mem("core-2", "L3", "I am Tushu", true));
+      assignMemoryScope.mockRejectedValue(new Error("admin route unavailable"));
+
+      const m = await captureCore("I am Tushu");
+
+      expect(m?.id).toBe("core-2");
+    });
+
     it("editCore routes through updateMemory and survives a missing id", async () => {
       updateMemory.mockResolvedValueOnce(true);
       expect(await editCore("m1", "new text")).toBe(true);
@@ -432,9 +467,74 @@ describe("memory engine", () => {
       expect(await recallContext("q")).toHaveLength(1);
     });
 
+    it("drops ids another block already carries, before accounting", async () => {
+      // The manifest owns its entries for the turn. A row that also ranked as relevant must not
+      // be injected twice, and the retrieval counter must describe exactly what was returned —
+      // including a contradicted capability, whose id is excluded so it cannot re-enter here.
+      listMemories.mockResolvedValue([mem("p", "L1", "pinned fact", true)]);
+      recallMemories.mockResolvedValue([mem("a", "L1", "relevant")]);
+
+      const hits = await recallContext("q", { excludeIds: new Set(["p"]) });
+
+      expect(hits.map((m) => m.id)).toEqual(["a"]);
+      expect(markMemoriesRetrieved).toHaveBeenCalledWith(["a"]);
+    });
+
     it("returns nothing instead of throwing when recall fails", async () => {
       recallMemories.mockRejectedValue(new Error("fts corrupt"));
       await expect(recallContext("q")).resolves.toEqual([]);
+    });
+
+    it("scopes both the pinned prefetch and the query recall to the workspace root", async () => {
+      listScopedMemories.mockResolvedValue([mem("identity", "L3", "I am Tushu", true)]);
+      recallMemories.mockResolvedValue([]);
+
+      const got = await recallContext("fix the build", { root: "/tmp/next-app" });
+
+      expect(listScopedMemories).toHaveBeenCalledWith({
+        projectRoot: "/tmp/next-app",
+        pinnedOnly: true,
+        limit: 50,
+      });
+      expect(recallMemories).toHaveBeenCalledWith("fix the build", 4, ["L3", "L2"], {
+        projectRoot: "/tmp/next-app",
+      });
+      expect(recallMemories).toHaveBeenCalledWith("fix the build", 8, ["L1"], {
+        projectRoot: "/tmp/next-app",
+      });
+      expect(got.map((m) => m.id)).toEqual(["identity"]);
+    });
+
+    it("fails closed when the root option is present but blank", async () => {
+      // A blank root is the Assistant with no workspace — not "no scope". Treating it as unscoped
+      // would read every workspace's facts, so the contract is no facts at all.
+      listMemories.mockResolvedValue([mem("p", "L1", "pinned", true)]);
+      recallMemories.mockResolvedValue([mem("a", "L1", "relevant")]);
+
+      await expect(recallContext("q", { root: "   " })).resolves.toEqual([]);
+
+      expect(listScopedMemories).not.toHaveBeenCalled();
+      expect(listMemories).not.toHaveBeenCalled();
+      expect(recallMemories).not.toHaveBeenCalled();
+      // Nothing was read, so there is nothing to account for.
+      expect(markMemoriesRetrieved).not.toHaveBeenCalled();
+    });
+
+    it("accounts for exactly the rows it returned, after the read", async () => {
+      listMemories.mockResolvedValue([mem("p", "L1", "pinned", true)]);
+      recallMemories.mockResolvedValue([mem("a", "L1", "relevant")]);
+
+      const hits = await recallContext("q");
+
+      expect(markMemoriesRetrieved).toHaveBeenCalledWith(hits.map((m) => m.id));
+      // A usage counter is not allowed to change what the turn sees.
+      expect(hits.map((m) => m.id)).toEqual(["p", "a"]);
+    });
+
+    it("does not account for a recall that returned nothing", async () => {
+      recallMemories.mockResolvedValue([]);
+      await recallContext("q");
+      expect(markMemoriesRetrieved).not.toHaveBeenCalled();
     });
   });
 

@@ -5,14 +5,14 @@
 //! where one never does: the headless daemon serves `/admin/memory/prune` and
 //! `/admin/context/prune` but nothing ever called them, so both tables grew without limit for
 //! as long as the daemon ran (2026-10-04 audit, P2). This module is the fix: one task per core,
-//! one interval, two gated jobs.
+//! one interval, two jobs.
 //!
-//! **What runs, and what gates it.** `memory::prune_step` + `session_context::prune_step`, in
-//! bounded chunks, gated on the memory master toggle (`core.memory_enabled()`), the same rule
-//! the webview's `pruneOnce` applies: with the layer off the request path writes neither table,
-//! and the off-by-default guarantee is that the layer performs no writes at all — which has to
-//! include deletes. A user's memories are not touched because a feature they never switched on
-//! is doing housekeeping.
+//! **What runs, and why nothing gates it.** `memory::prune_step` + `session_context::prune_step`,
+//! in bounded chunks. Pruning is deliberately **ungated**: the Assistant writes memories
+//! independently of the gateway memory switch (it defaults memory on), so `memories` has two
+//! writers with different switches, and gating housekeeping on the gateway switch would let the
+//! Assistant's rows grow without limit under the default configuration. Pruning only removes
+//! rows past their TTL or ring/recency caps, which is safe whichever writer created them.
 //!
 //! **Why the pass is budgeted.** Every request and every prune share the store's one writer
 //! lock, and SQLite has no statement timeout — the thing that bounds a prune is the statement
@@ -82,13 +82,10 @@ impl PassBudget {
 
 #[derive(Debug, Default)]
 pub struct RetentionPass {
-    /// Memory retention, when the layer was on.
+    /// Memory retention stats for this pass.
     pub memory: Option<MemoryPruneStats>,
-    /// Live-context retention, when the layer was on.
+    /// Live-context retention stats for this pass.
     pub context: Option<PruneStats>,
-    /// The memory layer's master switch was off: memory and live context were untouched, the
-    /// same rule the webview scheduler applies.
-    pub memory_layer_skipped: bool,
     /// Drift triggers raised this pass (A1 follow-up: the Rust half of the drift monitor).
     pub drift_triggers: usize,
     /// The pass stopped with work left on the table because the wall-clock budget ran out; the
@@ -99,11 +96,7 @@ pub struct RetentionPass {
 
 /// One retention pass. Split from the scheduler so it can be tested without a runtime, and so
 /// a host that wants to drive it synchronously can.
-pub fn pass(
-    store: Option<&Arc<Store>>,
-    memory_enabled: bool,
-    budget: &PassBudget,
-) -> Result<RetentionPass, String> {
+pub fn pass(store: Option<&Arc<Store>>, budget: &PassBudget) -> Result<RetentionPass, String> {
     let mut out = RetentionPass::default();
     let Some(store) = store else {
         return Ok(out);
@@ -114,11 +107,6 @@ pub fn pass(
     // the Rust half of the drift monitor (A1 follow-up): the TS monitor went blind when
     // generation moved to the gateway, and this pass is what keeps the repair flow fed.
     out.drift_triggers = drift::evaluate(store, now_ms())?.len();
-
-    if !memory_enabled {
-        out.memory_layer_skipped = true;
-        return Ok(out);
-    }
 
     loop {
         // The clock is checked *between* batches, never mid-statement: a batch is one bounded
@@ -144,6 +132,109 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// What an opt-in history prune would remove.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct HistoryRetentionCounts {
+    pub sessions: i64,
+    pub messages: i64,
+    pub nodes: i64,
+    pub edges: i64,
+}
+
+/// `None` means retention is off (`days == 0`), never "everything is old".
+fn history_cutoff(days: u32) -> Option<i64> {
+    if days == 0 {
+        return None;
+    }
+    Some(now_ms().saturating_sub((days as i64).saturating_mul(86_400_000)))
+}
+
+fn count_history_at(
+    conn: &rusqlite::Connection,
+    cutoff: i64,
+) -> Result<HistoryRetentionCounts, String> {
+    let one = |sql: &str| -> Result<i64, String> {
+        conn.query_row(sql, [cutoff], |r| r.get(0)).map_err(|e| e.to_string())
+    };
+    const OLD_SESSIONS: &str = "SELECT id FROM router_sessions WHERE last_seen_at < ?1";
+    Ok(HistoryRetentionCounts {
+        sessions: one("SELECT COUNT(*) FROM router_sessions WHERE last_seen_at < ?1")?,
+        messages: one(&format!(
+            "SELECT COUNT(*) FROM session_messages WHERE session_id IN ({OLD_SESSIONS})"
+        ))?,
+        nodes: one(&format!(
+            "SELECT COUNT(*) FROM context_nodes WHERE session_id IN ({OLD_SESSIONS})"
+        ))?,
+        edges: one(&format!(
+            "SELECT COUNT(*) FROM context_edges
+             WHERE from_id IN (SELECT id FROM context_nodes WHERE session_id IN ({OLD_SESSIONS}))
+                OR to_id IN (SELECT id FROM context_nodes WHERE session_id IN ({OLD_SESSIONS}))"
+        ))?,
+    })
+}
+
+/// Count what [`prune_history`] would delete. `days == 0` (the default) means retention is off.
+///
+/// This is a **read**; the Settings screen calls it to show the user exactly what a prune would
+/// remove before they confirm.
+pub fn preview_history(store: &Store, days: u32) -> Result<HistoryRetentionCounts, String> {
+    let Some(cutoff) = history_cutoff(days) else { return Ok(HistoryRetentionCounts::default()) };
+    let conn = store.conn.lock().map_err(|e| e.to_string())?;
+    count_history_at(&conn, cutoff)
+}
+
+/// Delete session-scoped history older than `days` of inactivity.
+///
+/// **Manual and opt-in.** The caller is the Settings screen, after a preview and a second
+/// confirmation. Nothing schedules this pass. Memories and the run ledger are deliberately not
+/// touched — they have their own retention and their own reasons to outlive a conversation.
+///
+/// The session row goes with its transcript, graph, title and state in one transaction, so
+/// History cannot show a session whose transcript has already been removed.
+pub fn prune_history(store: &Store, days: u32) -> Result<HistoryRetentionCounts, String> {
+    let Some(cutoff) = history_cutoff(days) else { return Ok(HistoryRetentionCounts::default()) };
+    let mut conn = store.conn.lock().map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let counts = count_history_at(&tx, cutoff)?;
+    const OLD_SESSIONS: &str = "SELECT id FROM router_sessions WHERE last_seen_at < ?1";
+    // Edges first, from either side; then nodes, the transcript, the session metadata, and the
+    // session itself. Deleting a node first would leave edges pointing at a row that is gone
+    // until the cascade runs, and the cascade is not the guarantee we want to rely on here.
+    tx.execute(
+        &format!(
+            "DELETE FROM context_edges
+             WHERE from_id IN (SELECT id FROM context_nodes WHERE session_id IN ({OLD_SESSIONS}))
+                OR to_id IN (SELECT id FROM context_nodes WHERE session_id IN ({OLD_SESSIONS}))"
+        ),
+        [cutoff],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        &format!("DELETE FROM context_nodes WHERE session_id IN ({OLD_SESSIONS})"),
+        [cutoff],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        &format!("DELETE FROM session_messages WHERE session_id IN ({OLD_SESSIONS})"),
+        [cutoff],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        &format!("DELETE FROM session_titles WHERE session_id IN ({OLD_SESSIONS})"),
+        [cutoff],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        &format!("DELETE FROM session_state WHERE session_id IN ({OLD_SESSIONS})"),
+        [cutoff],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM router_sessions WHERE last_seen_at < ?1", [cutoff])
+        .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(counts)
 }
 
 fn fold_memory(acc: &mut Option<MemoryPruneStats>, step: MemoryPruneStats) {
@@ -200,7 +291,7 @@ pub async fn interval(core: Arc<GatewayCore>) {
 
 fn run_pass(core: &GatewayCore) {
     let budget = PassBudget::new(PASS_BUDGET);
-    match pass(core.store(), core.memory_enabled(), &budget) {
+    match pass(core.store(), &budget) {
         Ok(p) => {
             tracing::debug!(?p, "memory retention pass ran");
             if something_removed(&p) || p.budget_exhausted {
@@ -250,14 +341,16 @@ mod retention_tests {
     }
 
     #[test]
-    fn with_the_layer_off_the_pass_takes_nothing_and_skips() {
+    fn a_pass_prunes_even_when_the_gateway_toggle_is_off() {
         let (store, d) = temp_store("off");
+        seed_stale_memories(&store, 5);
         let budget = PassBudget::new(Duration::from_secs(60));
-        let p = pass(Some(&store), false, &budget).unwrap();
-        assert!(p.memory_layer_skipped);
-        assert!(p.memory.is_none());
-        assert!(p.context.is_none());
-        assert!(!something_removed(&p));
+        let p = pass(Some(&store), &budget).unwrap();
+        // The Assistant writes memories independently of the gateway switch, so housekeeping
+        // cannot be gated on that switch or the tables grow forever.
+        assert!(p.memory.is_some());
+        assert!(p.context.is_some());
+        assert!(something_removed(&p));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -267,8 +360,7 @@ mod retention_tests {
         // No rows anywhere: a pass over an empty store removed nothing, which is neither an
         // error nor a skip.
         let budget = PassBudget::new(Duration::from_secs(60));
-        let p = pass(Some(&store), true, &budget).unwrap();
-        assert!(!p.memory_layer_skipped);
+        let p = pass(Some(&store), &budget).unwrap();
         assert!(p.memory.is_some());
         assert!(p.context.is_some());
         assert!(!something_removed(&p));
@@ -279,8 +371,7 @@ mod retention_tests {
     #[test]
     fn a_pass_without_a_store_removes_nothing_and_fails_nothing() {
         let budget = PassBudget::new(Duration::from_secs(60));
-        let p = pass(None, true, &budget).unwrap();
-        assert!(!p.memory_layer_skipped);
+        let p = pass(None, &budget).unwrap();
         assert!(p.memory.is_none());
         assert!(p.context.is_none());
     }
@@ -290,7 +381,7 @@ mod retention_tests {
         let (store, d) = temp_store("expired");
         seed_stale_memories(&store, 5);
         let budget = PassBudget::new(Duration::ZERO);
-        let p = pass(Some(&store), true, &budget).unwrap();
+        let p = pass(Some(&store), &budget).unwrap();
         // The clock is checked before the first batch, so an expired budget runs zero batches —
         // and reports the fact instead of a silent no-op.
         assert!(p.budget_exhausted);
@@ -329,15 +420,79 @@ mod retention_tests {
 
         // Tick one: no budget to spend. Tick two: a real budget — the same rows, now drained.
         let empty = PassBudget::new(Duration::ZERO);
-        pass(Some(&store), true, &empty).unwrap();
+        pass(Some(&store), &empty).unwrap();
         let next = PassBudget::new(Duration::from_secs(60));
-        let p = pass(Some(&store), true, &next).unwrap();
+        let p = pass(Some(&store), &next).unwrap();
         assert!(!p.budget_exhausted);
         assert_eq!(memory_total(&p), 5, "the second pass drains what the first deferred");
         let conn = store.conn.lock().unwrap();
         let left: i64 = conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0)).unwrap();
         drop(conn);
         assert_eq!(left, 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn history_retention_removes_only_sessions_older_than_the_cutoff() {
+        let (store, d) = temp_store("history");
+        let now = now_ms();
+        let old = now - 40 * 86_400_000;
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO router_sessions (id, created_at, last_seen_at) VALUES ('old', ?1, ?2)",
+                rusqlite::params![old, old],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO router_sessions (id, created_at, last_seen_at) VALUES ('new', ?1, ?2)",
+                rusqlite::params![now, now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_messages (session_id, seq, role, content, ts)
+                 VALUES ('old', 0, 'user', 'old q', ?1), ('new', 0, 'user', 'new q', ?1)",
+                [now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO context_nodes (id, kind, label, source, session_id, ts)
+                 VALUES ('n-old', 'message', 'old', 'ui', 'old', ?1),
+                        ('n-new', 'message', 'new', 'ui', 'new', ?1)",
+                [now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO context_edges (id, from_id, to_id, kind, weight, ts)
+                 VALUES ('e-old', 'n-old', 'n-old', 'follows', 1, ?1),
+                        ('e-new', 'n-new', 'n-new', 'follows', 1, ?1)",
+                [now],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            preview_history(&store, 0).unwrap(),
+            HistoryRetentionCounts::default(),
+            "0 means retention is off"
+        );
+        let expected = HistoryRetentionCounts { sessions: 1, messages: 1, nodes: 1, edges: 1 };
+        assert_eq!(preview_history(&store, 30).unwrap(), expected);
+        assert_eq!(prune_history(&store, 30).unwrap(), expected);
+
+        let conn = store.conn.lock().unwrap();
+        let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(count("SELECT COUNT(*) FROM router_sessions"), 1, "the recent session survives");
+        assert_eq!(count("SELECT COUNT(*) FROM session_messages"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM context_nodes"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM context_edges"), 1);
+        drop(conn);
+
+        assert_eq!(
+            preview_history(&store, 30).unwrap(),
+            HistoryRetentionCounts::default(),
+            "the prune is idempotent"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 }

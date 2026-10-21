@@ -6,6 +6,7 @@
  * the TurnController join in later phases, extending this module rather than forking it.
  */
 import type { Msg } from "./messages";
+import type { ChatMessage, CompressResult } from "@aiprovider/router-core";
 import type { Recorder } from "../../context/recorder";
 import type { Memory } from "../../../store";
 import type { GatewayGenerateRequest, GatewayExec } from "../../gateway-turn";
@@ -122,6 +123,21 @@ export interface TurnRequestBase {
   startedAt: number;
   /** The assistant bubble the screen optimistically appended; patches address it by id. */
   assistantMsgId: string;
+  /**
+   * Automatic compaction for the replayed history, supplied by the screen because the summarizer
+   * is a model call it owns. Absent = the user turned auto-compaction off.
+   */
+  compact?: (messages: readonly ChatMessage[], budgetTokens: number) => Promise<CompressResult>;
+  /** The token budget compaction fits into. Absent disables `compact`. */
+  compactBudget?: number;
+  /** Called when compaction actually removed messages, so the screen can say so. */
+  onCompacted?: (info: { dropped: number; beforeTokens: number; afterTokens: number }) => void;
+  /**
+   * Verified, scoped manifest text for this turn; empty when memory is off or nothing is scoped.
+   * Built by the screen (it owns the tool policy), threaded unchanged through both branches, and
+   * placed above the per-turn recall so stable knowledge reads first.
+   */
+  manifestBlock?: string;
 }
 
 /**

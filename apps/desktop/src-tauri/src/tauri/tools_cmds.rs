@@ -68,9 +68,18 @@ pub fn tools_list_dirs(path: String) -> Result<Vec<String>, String> {
 ///
 /// `call_id` is the model's tool-call id, sent by the Assistant so the call can be stopped
 /// mid-flight; absent for a gateway call, which has no Stop button to serve.
+///
+/// **Async on purpose.** A synchronous Tauri command runs on the main thread, and this one can
+/// block for a minute inside `run_command` or a browser wait. `tool_cancel` is a separate
+/// command; if this one owns the main thread, Stop cannot be delivered until the tool has
+/// already finished. The blocking work moves to the blocking pool, which is what it is for.
 #[tauri::command]
-pub fn tool_run(req: ToolRunRequest, call_id: Option<String>) -> ToolResult {
-    crate::core::tools::tool_run_with_call(req, call_id.as_deref())
+pub async fn tool_run(req: ToolRunRequest, call_id: Option<String>) -> ToolResult {
+    tokio::task::spawn_blocking(move || {
+        crate::core::tools::tool_run_with_call(req, call_id.as_deref())
+    })
+    .await
+    .unwrap_or_else(|e| ToolResult::err(format!("tool execution task failed: {e}")))
 }
 
 /// Stop a tool call that is still running — the Stop button's mid-flight path.
@@ -79,18 +88,26 @@ pub fn tool_run(req: ToolRunRequest, call_id: Option<String>) -> ToolResult {
 /// finished, which the UI can report honestly rather than as a stop that happened. Only
 /// `run_command` registers for cancellation; every other tool is bounded by its own timeout.
 #[tauri::command]
-pub fn tool_cancel(call_id: String) -> Result<bool, String> {
-    crate::core::tools::tool_cancel(&call_id)
+pub async fn tool_cancel(call_id: String) -> Result<bool, String> {
+    tokio::task::spawn_blocking(move || crate::core::tools::tool_cancel(&call_id))
+        .await
+        .map_err(|e| format!("tool cancel task failed: {e}"))?
 }
 
 /// The workspace's git state for the Assistant's git capsule.
 #[tauri::command]
-pub fn git_summary(root: String) -> Result<crate::core::tools::GitSummary, String> {
-    crate::core::tools::git_summary(Path::new(&root))
+pub async fn git_summary(root: String) -> Result<crate::core::tools::GitSummary, String> {
+    tokio::task::spawn_blocking(move || crate::core::tools::git_summary(Path::new(&root)))
+        .await
+        .map_err(|e| format!("git summary task failed: {e}"))?
 }
 
 /// Stage, commit and push the workspace from the Assistant's git capsule.
 #[tauri::command]
-pub fn git_commit_push(root: String, message: String) -> Result<String, String> {
-    crate::core::tools::git_commit_push(Path::new(&root), &message)
+pub async fn git_commit_push(root: String, message: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::core::tools::git_commit_push(Path::new(&root), &message)
+    })
+    .await
+    .map_err(|e| format!("git commit task failed: {e}"))?
 }

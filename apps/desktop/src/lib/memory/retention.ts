@@ -17,13 +17,12 @@
  * "idle" is approximated by a long interval plus one pass at start — inventing an idle detector to
  * save a cheap bounded DELETE would be worse than the thing it replaces.
  *
- * **Gated on the master toggle.** With memory off, neither table is written either, so there is
- * nothing to prune — and the off-by-default guarantee is that the layer performs no writes at all,
- * which has to include deletes. A user's memories are not touched because a feature they never
- * switched on is running housekeeping.
+ * **Ungated.** The Assistant writes memories regardless of the gateway's memory switch (it
+ * defaults memory on), so the table has two writers with different switches. Gating pruning on
+ * the gateway switch would leave the Assistant's rows to grow without limit under the default
+ * configuration — housekeeping is safe for both writers, so it runs for both.
  */
 import {
-  gatewayMemoryEnabled,
   pruneLiveContext,
   pruneMemories,
   type LiveContextPruneStats,
@@ -37,10 +36,12 @@ export interface RetentionResult {
   memories?: MemoryPruneStats;
   live?: LiveContextPruneStats;
   /**
-   * True when nothing ran: a pass was already in flight, or memory is off host-side. Distinct from
-   * "removed nothing" so the UI can say the right thing.
+   * True when nothing ran: a pass was already in flight, or the host was unreachable. Distinct
+   * from "removed nothing" so the UI can say the right thing.
    */
   skipped: boolean;
+  /** Why the pass did not run, when it failed rather than being skipped. */
+  error?: string;
 }
 
 /** A prune is a table scan; two overlapping passes would each re-scan what the other is deleting. */
@@ -50,13 +51,18 @@ let timer: ReturnType<typeof setInterval> | null = null;
 export async function pruneOnce(): Promise<RetentionResult> {
   if (running) return { skipped: true };
   running = true;
+  let memories: MemoryPruneStats | undefined;
   try {
-    if (!(await gatewayMemoryEnabled().catch(() => false))) {
-      return { skipped: true };
-    }
-    const memories = await pruneMemories();
+    // Deliberately ungated: the Assistant records memories whether or not the *gateway*
+    // memory switch is on, so pruning must run for both writers.
+    memories = await pruneMemories();
     const live = await pruneLiveContext();
     return { memories, live, skipped: false };
+  } catch (e) {
+    // "Gateway not running" is a supported state, and this pass runs at boot. A rejection here
+    // would surface as an uncaught page error that reads like a corrupt store; degrade instead.
+    // The first step's stats survive a failure in the second: half a pass is still a fact.
+    return { memories, skipped: true, error: e instanceof Error ? e.message : String(e) };
   } finally {
     running = false;
   }

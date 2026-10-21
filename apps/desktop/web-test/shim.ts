@@ -390,6 +390,16 @@ const MEMORY_LAYERS = ["L0", "L1", "L2", "L3"];
  */
 const DEFAULT_SCOPE = { user: "", project: null, agent: null, global: false };
 
+/** Matches context_scope::project_key_from_root in Rust: FNV-1a over the trimmed root. */
+const projectKey = (root: string): string => {
+  let hash = 0xcbf29ce484222325n;
+  for (const byte of new TextEncoder().encode(root.trim())) {
+    hash ^= BigInt(byte);
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+  }
+  return `p${hash.toString(16).padStart(16, "0")}`;
+};
+
 /**
  * The real host sends `Memory.pinned` as a boolean (Rust `bool`), but this shim stores it as the
  * SQL-ish 0/1 its SQLite emulation uses — so the app's `isMemory` guard, which requires a bool,
@@ -398,6 +408,55 @@ const DEFAULT_SCOPE = { user: "", project: null, agent: null, global: false };
  * specs read raw rows and assert `pinned === 1`.
  */
 const wireMemory = (m: Row): Row => ({ ...m, pinned: Boolean(m.pinned) });
+
+/**
+ * The webview-side mirror of `memory.rs::classify_kind`, including its order: capability before
+ * preference before decision. The order is load-bearing — an atom that mentions "git clone is not
+ * available" is a capability claim even if it also says "prefer" — and Task 7's contradicted
+ * capability path depends on the claim landing as `capability` rather than `project_fact`.
+ */
+function classifyKind(layer: unknown, text: unknown): string {
+  if (layer === "L0") return "conversation";
+  if (layer === "L3") return "identity";
+  const t = String(text ?? "").toLowerCase();
+  const CAPABILITY = [
+    "git clone", "git fetch", "cannot run", "can't run", "not available",
+    "no access", "unable to", "no real shell", "shell is available",
+  ];
+  if (CAPABILITY.some((p) => t.includes(p))) return "capability";
+  const PREFERENCE = ["prefers", "prefer ", "likes ", "wants ", "always use", "never use", "concise"];
+  if (PREFERENCE.some((p) => t.includes(p))) return "preference";
+  const DECISION = ["decided", "we will", "we'll", "chosen", "approved", "agreed"];
+  if (DECISION.some((p) => t.includes(p))) return "decision";
+  return "project_fact";
+}
+
+/**
+ * 0033 metadata a row carries from birth. A row that predates the columns gets the same defaults
+ * filled in on touch.
+ */
+function memoryMetadata(layer: unknown, text: unknown): Row {
+  return {
+    kind: classifyKind(layer, text),
+    source: "inferred",
+    verified: null,
+    expires_at: null,
+    retrieval_count: 0,
+    last_retrieved_at: null,
+  };
+}
+
+/** Fill metadata columns on a row stored before 0033, without overwriting a real value. */
+function fillMemoryMetadata(row: Row): void {
+  for (const [k, v] of Object.entries(memoryMetadata(row.layer, row.text))) {
+    if (row[k] === undefined) row[k] = v;
+  }
+}
+
+/** 0033: an expired row is kept but can no longer be injected. */
+function isExpired(row: Row, now = Date.now()): boolean {
+  return row.expires_at != null && Number(row.expires_at) <= now;
+}
 
 const STEP_KINDS = ["assistant", "tool_call", "tool_result", "done", "denied"];
 /** context.rs caps a repeated edge's weight so one hot pair cannot swamp the layout. */
@@ -479,7 +538,14 @@ const DEFAULT_WORKSPACE_ROOT = "/Users/tester/AI-Provider-Router-Workspace";
 
 const TOOLS_POLICY = {
   programs: ["ls", "cat", "echo", "grep", "rg", "find", "git", "node", "npm", "npx", "pnpm", "python3", "make", "tar", "sed", "awk"],
-  git_subcommands: ["status", "log", "diff", "show"],
+  // Mirrors `GIT_SUBCOMMANDS` in core/tools.rs rather than a read-only subset. The manifest's
+  // capability verification reads this list, so a shim that omitted clone/fetch would judge
+  // "cannot run git clone" against a sandbox the real app does not have — and the spec would pin
+  // the wrong verdict.
+  git_subcommands: [
+    "status", "diff", "log", "show", "branch", "add", "commit", "init", "rev-parse",
+    "ls-files", "config", "describe", "stash", "clone", "fetch", "pull", "push",
+  ],
   max_command_ms: 60_000,
   max_output_bytes: 64 * 1024,
 };
@@ -1521,6 +1587,12 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       transcriptRows.delete(sid);
       return null;
     }
+    case "history_retention_preview":
+    case "history_retention_prune":
+      // The shim has no session age clock; the Rust retention test owns the deletion logic. The
+      // commands exist here so the Settings section can render and preview without an unknown-
+      // command rejection — and so a UI test can see the honest empty result.
+      return { sessions: 0, messages: 0, nodes: 0, edges: 0 };
     // ---- the transcript (0027) ----
     // The durable copy of the conversation. Emulated rather than stubbed because the resume path
     // reads it back: a shim that returned [] would make "resume restored the transcript" pass
@@ -2271,6 +2343,28 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         virtualFs.set(rel, TINY_PNG);
         return ok(`READ_IMAGE:image/png;base64,${TINY_PNG}\npath: ${rel}\nbytes: 70`);
       }
+      if (name === "browser_print") {
+        if (!vBrowser.title) return fail("no browser answered on 127.0.0.1:9222 — start Chrome (or Chromium/Edge) with --remote-debugging-port=9222 and open a tab");
+        // The smallest bytes that are honestly a PDF ("%PDF-1.4\n%%EOF").
+        const TINY_PDF = "JVBERi0xLjQKJSVFT0Y=";
+        const rel = String(toolArgs["path"] ?? "documents/print-fixture.pdf");
+        virtualFs.set(rel, TINY_PDF);
+        return ok(`printed the page to ${rel} (1 KB) with print media — read_document can read its text`);
+      }
+      if (name === "device_list") {
+        return ok("adb: /fixtures/platform-tools/adb\nemulator-5554  device  model:fixture");
+      }
+      if (name === "device_open_url") {
+        const url = String(toolArgs["url"] ?? "");
+        if (!/^https?:\/\//.test(url)) return fail('"url" must start with http:// or https://');
+        return ok(`opened ${url} on emulator-5554`);
+      }
+      if (name === "device_screenshot") {
+        const TINY_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        const rel = String(toolArgs["path"] ?? "images/device-fixture.png");
+        virtualFs.set(rel, TINY_PNG);
+        return ok(`READ_IMAGE:image/png;base64,${TINY_PNG}\npath: ${rel}\nbytes: 70`);
+      }
       if (name === "read_image") {
         const p = String(toolArgs["path"] ?? "");
         const data = virtualFs.get(p);
@@ -2352,6 +2446,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         // them in on touch so the Memory screen's `ScopeSelect` doesn't read `.global` of undefined.
         if (!seen.scope) seen.scope = { ...DEFAULT_SCOPE };
         if (seen.superseded_at === undefined) seen.superseded_at = null;
+        fillMemoryMetadata(seen);
         return wireMemory(seen);
       }
       const row: Row = {
@@ -2360,6 +2455,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         created_at: now, updated_at: now, pinned: args.pinned ? 1 : 0,
         scope: { ...DEFAULT_SCOPE },
         superseded_at: null,
+        ...memoryMetadata(layer, text),
       };
       memories.push(row);
       return wireMemory(row);
@@ -2396,6 +2492,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         const seen = memories.find((m) => m.layer === it.layer && m.text === text);
         if (seen) {
           seen.updated_at = now;
+          fillMemoryMetadata(seen);
         } else {
           memories.push({
             id: `m-${it.layer}-${memories.length + 1}-${now}`, layer: it.layer, text,
@@ -2403,6 +2500,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
             created_at: now, updated_at: now, pinned: it.pinned ? 1 : 0,
             scope: { ...DEFAULT_SCOPE },
             superseded_at: null,
+            ...memoryMetadata(it.layer, text),
           });
         }
         n += 1;
@@ -2421,7 +2519,16 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         .split(/[^A-Za-z0-9]+/)
         .filter((w) => w.length > 0);
       if (words.length === 0) return [];
-      const scored = memories
+      const root = typeof args.project_root === "string" ? args.project_root.trim() : "";
+      const project = root ? projectKey(root) : null;
+      const visible = memories.filter((m) => {
+        if (m.superseded_at != null) return false;
+        if (isExpired(m)) return false;
+        if (!project) return true; // the Memory screen's intentional global search
+        const sc = (m.scope as Row | undefined) ?? DEFAULT_SCOPE;
+        return Number(sc.global) === 1 || sc.project === project;
+      });
+      const scored = visible
         .filter((m) => !layers || layers.includes(String(m.layer)))
         .map((m) => {
           const hay = String(m.text).toLowerCase();
@@ -2452,6 +2559,26 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         recencyOf(b) - recencyOf(a) ||
         (rank[String(a.m.layer)] ?? 9) - (rank[String(b.m.layer)] ?? 9));
       return scored.slice(0, limit).map((x) => wireMemory({ ...x.m, score: x.score }));
+    }
+    case "memory_scoped": {
+      const root = String(args.project_root ?? "").trim();
+      if (!root) throw new Error("project_root is required");
+      const project = projectKey(root);
+      const pinnedOnly = args.pinned_only === true;
+      const limit = (args.limit as number) ?? 200;
+      return memories
+        .filter((m) => m.layer !== "L0")
+        .filter((m) => m.superseded_at == null)
+        .filter((m) => !isExpired(m))
+        .filter((m) => {
+          const sc = (m.scope as Row | undefined) ?? DEFAULT_SCOPE;
+          return Number(sc.global) === 1 || sc.project === project;
+        })
+        .filter((m) => !pinnedOnly || Number(m.pinned) === 1)
+        .sort((a, b) =>
+          Number(b.pinned) - Number(a.pinned) || Number(b.updated_at) - Number(a.updated_at))
+        .slice(0, limit)
+        .map(wireMemory);
     }
     case "memory_list": {
       const limit = (args.limit as number) ?? 200;
@@ -2496,6 +2623,18 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         .sort((a, b) => (a.created_at as number) - (b.created_at as number))
         .slice(0, limit)
         .map(wireMemory);
+    }
+    case "memory_mark_retrieved": {
+      const ids = (args.ids as string[] | undefined) ?? [];
+      let n = 0;
+      for (const id of ids) {
+        const m = memories.find((x) => x.id === id);
+        if (!m) continue;
+        m.retrieval_count = Number(m.retrieval_count ?? 0) + 1;
+        m.last_retrieved_at = Date.now();
+        n += 1;
+      }
+      return n;
     }
     case "memory_clear":
       memories.length = 0;
@@ -2945,8 +3084,53 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       return [...axiomAudits]
         .sort((a, b) => (b.startedAt as number) - (a.startedAt as number) || String(b.id).localeCompare(String(a.id)))
         .slice(0, limit)
-        .map(cloneJson);
+        .map((a) => {
+          // Mirror the Rust contract: the list carries metadata and the two small fields the
+          // timeline renders, never the body.
+          const { report, ...meta } = cloneJson(a) as Record<string, unknown>;
+          const body = report === undefined ? "" : JSON.stringify(report);
+          const doc = report as { error?: unknown; decision?: { deltas?: unknown } } | undefined;
+          return {
+            ...meta,
+            reportBytes: body.length,
+            reportError: typeof doc?.error === "string" ? doc.error : null,
+            reportDeltas: doc?.decision?.deltas ? JSON.stringify(doc.decision.deltas) : null,
+          };
+        });
     }
+    case "axiom_audit_get": {
+      const found = axiomAudits.find((a) => a.id === String(args.id));
+      return found ? cloneJson(found) : null;
+    }
+
+    // ---- cross-agent sources: the Tauri commands behind the agent tools' port ----
+    // The agent loop reaches these through `assistant.sources` (invoke), not through the admin
+    // HTTP routes the TS surface uses, so a shim without these cases would reject every
+    // search_agents / load_session call as an unknown command.
+    case "admin_sources_list":
+      return sourceList();
+    case "admin_source_sessions": {
+      const source = typeof args.source === "string" && args.source ? args.source : null;
+      const query = typeof args.query === "string" ? args.query.trim().toLowerCase() : "";
+      const root = typeof args.root === "string" && args.root.trim() ? args.root.trim() : null;
+      const limit = Math.min(Number(args.limit ?? 25) || 25, 100);
+      const pool = source
+        ? SOURCES_SEED[source] ?? []
+        : ADAPTER_ORDER.flatMap((n) => SOURCES_SEED[n] ?? []);
+      return pool
+        .filter((s) => !root || s.root === root)
+        .filter(
+          (s) =>
+            !query ||
+            (s.title ?? "").toLowerCase().includes(query) ||
+            s.preview.toLowerCase().includes(query) ||
+            (s.root ?? "").toLowerCase().includes(query),
+        )
+        .slice(0, limit)
+        .map(sourceRef);
+    }
+    case "admin_source_import":
+      return importSourceSeed(String(args.source ?? ""), String(args.native_id ?? ""));
 
     default:
       // Unknown commands must reject, exactly as Rust would, so a typo can't pass silently.
@@ -3252,6 +3436,10 @@ async function routeAdmin(method: string, segs: string[], q: URLSearchParams, bo
     case "memory":
       return routeMemory(method, segs, q, body);
 
+    // ── cross-agent session sources (v1) ───────────────────────────────────
+    case "sources":
+      return routeSources(method, segs, q, body);
+
     // ── context graph (P4) ─────────────────────────────────────────────────
     case "context": {
       if (method === "GET" && segs.length === 2) return dispatch("context_graph", { limit: limitOf(q, 200) });
@@ -3325,6 +3513,33 @@ async function routeMemory(method: string, segs: string[], q: URLSearchParams, b
         const b = (body ?? {}) as Row;
         return dispatch("memory_recall", {
           query: b.query ?? "", limit: b.limit ?? 8, layers: b.layers ?? null,
+          project_root: b.project_root ?? null,
+        });
+      }
+      break;
+    }
+    case "retrieved": {
+      if (method === "POST") {
+        const b = (body ?? {}) as Row;
+        return {
+          updated: await dispatch("memory_mark_retrieved", {
+            ids: Array.isArray(b.ids) ? b.ids.map(String) : [],
+          }),
+        };
+      }
+      break;
+    }
+    case "scoped": {
+      if (method === "POST") {
+        const b = (body ?? {}) as Row;
+        // The host answers a blank root with 400 `scope_required` — never with a read. Matching
+        // that here keeps the harness from being more permissive than the code it stands in for.
+        const root = typeof b.project_root === "string" ? b.project_root.trim() : "";
+        if (!root) refuse(400, "project_root is required", "scope_required");
+        return dispatch("memory_scoped", {
+          project_root: b.project_root ?? null,
+          pinned_only: b.pinned_only ?? false,
+          limit: b.limit ?? 200,
         });
       }
       break;
@@ -3393,6 +3608,136 @@ async function routeMemory(method: string, segs: string[], q: URLSearchParams, b
     }
   }
 
+  refuse(404, `no admin route for ${method} /${segs.join("/")}`, "unknown_route");
+}
+
+/** Cross-agent session sources: list/search/import. The shim seeds a synthetic Claude session so
+ * the TS surface has something to render, plus empty stubs for every other adapter (incl. the
+ * user-locked workbuddy empty stub) so `listAgentSources` reports the full UI order. */
+const ADAPTER_ORDER = ["zcode", "claude", "codex", "qoder", "router", "workbuddy", "gemini"];
+const SOURCES_SEED: Record<string, RelatedSessionSeed[]> = {
+  claude: [
+    {
+      source: "claude", nativeId: "sess_1", title: "Claude: auth flow sketch",
+      root: "/tmp/proj-beta", preview: "How do we rotate the refresh token?",
+      nativePath: "~/.claude/projects/-tmp-proj-beta/sess_1.jsonl", importId: null,
+      // What the adapter's `read()` returns; import copies these rows into this app's transcript
+      // store. The second turn's phrase exists nowhere else in the harness, so a spec can prove
+      // it reached the answer through import → transcript_append → read_session.
+      turnRows: [
+        { role: "user", content: "How do we rotate the refresh token?", ts: 1_790_000_000_000 },
+        {
+          role: "assistant",
+          content:
+            "Rotate on a 15-minute cadence and keep the previous token valid for one overlap " +
+            "window so in-flight requests do not fail.",
+          ts: 1_790_000_005_000,
+        },
+        { role: "user", content: "Does that hold when the clock skews?", ts: 1_790_000_010_000 },
+        {
+          role: "assistant",
+          content:
+            "Widen the overlap to two windows under skew; the refresh endpoint tolerates the " +
+            "older token until it expires.",
+          ts: 1_790_000_015_000,
+        },
+      ],
+    },
+  ],
+  // A second agent's session in a DIFFERENT workspace. The related list is scoped by root, so
+  // this row must never appear alongside the claude one — the harness proves the scoping, not
+  // just that some foreign session renders.
+  codex: [
+    {
+      source: "codex", nativeId: "cafe", title: "Codex: build slowdown",
+      root: "/tmp/proj-alpha", preview: "why is the build slow?",
+      nativePath: "~/.codex/sessions/2026/10/02/rollout-cafe.jsonl", importId: null,
+      turnRows: [
+        { role: "user", content: "why is the build slow?", ts: 1_790_000_100_000 },
+        {
+          role: "assistant",
+          content: "The typecheck runs twice; dedupe the plugin.",
+          ts: 1_790_000_105_000,
+        },
+      ],
+    },
+  ],
+};
+interface RelatedSessionSeed {
+  source: string;
+  nativeId: string;
+  title: string | null;
+  root: string | null;
+  preview: string;
+  nativePath: string;
+  importId: string | null;
+  turnRows: Array<{ role: string; content: string; ts: number }>;
+}
+/** The wire shape `SessionRef` serializes in Rust (camelCase, `turns`, `importId`). */
+function sourceRef(s: RelatedSessionSeed): Record<string, unknown> {
+  return {
+    source: s.source, nativeId: s.nativeId, title: s.title, root: s.root,
+    updatedAt: 1_790_000_000_000, turns: s.turnRows.length, preview: s.preview,
+    nativePath: s.nativePath, readable: true, note: null, importId: s.importId,
+  };
+}
+/** Mirror the Rust import: a deterministic id, the seed marked imported, and the rows written into
+ * this app's own transcript store under that id — the rows `read_session` serves afterwards. */
+async function importSourceSeed(
+  source: string,
+  nativeId: string,
+): Promise<{ sessionId: string; turns: number }> {
+  const match = (SOURCES_SEED[source] ?? []).find((s) => s.nativeId === nativeId);
+  if (!match) refuse(404, "unknown session", "unknown_session");
+  const sessionId = `imp-${source}-${match.nativeId}`;
+  match.importId = sessionId;
+  await dispatch("transcript_append", {
+    rows: match.turnRows.map((t, i) => ({
+      sessionId, seq: i, role: t.role, content: t.content, ts: t.ts, root: match.root,
+    })),
+  });
+  return { sessionId, turns: match.turnRows.length };
+}
+function sourceList(): unknown[] {
+  return ADAPTER_ORDER.map((name) => {
+    const sessions = SOURCES_SEED[name] ?? [];
+    return {
+      name,
+      available: sessions.length > 0,
+      sessionCount: sessions.length,
+      note: sessions.length ? null : "no sessions found",
+    };
+  });
+}
+async function routeSources(method: string, segs: string[], q: URLSearchParams, body: unknown): Promise<unknown> {
+  const at = (i: number): string => (i < segs.length ? decodeURIComponent(segs[i]) : "");
+  // GET /admin/sources
+  if (method === "GET" && segs.length === 2) return { sources: sourceList() };
+  // GET /admin/sources/{name}/sessions  |  GET /admin/sources/sessions
+  if (method === "GET" && segs.length === 3) {
+    const which = at(2);
+    const root = q.get("root");
+    const qstr = (q.get("q") || "").trim().toLowerCase();
+    const pool: RelatedSessionSeed[] =
+      which === "sessions" ? ADAPTER_ORDER.flatMap((n) => SOURCES_SEED[n] ?? []) : SOURCES_SEED[which] ?? [];
+    let hits = pool;
+    if (root) hits = hits.filter((s) => s.root === root);
+    if (qstr) {
+      hits = hits.filter((s) =>
+        (s.title ?? "").toLowerCase().includes(qstr) ||
+        s.preview.toLowerCase().includes(qstr) ||
+        (s.root ?? "").toLowerCase().includes(qstr),
+      );
+    }
+    const limit = limitOf(q, 25);
+    return { sessions: hits.slice(0, limit).map(sourceRef) };
+  }
+  // POST /admin/sources/import — `import` is a static segment, so it precedes any {name}/sessions
+  // match the same way the Rust router declares it before `{name}/sessions`.
+  if (method === "POST" && segs.length === 3 && at(2) === "import") {
+    const b = (body ?? {}) as { source?: unknown; native_id?: unknown };
+    return importSourceSeed(String(b.source ?? ""), String(b.native_id ?? ""));
+  }
   refuse(404, `no admin route for ${method} /${segs.join("/")}`, "unknown_route");
 }
 

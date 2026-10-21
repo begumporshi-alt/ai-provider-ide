@@ -82,6 +82,7 @@ export {
   design,
   parsePromptPatches,
   patchChars,
+  unmarkedChars,
   type CandidateInput,
   type CandidateResult,
   type LoopParamChange,

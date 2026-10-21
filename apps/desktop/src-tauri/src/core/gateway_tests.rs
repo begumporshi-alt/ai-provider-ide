@@ -30,6 +30,22 @@ fn step4_ok_probe_delegates_true_app_skips_bind() {
     assert!(app_bind_decision(&taken));
 }
 
+/// A consumer that stops draining must cancel the request, not grow an unbounded queue.
+#[test]
+fn a_full_reply_queue_is_treated_as_a_dead_consumer() {
+    let h = ReplyHandle::default();
+    let mut rx = h.test_channel(7);
+    for _ in 0..REPLY_QUEUE_CAPACITY {
+        assert!(h.reply(7, BridgeMsg::Liveness), "the queue has room");
+    }
+    assert!(!h.reply(7, BridgeMsg::Liveness), "a full queue reports a stalled consumer");
+    // The registration is gone, so draining the queued frames reaches the closed end.
+    for _ in 0..REPLY_QUEUE_CAPACITY {
+        assert!(rx.try_recv().is_ok());
+    }
+    assert!(rx.try_recv().is_err(), "the channel closes after the cancellation");
+}
+
 /// `app_listener_action` is the seam `app.rs` calls: `Some(port)` = delegate to the agent,
 /// `None` = bind it ourselves. It composes `app_bind_decision` with the port the caller
 /// would bind, so both arms are pinned against a real port value.
@@ -96,6 +112,8 @@ struct SynthBridge {
     fallbacks: AtomicBool,
     /// Prepend a reasoning message — the upstream-gated pass-through channel.
     reasoning: AtomicBool,
+    /// Prepend a retry-progress frame — the engine's `model_retry_scheduled` equivalent.
+    retry: AtomicBool,
     /// Prepend an empty delta — the bridge's between-turns liveness probe.
     empty_delta: AtomicBool,
     /// Send one `Liveness` frame, then pause past any short first-message bound a test sets.
@@ -129,6 +147,7 @@ impl SynthBridge {
             served: AtomicBool::new(false),
             fallbacks: AtomicBool::new(false),
             reasoning: AtomicBool::new(false),
+            retry: AtomicBool::new(false),
             empty_delta: AtomicBool::new(false),
             liveness_then_pause: AtomicBool::new(false),
             silent: AtomicBool::new(false),
@@ -177,6 +196,10 @@ impl SynthBridge {
     fn answer_with_reasoning(&self, on: bool) {
         self.reasoning.store(on, Ordering::Relaxed);
     }
+    /// Emit a contentless retry-progress frame before the answer.
+    fn answer_with_retry(&self, on: bool) {
+        self.retry.store(on, Ordering::Relaxed);
+    }
     fn answer_with_empty_delta(&self, on: bool) {
         self.empty_delta.store(on, Ordering::Relaxed);
     }
@@ -220,6 +243,7 @@ impl Bridge for SynthBridge {
         let with_served = self.served.load(Ordering::Relaxed);
         let with_fallbacks = self.fallbacks.load(Ordering::Relaxed);
         let with_reasoning = self.reasoning.load(Ordering::Relaxed);
+        let with_retry = self.retry.load(Ordering::Relaxed);
         let with_empty = self.empty_delta.load(Ordering::Relaxed);
         let liveness_then_pause = self.liveness_then_pause.load(Ordering::Relaxed);
         let fail = self.fail_status.load(Ordering::Relaxed);
@@ -255,6 +279,21 @@ impl Bridge for SynthBridge {
                         // Before the prose — the order a reasoning model produces them in.
                         replies
                             .reply(req.request_id, BridgeMsg::Reasoning("Working it out".into()));
+                    }
+                    if with_retry {
+                        // A retry notice is progress, not answer text: the OpenAI client must
+                        // ignore the unknown field and the Assistant paints it.
+                        replies.reply(
+                            req.request_id,
+                            BridgeMsg::Retry {
+                                provider: "agent-router".into(),
+                                key: "key-03".into(),
+                                attempt: 2,
+                                max: 3,
+                                delay_ms: 2000,
+                                reason: "upstream sent no response headers for 20s".into(),
+                            },
+                        );
                     }
                     replies.reply(req.request_id, BridgeMsg::Delta("Hel".into()));
                     replies.reply(req.request_id, BridgeMsg::Delta("lo".into()));
@@ -482,6 +521,42 @@ async fn reasoning_streams_as_delta_reasoning_content_with_the_role_on_the_first
     // And the reasoning never leaked into the answer channel.
     assert!(acc.contains("\"content\":\"Hel\""), "the answer is unchanged: {acc}");
     assert!(!acc.contains("\"content\":\"Working"), "reasoning is not content: {acc}");
+}
+
+/// The retry progress frame: a contentless OpenAI chunk carrying `aip_retry`. It must not open the
+/// message or become answer text; it is the wire half of the Assistant's `attempt 2/3` line.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retry_frame_rides_the_openai_stream_without_becoming_content() {
+    let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+    let s = start(key).await;
+    s.bridge.answer_with_retry(true);
+
+    let res = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&chat_body(true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let mut acc = String::new();
+    let mut stream = res.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        if acc.contains("finish_reason") {
+            break;
+        }
+    }
+    assert!(acc.contains("\"aip_retry\""), "{acc}");
+    assert!(acc.contains("\"provider\":\"agent-router\""), "{acc}");
+    assert!(acc.contains("\"key\":\"key-03\""), "{acc}");
+    assert!(acc.contains("\"attempt\":2"), "{acc}");
+    assert!(acc.contains("\"max\":3"), "{acc}");
+    assert!(acc.contains("\"delay_ms\":2000"), "{acc}");
+    // The frame is progress, not output: the answer is still exactly the bridge's text.
+    assert!(!acc.contains("\"content\":\"Retrying"), "a retry notice is not content: {acc}");
+    assert!(acc.contains("\"content\":\"Hel\""), "the answer is unchanged: {acc}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2882,7 +2957,7 @@ fn mutation_is_disabled_by_default() {
 fn mutating_tools_are_refused_while_read_only_still_works() {
     let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
     let (core, _bridge) = test_core(key);
-    for tool in ["write_file", "run_command"] {
+    for tool in ["write_file", "run_command", "web_fetch", "web_search"] {
         assert!(core.gateway_tool_refusal(tool).is_some(), "{tool} must be refused by default");
     }
     for tool in ["read_file", "list_dir"] {
@@ -2899,7 +2974,7 @@ fn enabling_mutation_lifts_the_refusal() {
     let (core, _bridge) = test_core(key);
     core.set_tools_mutation_enabled(true);
     assert!(core.is_tools_mutation_enabled());
-    for tool in ["write_file", "run_command", "read_file", "list_dir"] {
+    for tool in ["write_file", "run_command", "web_fetch", "web_search", "read_file", "list_dir"] {
         assert!(
             core.gateway_tool_refusal(tool).is_none(),
             "{tool} must be allowed once mutation is enabled"
@@ -3936,6 +4011,8 @@ async fn start_with_memory() -> (TestServer, std::path::PathBuf) {
             session_id: None,
             subject: None,
             pinned: false,
+            kind: None,
+            source: None,
         },
     )
     .unwrap();
@@ -4227,7 +4304,7 @@ fn the_bridge_holds_no_reference_that_keeps_the_core_alive() {
 fn the_bridge_and_the_core_answer_into_the_same_place() {
     let bridge = Arc::new(MinimalBridge::new());
     let core = Arc::new(GatewayCore::new(bridge.clone(), Arc::new(|| Some("sk-aip-test".into()))));
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(REPLY_QUEUE_CAPACITY);
     core.replies.register(7, tx);
     core.dispatch(bare_request(7));
 
@@ -4510,8 +4587,15 @@ async fn admin_routes_refuse_without_the_master_key() {
         ("DELETE", "/admin/memory", json!(null)),
         ("POST", "/admin/memory/batch", json!([])),
         ("POST", "/admin/memory/recall", json!({ "query": "x" })),
+        ("POST", "/admin/memory/scoped", json!({ "project_root": "/tmp/x" })),
+        ("POST", "/admin/memory/retrieved", json!({ "ids": ["m1"] })),
         ("GET", "/admin/memory/stats", json!(null)),
         ("GET", "/admin/memory/conflicts", json!(null)),
+        // Cross-agent session sources. `import` writes rows, so it authenticates like every
+        // other mutating admin route.
+        ("GET", "/admin/sources", json!(null)),
+        ("GET", "/admin/sources/claude/sessions", json!(null)),
+        ("POST", "/admin/sources/import", json!({ "source": "claude", "native_id": "x" })),
         // The master switch. Listed with the memory statics because it is one, and because a reader
         // of the routes should see that it authenticates like every other one.
         ("GET", "/admin/memory/enabled", json!(null)),
@@ -5312,6 +5396,24 @@ async fn admin_memory_recall_finds_a_captured_atom() {
     assert!(!arr.is_empty(), "BM25 must find the atom it just stored: {rows}");
 }
 
+/// The scoped list route is workspace-only by construction: a caller that names no workspace is
+/// refused rather than silently handed every row. `scope_required` makes the refusal classifiable.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_memory_scoped_list_requires_a_workspace() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .post(format!("{}/admin/memory/scoped", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400, "no project_root is a caller error, not a wildcard");
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "scope_required");
+}
+
 /// Capture is not injection: a row is born `Unscoped` and must not be returned by a scoped recall
 /// until someone binds it on purpose.
 #[tokio::test(flavor = "multi_thread")]
@@ -6014,4 +6116,237 @@ async fn admin_memory_enabled_round_trips_and_is_off_by_default() {
     // And it is the *core's* flag the request path consults, not a copy the route keeps. This is the
     // assertion that makes the route's authority claim testable rather than prose.
     assert!(s.core.memory_enabled(), "the route must flip the core's own flag");
+}
+
+#[tokio::test]
+async fn sources_list_reports_every_agent_with_availability() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .get(format!("{}/admin/sources", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    let sources = body.get("sources").and_then(|v| v.as_array()).expect("a list");
+    let names: Vec<&str> =
+        sources.iter().map(|x| x.get("name").and_then(|n| n.as_str()).unwrap()).collect();
+    assert_eq!(
+        names,
+        vec!["zcode", "claude", "codex", "qoder", "router", "workbuddy", "gemini"],
+        "every adapter is reported, in the UI's order"
+    );
+    // Availability is data for every entry, including agents that are not installed.
+    for src in sources {
+        assert!(src.get("available").and_then(|v| v.as_bool()).is_some());
+        assert!(src.get("sessionCount").and_then(|v| v.as_u64()).is_some());
+    }
+    // The two stubs never have sessions on any machine.
+    let stub = sources.iter().find(|x| x["name"] == "workbuddy").unwrap();
+    assert_eq!(stub["sessionCount"], 0);
+}
+
+#[tokio::test]
+async fn source_sessions_rejects_an_unknown_source_but_searches_everything_with_q() {
+    let s = start_with_store().await;
+
+    let unknown = s
+        .client
+        .get(format!("{}/admin/sources/nope/sessions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), 404, "a listing names one real source");
+
+    // With a query the route is the combined search: an unknown name is not a filter, so it
+    // answers 200 with whatever matches (possibly nothing).
+    let searched = s
+        .client
+        .get(format!("{}/admin/sources/nope/sessions?q=definitely-not-present", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(searched.status(), 200);
+    let body: Value = searched.json().await.unwrap();
+    assert!(body.get("sessions").and_then(|v| v.as_array()).is_some());
+}
+
+#[tokio::test]
+async fn source_import_rejects_unknown_sources_and_unreadable_sessions() {
+    let s = start_with_store().await;
+
+    let unknown = s
+        .client
+        .post(format!("{}/admin/sources/import", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "source": "nope", "native_id": "x" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), 404);
+    let body: Value = unknown.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "unknown_source");
+
+    // A real source with an id it does not contain: nothing to import, and saying "not found"
+    // beats writing an empty session that looks like a successful import.
+    let missing = s
+        .client
+        .post(format!("{}/admin/sources/import", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "source": "workbuddy", "native_id": "x" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+    let body: Value = missing.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "unknown_session");
+}
+
+#[tokio::test]
+async fn source_import_writes_a_resumable_scrubbed_transcript_and_is_idempotent() {
+    // `HOME` is process-global, so a single test owns both the import and the scrub assertions:
+    // two tests mutating it in parallel would revert it out from under each other's request.
+    let dir = std::env::temp_dir().join(format!("aip-codex-import-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".codex/sessions/2026/10/02")).unwrap();
+    // Split so the key-leak guard (which scans shipped source for `sk-…` literals) does not read
+    // this obvious fake as a credential; the fixture still carries the full string.
+    let fake_key = concat!("sk-", "abcdefghijklmnopqrstuvwxyz012345");
+    let meta = "{\"type\":\"session_meta\",\"session_id\":\"cafe\",\"cwd\":\"/tmp/proj-alpha\"}\n";
+    let user = format!(
+        "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"why is the build slow, key {fake_key}\"}}]}},\"timestamp\":\"2026-10-02T09:00:00Z\"}}\n"
+    );
+    let assistant = "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"the typecheck runs twice\"}]},\"timestamp\":\"2026-10-02T09:00:05Z\"}\n";
+    std::fs::write(
+        dir.join(".codex/sessions/2026/10/02/rollout-2026-10-02T09-00-00-cafe.jsonl"),
+        format!("{meta}{user}{assistant}"),
+    )
+    .unwrap();
+
+    let previous = std::env::var_os("HOME");
+    std::env::set_var("HOME", &dir);
+    // Restore HOME no matter how the test exits — it's process-global and the rest of the suite
+    // (and the developer's machine, if this ever runs against a real store) depends on it.
+    struct RestoreHome(Option<std::ffi::OsString>);
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            if let Some(home) = &self.0 {
+                std::env::set_var("HOME", home);
+            }
+        }
+    }
+    let _guard = RestoreHome(previous.clone());
+
+    let s = start_with_store().await;
+
+    let first = s
+        .client
+        .post(format!("{}/admin/sources/import", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "source": "codex", "native_id": "cafe" }))
+        .send()
+        .await
+        .unwrap();
+    let status = first.status();
+    let body: Value = first.json().await.unwrap();
+    assert_eq!(status, 200, "import failed: {body}");
+    assert_eq!(body["turns"], 2);
+    let session_id = body["sessionId"].as_str().unwrap().to_string();
+    assert!(session_id.starts_with("imp-codex-"));
+
+    // The transcript is in this app's own store, readable by the existing session tools, and the
+    // capture scrub ran before the row was written.
+    let (role, content): (String, String) = s
+        .core
+        .store()
+        .unwrap()
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT role, content FROM session_messages WHERE session_id = ?1 AND seq = 1",
+            [&session_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(role, "user");
+    assert!(content.contains("build slow"));
+    assert!(!content.contains(fake_key), "the capture scrub must run before the row is stored");
+    // Task 3 — the import carries the foreign session's project root, so the manifest can scope
+    // recall to /tmp/proj-alpha just like an in-tree session.
+    let root: Option<String> = s
+        .core
+        .store()
+        .unwrap()
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT root FROM session_messages WHERE session_id = ?1 AND seq = 1",
+            [&session_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(root, Some("/tmp/proj-alpha".to_string()));
+    let title: String = s
+        .core
+        .store()
+        .unwrap()
+        .conn
+        .lock()
+        .unwrap()
+        .query_row("SELECT title FROM session_titles WHERE session_id = ?1", [&session_id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(title.starts_with("codex:"));
+
+    // The same import twice is one session, not two: the id is derived, and `(session_id, seq)`
+    // is the primary key.
+    let second = s
+        .client
+        .post(format!("{}/admin/sources/import", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "source": "codex", "native_id": "cafe" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 200);
+    let body: Value = second.json().await.unwrap();
+    assert_eq!(body["sessionId"].as_str().unwrap(), session_id);
+    let count: i64 = s
+        .core
+        .store()
+        .unwrap()
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1",
+            [&session_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 2);
+
+    // The listing speaks the UI's wire shape: `turns` (what the manifest's guard and card read),
+    // never the adapter's field name, and the deterministic import id rides along so the card can
+    // show "imported" instead of offering the same import twice.
+    let listing = s
+        .client
+        .get(format!("{}/admin/sources/codex/sessions?root=/tmp/proj-alpha", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listing.status(), 200);
+    let body: Value = listing.json().await.unwrap();
+    let hit = body["sessions"].as_array().unwrap().first().expect("the imported session is listed");
+    assert_eq!(hit["turns"], 2, "the wire field is the one the TS consumer guards on");
+    assert!(hit.get("turnEstimate").is_none(), "the adapter's internal name must not leak");
+    assert_eq!(hit["importId"].as_str(), Some(session_id.as_str()));
 }

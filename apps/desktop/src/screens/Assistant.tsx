@@ -4,18 +4,30 @@
  * request the calm summary line (`✓ 421ms · OpenRouter · key-03` / `↻ 1 fallback`) with an
  * expandable per-attempt route trace. Acceptance criterion 4: text + image end-to-end.
  */
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { createPortal } from "react-dom";
 import {
   catalog,
   listSkills,
+  listScopedMemories,
+  listSourceSessions,
+  importSourceSession,
   agentDefsList,
   registry,
   router,
   loadHistorySessions,
   resumeSession,
   historyMaxSeq,
+  forgetMemory,
   transcriptAppend,
+  transcriptReplace,
   transcriptMaxSeq,
   setSessionTitle as saveSessionTitle,
   type HistorySession,
@@ -32,6 +44,7 @@ import { useUi } from "../ui-state";
 import { useHeaderSlot } from "../components/Shell";
 import { Button, Modal, inputCls, inputStyle } from "../components/atoms";
 import { Markdown } from "../components/Markdown";
+import { RunConfig } from "../components/assistant/RunConfig";
 import { RichMarkdown } from "../components/RichMarkdown";
 import { DocCard } from "../components/DocCard";
 import { ArtifactCard } from "../components/ArtifactCard";
@@ -43,27 +56,60 @@ import {
   pickVisionModel,
   type ImageReading,
 } from "../lib/chat/vision";
-import { artifactHistories, type ArtifactVersion } from "../lib/chat/artifact-versions";
-import { Composer, type Attachment, type InlinedText } from "../components/Composer";
+import {
+  artifactHistories,
+  type ArtifactVersion,
+} from "../lib/chat/artifact-versions";
+import {
+  Composer,
+  type Attachment,
+  type InlinedText,
+} from "../components/Composer";
 import { parseListing, type MentionCandidate } from "../lib/chat/mentions";
-import { parseAssistantStream, type ToolSegment } from "../lib/assistant-stream";
+import {
+  parseAssistantStream,
+  type ToolSegment,
+} from "../lib/assistant-stream";
 import { editPoint, retryPoint } from "../lib/chat/actions";
 import { instructionSystemText } from "../lib/chat/context-blocks";
-import { createTauriToolHost, fetchToolsPolicy, fetchDefaultRoot, savePlan, planPathFromResult, clampIterations, MAX_ITERATIONS_CAP, resolveSubagentResultCap, SUBAGENT_RESULT_CAP, SUBAGENT_RESULT_CAP_MAX, SUBAGENT_RESULT_CAP_MIN, type ToolsPolicy, type AgentEvent, type PlanPorts } from "../lib/tools";
 import {
-  APPROVAL_MODES, INITIAL_APPROVAL, revertPlan,
-  type ApprovalMode, type ApprovalState, type RunChangeSet,
+  createTauriToolHost,
+  fetchToolsPolicy,
+  fetchDefaultRoot,
+  savePlan,
+  planPathFromResult,
+  clampIterations,
+  resolveSubagentResultCap,
+  AGENT_TOOLS,
+  type ToolsPolicy,
+  type AgentEvent,
+  type PlanPorts,
+} from "../lib/tools";
+import {
+  APPROVAL_MODES,
+  INITIAL_APPROVAL,
+  revertPlan,
+  type ApprovalMode,
+  type ApprovalState,
+  type RunChangeSet,
 } from "../lib/tools";
 import { ApproveModal, type ApprovalChoice } from "../components/ApproveModal";
-import { PlanModeEntryModal, PlanReviewModal } from "../components/PlanReviewModal";
+import {
+  PlanModeEntryModal,
+  PlanReviewModal,
+} from "../components/PlanReviewModal";
 import { ChangeSetReview } from "../components/ChangeSetReview";
-import { AssistantCapsule, type TodoItem } from "../components/AssistantCapsule";
+import {
+  AssistantCapsule,
+  type TodoItem,
+} from "../components/AssistantCapsule";
 import { SubagentsDrawer } from "../components/RunsDrawer";
 import { SessionSkillsDrawer } from "../components/SessionSkillsDrawer";
 import { SessionReferencesDrawer } from "../components/SessionReferencesDrawer";
 import { DiffView } from "../components/DiffView";
 import { ProcessCard } from "../components/ProcessCard";
 import { LearnedStrip, RecallCard } from "../components/MemoryMoments";
+import { ManifestCard } from "../components/ManifestCard";
 import { ScreenshotPreview } from "../components/ScreenshotPreview";
 import { backgroundJobIdFromResult } from "../lib/tools/processJob";
 import type { WireToolResult } from "../lib/tools/host";
@@ -80,20 +126,53 @@ import {
   type ToolCallRef,
   type ToolStep,
 } from "../lib/tools/render";
-import type { ChatMessage, ReasoningEffort, ToolCall, UsageTokens } from "@aiprovider/router-core";
+import type {
+  ChatMessage,
+  ReasoningEffort,
+  ToolCall,
+  UsageTokens,
+} from "@aiprovider/router-core";
 import {
-  estimateTokens, DEFAULT_CONTEXT_WINDOW, textOfContent, compressWithSummary, type CatalogModel,
+  estimateTokens,
+  DEFAULT_CONTEXT_WINDOW,
+  textOfContent,
+  compressWithSummary,
+  type CatalogModel,
 } from "@aiprovider/router-core";
 import { formatCost } from "../lib/ledger/format";
-import { chargeSessionUsage, emptySessionUsage } from "../lib/ledger/session-usage";
-import { shortcutFor } from "../lib/keys/shortcuts";
-import { activeSession, startSession, type Recorder } from "../lib/context/recorder";
-import { endRun, newRunId, recordStep, registerAbort, startRun } from "../lib/agent/orchestrator";
 import {
-  distilTurn, memoryBlock, onLearned, recallContext, recordRecall, rememberTurn,
+  chargeSessionUsage,
+  emptySessionUsage,
+} from "../lib/ledger/session-usage";
+import { shortcutFor } from "../lib/keys/shortcuts";
+import {
+  activeSession,
+  startSession,
+  type Recorder,
+} from "../lib/context/recorder";
+import {
+  endRun,
+  newRunId,
+  recordStep,
+  registerAbort,
+  startRun,
+} from "../lib/agent/orchestrator";
+import {
+  distilTurn,
+  memoryBlock,
+  onLearned,
+  recallContext,
+  recordRecall,
+  rememberTurn,
   type LearnedMemory,
 } from "../lib/memory/engine";
-import { newMsgId, replayHistory, withIds, type Msg } from "../lib/chat/turn/messages";
+import { buildManifest, type ComposedManifest } from "../lib/memory/manifest";
+import {
+  newMsgId,
+  replayHistory,
+  withIds,
+  type Msg,
+} from "../lib/chat/turn/messages";
 import {
   applyAgentEvent,
   attachReasoning,
@@ -103,7 +182,9 @@ import {
   type ToolStatus,
 } from "../lib/chat/turn/timeline";
 import {
-  agentSystem, AGENT_SYSTEM, NO_TOOLS_SYSTEM,
+  agentSystem,
+  AGENT_SYSTEM,
+  NO_TOOLS_SYSTEM,
 } from "../lib/chat/turn/prompt";
 import { tryParseArgs } from "../lib/chat/turn/graph-record";
 import {
@@ -126,6 +207,7 @@ import { activeAxiomTurn } from "../lib/axiom/active";
 import { beginTurn, currentTurn } from "../lib/chat/turn/controller";
 import type { Trace } from "../lib/chat/turn/ports";
 import type { TranscriptEntry } from "../lib/chat/turn/ports";
+import { attachmentMeta } from "../lib/chat/turn/ports";
 
 /**
  * Tier 2 summarizer — what the assistant hands to `generateText` so dropped context becomes a
@@ -193,7 +275,9 @@ function createEnhancer(model: string): (draft: string) => Promise<string> {
   };
 }
 
-function createSummarizer(model: string): (dropped: ChatMessage[]) => Promise<string> {
+function createSummarizer(
+  model: string,
+): (dropped: ChatMessage[]) => Promise<string> {
   return async (dropped) => {
     const transcript = dropped
       .map((m) => `${m.role}: ${m.content}`)
@@ -227,210 +311,12 @@ function formatTokens(n: number): string {
   return n.toLocaleString();
 }
 
-
 /**
  * One switch row inside the run-configuration panel: setting name on the left, pill switch on
  * the right. The accessible name is always the full setting name — the same names the inline
  * controls used to carry — so the specs and screen readers keep matching them; `displayLabel`
  * only shortens the visible text.
  */
-function RunSwitchRow({
-  label,
-  displayLabel,
-  checked,
-  onChange,
-  disabled,
-  note,
-}: {
-  label: string;
-  displayLabel?: string;
-  checked: boolean;
-  onChange: (v: boolean) => void;
-  disabled?: boolean;
-  /** One line under the name — usually why the row is disabled. */
-  note?: string;
-}) {
-  return (
-    <label
-      className={`flex items-center justify-between gap-3 rounded px-2 py-1.5 text-[12px] ${disabled ? "opacity-50" : "cursor-pointer"}`}
-      style={{ color: "var(--text)" }}
-    >
-      <span className="min-w-0">
-        <span className="block truncate">{displayLabel ?? label}</span>
-        {note && (
-          <span className="block text-[10px]" style={{ color: "var(--text-faint)" }}>
-            {note}
-          </span>
-        )}
-      </span>
-      <input
-        type="checkbox"
-        className="switch shrink-0"
-        checked={checked}
-        disabled={disabled}
-        aria-label={label}
-        onChange={(e) => onChange(e.target.checked)}
-      />
-    </label>
-  );
-}
-
-/**
- * Tool-step ceiling for one agent turn.
- *
- * The draft is held as text while the field is focused: clamping on every keystroke would fight
- * the user — typing "12" passes through "1", and clearing the field to retype it would snap back
- * to a number mid-edit. The value is clamped when the edit is finished, not while it is in
- * progress.
- *
- * Two states, both stated on screen rather than left to a tooltip: **a number** means the turn is
- * bounded and carries a clear button, **blank** means it is not counted and says so in words. A
- * blank box that only a hover explains is how this field misled users twice.
- */
-function StepBudget({
-  value,
-  onChange,
-  disabled,
-}: {
-  /** The user's budget, or `null` for no ceiling — see `AgentLoopOptions.maxIterations`. */
-  value: number | null;
-  onChange: (v: number | null) => void;
-  disabled?: boolean;
-}) {
-  // `null` renders as an empty field, which is also how the user asks for no limit: the blank
-  // state and the unbounded state are the same state, so nothing has to translate between them.
-  const [draft, setDraft] = useState(value === null ? "" : String(value));
-  // Follow the value when it changes from outside this field — hydration, or a reset.
-  useEffect(() => setDraft(value === null ? "" : String(value)), [value]);
-
-  const commit = () => {
-    // The raw string, not `Number(draft)`: an emptied field means "no limit", and `Number("")` is
-    // 0 — which would clamp to the minimum and turn a cleared box into a one-step loop that
-    // returns an empty answer and reports success.
-    const next = clampIterations(draft);
-    onChange(next);
-    setDraft(next === null ? "" : String(next));
-  };
-
-  return (
-    // The run-configuration panel's step budget, under the agent switches it belongs to. The
-    // accessible name stays "tool steps" (aria-label wins over the label's visible text), so the
-    // spec that fills this field keeps matching.
-    //
-    // **The blank state is labelled on screen, not only in a tooltip.** "Blank means no limit" lived
-    // in the `title` attribute alone, and a field whose meaning is visible only on hover is how this
-    // one came to be misread twice — once defaulting to 8, once to a 250 backstop nobody could see.
-    // The clear button is the same fix for the action: the stored value is a real `null` rather than
-    // an omission, so emptying the box *is* a setting change and should be one click, not a
-    // select-all. It sits outside the `<label>` because a button nested in a label also activates the
-    // input.
-    <span
-      className={`flex items-center gap-1.5 ${disabled ? "opacity-50" : ""}`}
-      style={{ color: "var(--text-dim)" }}
-      title={
-        disabled
-          ? "only applies in agent mode — without tools there is nothing to step through"
-          : `how many rounds of tool calls one turn may take (1–${MAX_ITERATIONS_CAP}), or blank for no limit — the loop stops as soon as the model answers, and a long turn is reminded to wrap up`
-      }
-    >
-      <label className="flex items-center gap-1.5">
-        <span className="text-[11px]">Steps</span>
-        <input
-          type="number"
-          min={1}
-          max={MAX_ITERATIONS_CAP}
-          value={draft}
-          disabled={disabled}
-          onChange={(e) => setDraft(e.target.value)}
-          onBlur={commit}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") commit();
-          }}
-          aria-label="tool steps"
-          className="no-spin w-14 rounded-full border px-2 py-0.5 text-center text-[11px]"
-          style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }}
-        />
-      </label>
-      {value === null ? (
-        // Reads `value`, not `draft`: mid-edit the box can be empty while a number is still stored,
-        // and this label describes what is saved rather than what is being typed.
-        <span className="text-[11px] italic opacity-70">no limit</span>
-      ) : (
-        <button
-          type="button"
-          disabled={disabled}
-          aria-label="clear step budget"
-          title="clear the step budget — a turn will not be counted, and stops when the model answers"
-          onClick={() => {
-            onChange(null);
-            setDraft("");
-          }}
-          className="rounded-full border px-1.5 text-[11px] leading-none"
-          style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text-dim)" }}
-        >
-          ×
-        </button>
-      )}
-    </span>
-  );
-}
-
-/**
- * How much of a sub-agent's summary reaches the parent transcript.
- *
- * Same draft-then-commit shape as `StepBudget`, and for the same reason: clamping per keystroke
- * fights the user, and an emptied field means "the loop's default" — passing the raw string into
- * the clamp is what keeps a blank box from becoming `0` characters of summary.
- */
-function SubagentSummaryCap({
-  value,
-  onChange,
-  disabled,
-}: {
-  /** The user's cap, or `null` for the loop's default — see `AgentLoopOptions.subagentSummaryCap`. */
-  value: number | null;
-  onChange: (v: number | null) => void;
-  disabled?: boolean;
-}) {
-  const [draft, setDraft] = useState(value === null ? "" : String(value));
-  useEffect(() => setDraft(value === null ? "" : String(value)), [value]);
-
-  const commit = () => {
-    // The raw string into the clamp, never `Number(draft)` first: `Number("")` is 0.
-    const next = draft.trim() === "" ? null : resolveSubagentResultCap(Number(draft));
-    onChange(next);
-    setDraft(next === null ? "" : String(next));
-  };
-
-  return (
-    <label
-      className={`flex items-center gap-1.5 ${disabled ? "opacity-50" : ""}`}
-      style={{ color: "var(--text-dim)" }}
-      title={
-        disabled
-          ? "only applies in agent mode — without tools there is nothing to delegate"
-          : `characters of a sub-agent's summary kept for this conversation (${SUBAGENT_RESULT_CAP_MIN}–${SUBAGENT_RESULT_CAP_MAX}), or blank for the default (${SUBAGENT_RESULT_CAP}) — the point of delegating is that the survey does not land here`
-      }
-    >
-      <span className="text-[11px]">Sub-agent summary</span>
-      <input
-        type="number"
-        min={SUBAGENT_RESULT_CAP_MIN}
-        max={SUBAGENT_RESULT_CAP_MAX}
-        value={draft}
-        disabled={disabled}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={commit}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") commit();
-        }}
-        aria-label="sub-agent summary characters"
-        className="no-spin w-16 rounded-full border px-2 py-0.5 text-center text-[11px]"
-        style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }}
-      />
-    </label>
-  );
-}
 /**
  * The system-prompt editor.
  *
@@ -471,7 +357,11 @@ function SystemPromptEditor({
   onClose: () => void;
 }) {
   const ta = "mono w-full rounded border p-2 text-[11px]";
-  const taStyle = { background: "var(--bg)", borderColor: "var(--border)", color: "var(--text)" } as const;
+  const taStyle = {
+    background: "var(--bg)",
+    borderColor: "var(--border)",
+    color: "var(--text)",
+  } as const;
   const [keyDraft, setKeyDraft] = useState("");
   const field = (
     label: string,
@@ -482,8 +372,15 @@ function SystemPromptEditor({
   ) => (
     <div className="mb-3">
       <div className="mb-1 flex items-baseline gap-2">
-        <span className="text-[12px] font-medium" style={{ color: "var(--text)" }}>{label}</span>
-        <span className="text-[10px]" style={{ color: "var(--text-faint)" }}>{hint}</span>
+        <span
+          className="text-[12px] font-medium"
+          style={{ color: "var(--text)" }}
+        >
+          {label}
+        </span>
+        <span className="text-[10px]" style={{ color: "var(--text-faint)" }}>
+          {hint}
+        </span>
         {value && (
           <button
             type="button"
@@ -510,8 +407,9 @@ function SystemPromptEditor({
   return (
     <Modal title="System prompts" onClose={onClose} width={620}>
       <p className="mb-3 text-[11px]" style={{ color: "var(--text-dim)" }}>
-        Blank fields use the built-in prompt, shown greyed as the placeholder. These are stored with
-        the Assistant's settings and apply to every new turn.
+        Blank fields use the built-in prompt, shown greyed as the placeholder.
+        These are stored with the Assistant's settings and apply to every new
+        turn.
       </p>
       {field(
         "no-tools guard",
@@ -534,9 +432,15 @@ function SystemPromptEditor({
         onChangeSystem,
         "(no system prompt is sent unless you write one)",
       )}
-      <div className="mb-3 rounded-md border p-3" style={{ borderColor: "var(--border)" }}>
+      <div
+        className="mb-3 rounded-md border p-3"
+        style={{ borderColor: "var(--border)" }}
+      >
         <div className="mb-1 flex items-baseline gap-2">
-          <span className="text-[12px] font-medium" style={{ color: "var(--text)" }}>
+          <span
+            className="text-[12px] font-medium"
+            style={{ color: "var(--text)" }}
+          >
             Web search API key (optional)
           </span>
           {hasSearchKey && (
@@ -546,14 +450,19 @@ function SystemPromptEditor({
           )}
         </div>
         <p className="mb-2 text-[10px]" style={{ color: "var(--text-faint)" }}>
-          Search works without one (keyless, with fallback backends). Adding a Brave or Tavily key
-          puts that provider first in the chain — far more reliable under load. The key goes to the
-          OS vault; it is never readable back here and never reaches the model or the transcript.
+          Search works without one (keyless, with fallback backends). Adding a
+          Brave or Tavily key puts that provider first in the chain — far more
+          reliable under load. The key goes to the OS vault; it is never
+          readable back here and never reaches the model or the transcript.
         </p>
         <div className="flex items-center gap-2">
           <select
             value={searchProvider}
-            onChange={(e) => onChangeSearchProvider(e.target.value as "none" | "brave" | "tavily")}
+            onChange={(e) =>
+              onChangeSearchProvider(
+                e.target.value as "none" | "brave" | "tavily",
+              )
+            }
             className="rounded border bg-transparent px-2 py-1 text-[11px]"
             style={{ borderColor: "var(--border)", color: "var(--text)" }}
             aria-label="Search key provider"
@@ -565,7 +474,9 @@ function SystemPromptEditor({
           <input
             value={keyDraft}
             onChange={(e) => setKeyDraft(e.target.value)}
-            placeholder={hasSearchKey ? "replace the saved key…" : "paste an API key"}
+            placeholder={
+              hasSearchKey ? "replace the saved key…" : "paste an API key"
+            }
             disabled={searchProvider === "none"}
             className="min-w-0 flex-1 rounded border bg-transparent px-2 py-1 text-[11px] disabled:opacity-40"
             style={{ borderColor: "var(--border)", color: "var(--text)" }}
@@ -579,14 +490,20 @@ function SystemPromptEditor({
             }}
             disabled={searchProvider === "none" || !keyDraft.trim()}
             className="shrink-0 rounded-md border px-2 py-1 text-[11px] transition-opacity enabled:hover:opacity-90 disabled:opacity-40"
-            style={{ borderColor: "var(--border)", background: "var(--surface-2)", color: "var(--text)" }}
+            style={{
+              borderColor: "var(--border)",
+              background: "var(--surface-2)",
+              color: "var(--text)",
+            }}
           >
             Save
           </button>
         </div>
       </div>
       <div className="flex justify-end">
-        <Button variant="primary" onClick={onClose}>Done</Button>
+        <Button variant="primary" onClick={onClose}>
+          Done
+        </Button>
       </div>
     </Modal>
   );
@@ -604,6 +521,8 @@ interface AssistantSettings {
   root?: string;
   agentMode?: boolean;
   useMemory?: boolean;
+  /** Compress the oldest history before a turn that would overflow the model window. Default on. */
+  autoCompact?: boolean;
   noTools?: boolean;
   /** Ceiling on tool-calling rounds in one turn. Stored raw; clamped on read, because a value
    *  written by a future build may sit outside today's bounds and must not crash the screen. */
@@ -671,17 +590,30 @@ const ASSISTANT_SETTINGS_KEY = "assistant";
  * its own option, so "unset" is a real chooseable value rather than a missing one that a future
  * build could mistake for a level.
  */
-const THINKING_LEVELS: readonly ReasoningEffort[] = ["off", "low", "medium", "high"];
+const THINKING_LEVELS: readonly ReasoningEffort[] = [
+  "off",
+  "low",
+  "medium",
+  "high",
+];
 
-async function loadAssistantSettings(): Promise<AssistantSettings> {
+async function loadAssistantSettings(): Promise<AssistantSettings | null> {
   try {
     // The keyed route answers an **object**; the IPC command answered a JSON *string*. The
     // `JSON.parse` that used to sit here is gone with the transport rather than kept as a no-op —
     // parsing an object would throw, and the `catch` below would turn that into "no settings".
-    const parsed: unknown = await fetchAdmin("GET", `/admin/settings/${ASSISTANT_SETTINGS_KEY}`);
-    return parsed && typeof parsed === "object" ? (parsed as AssistantSettings) : {};
+    const parsed: unknown = await fetchAdmin(
+      "GET",
+      `/admin/settings/${ASSISTANT_SETTINGS_KEY}`,
+    );
+    return parsed && typeof parsed === "object"
+      ? (parsed as AssistantSettings)
+      : {};
   } catch {
-    return {}; // no stored settings is not an error — it is the first run
+    // `null`, not `{}`: "the read failed" and "there is no row" are different facts. Hydration
+    // must not mark itself complete on a failed read, because the next effect would then write
+    // defaults over the user's stored settings.
+    return null;
   }
 }
 
@@ -691,7 +623,9 @@ function saveAssistantSettings(s: AssistantSettings): void {
   // A **merge** now, where the IPC command was a whole-row UPSERT: a key another writer added
   // between this call and the write survives. Nothing else writes the `assistant` row today, so the
   // difference is invisible here — and it is the direction that cannot lose data.
-  void fetchAdmin("POST", `/admin/settings/${ASSISTANT_SETTINGS_KEY}`, s).catch(() => undefined);
+  void fetchAdmin("POST", `/admin/settings/${ASSISTANT_SETTINGS_KEY}`, s).catch(
+    () => undefined,
+  );
 }
 
 export function AssistantScreen() {
@@ -725,6 +659,7 @@ export function AssistantScreen() {
   // P7: memory is on by default but switchable. Recalling and distilling on every turn changes
   // what the model sees and costs a second call, so it has to be possible to turn it off.
   const [useMemory, setUseMemory] = useState(true);
+  const [autoCompact, setAutoCompact] = useState(true);
   // Whether the run-configuration panel (the sliders icon beside "Add context") is open. The five
   // behaviour switches it holds keep their state above `Chat` — only the door lives here.
   const [runConfigOpen, setRunConfigOpen] = useState(false);
@@ -738,7 +673,9 @@ export function AssistantScreen() {
   // workspace without the user asking for it would be a capability the screen granted by omission.
   // The summary cap defaults to `null` = the loop's own 4000 characters.
   const [subagentsCanWrite, setSubagentsCanWrite] = useState(false);
-  const [subagentsSummaryCap, setSubagentsSummaryCap] = useState<number | null>(null);
+  const [subagentsSummaryCap, setSubagentsSummaryCap] = useState<number | null>(
+    null,
+  );
   const [temperature, setTemperature] = useState<number | "">("");
   const [maxTokens, setMaxTokens] = useState<number | "">("");
   // The thinking level. `""` is "unset" — send no field and leave the provider's own default,
@@ -752,7 +689,9 @@ export function AssistantScreen() {
   // The web-search key tier: which provider (if any) the search chain should lead with, and
   // whether a key is already in the vault (the key itself is never readable back from the
   // webview — `vault_has` only, by design).
-  const [searchProvider, setSearchProvider] = useState<"none" | "brave" | "tavily">("none");
+  const [searchProvider, setSearchProvider] = useState<
+    "none" | "brave" | "tavily"
+  >("none");
   const [hasSearchKey, setHasSearchKey] = useState(false);
   const [root, setRoot] = useState("");
   // A root that will not work is worth saying before the run, not after it. An unusable root
@@ -789,44 +728,70 @@ export function AssistantScreen() {
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const [stored, fallback] = await Promise.all([loadAssistantSettings(), fetchDefaultRoot()]);
+      const [stored, fallback] = await Promise.all([
+        loadAssistantSettings(),
+        fetchDefaultRoot(),
+      ]);
       if (cancelled) return;
+      // A failed read is not a first run. Staying unhydrated keeps the write effects off, so
+      // defaults cannot overwrite a row we could not read.
+      if (stored === null) return;
       if (typeof stored.noTools === "boolean") setNoTools(stored.noTools);
       if (typeof stored.agentMode === "boolean") setAgentMode(stored.agentMode);
       if (typeof stored.useMemory === "boolean") setUseMemory(stored.useMemory);
+      if (typeof stored.autoCompact === "boolean")
+        setAutoCompact(stored.autoCompact);
       // Clamped, not trusted: the stored JSON is ours but not written by this build.
       // `null` is a real stored value here ("no limit"), like `temperature`'s and `maxTokens`',
       // so it is tested for first; anything else is parsed (and unparseable reads as no limit).
       if (stored.maxIterations === null) setMaxIterations(null);
-      else if (stored.maxIterations != null) setMaxIterations(clampIterations(stored.maxIterations));
+      else if (stored.maxIterations != null)
+        setMaxIterations(clampIterations(stored.maxIterations));
       // Absent or not a boolean leaves writes **off** — the one direction this may fail in.
-      if (typeof stored.subagentsCanWrite === "boolean") setSubagentsCanWrite(stored.subagentsCanWrite);
+      if (typeof stored.subagentsCanWrite === "boolean")
+        setSubagentsCanWrite(stored.subagentsCanWrite);
       if (stored.subagentsSummaryCap === null) setSubagentsSummaryCap(null);
       else if (stored.subagentsSummaryCap != null) {
-        setSubagentsSummaryCap(resolveSubagentResultCap(stored.subagentsSummaryCap));
+        setSubagentsSummaryCap(
+          resolveSubagentResultCap(stored.subagentsSummaryCap),
+        );
       }
       // A stored `null` is a real value here — it is how "unset" survives the round trip — so the
       // tests are explicitly for `null` first and then for a usable number. A blank field and a
       // field holding 0 are different requests: 0 is a real temperature.
       if (stored.temperature === null) setTemperature("");
-      else if (typeof stored.temperature === "number" && stored.temperature >= 0 && stored.temperature <= 2) {
+      else if (
+        typeof stored.temperature === "number" &&
+        stored.temperature >= 0 &&
+        stored.temperature <= 2
+      ) {
         setTemperature(stored.temperature);
       }
       if (stored.maxTokens === null) setMaxTokens("");
-      else if (typeof stored.maxTokens === "number" && stored.maxTokens > 0) setMaxTokens(Math.round(stored.maxTokens));
+      else if (typeof stored.maxTokens === "number" && stored.maxTokens > 0)
+        setMaxTokens(Math.round(stored.maxTokens));
       // Validated against the known levels, never trusted: a word a future build invented would
       // otherwise be stored as a selection the select cannot show, or reach the wire as no field
       // while the UI claimed a level. Anything unrecognised stays unset, which is the honest
       // reading of "this build does not know that level".
-      if (THINKING_LEVELS.includes(stored.thinking as ReasoningEffort)) setThinking(stored.thinking as ReasoningEffort);
-      if (typeof stored.systemPrompt === "string") setCustomSystemPrompt(stored.systemPrompt);
-      if (typeof stored.noToolsSystem === "string") setCustomNoToolsSystem(stored.noToolsSystem);
-      if (typeof stored.agentSystem === "string") setCustomAgentSystem(stored.agentSystem);
+      if (THINKING_LEVELS.includes(stored.thinking as ReasoningEffort))
+        setThinking(stored.thinking as ReasoningEffort);
+      if (typeof stored.systemPrompt === "string")
+        setCustomSystemPrompt(stored.systemPrompt);
+      if (typeof stored.noToolsSystem === "string")
+        setCustomNoToolsSystem(stored.noToolsSystem);
+      if (typeof stored.agentSystem === "string")
+        setCustomAgentSystem(stored.agentSystem);
       // Validated against the known ids rather than trusted: an unknown string from a future
       // build would otherwise reach `decide()` and match none of its branches, which reads as
       // "ask every time" — a silent downgrade the user could not see.
-      if (APPROVAL_MODES.some((m) => m.id === stored.approvalMode)) setApprovalMode(stored.approvalMode!);
-      if (stored.searchProvider === "brave" || stored.searchProvider === "tavily") setSearchProvider(stored.searchProvider);
+      if (APPROVAL_MODES.some((m) => m.id === stored.approvalMode))
+        setApprovalMode(stored.approvalMode!);
+      if (
+        stored.searchProvider === "brave" ||
+        stored.searchProvider === "tavily"
+      )
+        setSearchProvider(stored.searchProvider);
       // A model choice survives a remount like every other setting — without this, coming back to
       // the screen reset the picker and Send sat disabled until the user re-picked.
       if (typeof stored.model === "string") setModel(stored.model);
@@ -845,31 +810,54 @@ export function AssistantScreen() {
   // field meant editing both, and forgetting one saved a settings object with the new key
   // missing, which reads back as "the user never changed it".
   const saveAll = useCallback(
-    () => saveAssistantSettings({
-      root, agentMode, useMemory, noTools, maxIterations, approvalMode,
-      subagentsCanWrite,
-      // `null` for "the loop's default", never `undefined`, for the round-trip reason below.
-      subagentsSummaryCap,
-      // Always written, empty string included: a model the picker cleared has to overwrite the
-      // stored one, not vanish from the row.
+    () =>
+      saveAssistantSettings({
+        root,
+        agentMode,
+        useMemory,
+        autoCompact,
+        noTools,
+        maxIterations,
+        approvalMode,
+        subagentsCanWrite,
+        // `null` for "the loop's default", never `undefined`, for the round-trip reason below.
+        subagentsSummaryCap,
+        // Always written, empty string included: a model the picker cleared has to overwrite the
+        // stored one, not vanish from the row.
+        model,
+        // `null`, never `undefined`, for an unset field. `JSON.stringify` omits an undefined key, so
+        // an omitted one leaves the previously stored value in the row — clearing "max tokens" would
+        // look like it worked and then quietly come back on the next load.
+        temperature: typeof temperature === "number" ? temperature : null,
+        maxTokens: typeof maxTokens === "number" ? maxTokens : null,
+        // `null` for unset, for the same round-trip reason as the two above.
+        thinking: thinking === "" ? null : thinking,
+        // Always written, empty string included: same reason, for the three prompts.
+        systemPrompt: customSystemPrompt,
+        noToolsSystem: customNoToolsSystem,
+        agentSystem: customAgentSystem,
+        // `null` for "none" — a cleared provider has to overwrite the stored one, not vanish.
+        searchProvider: searchProvider === "none" ? null : searchProvider,
+      }),
+    [
+      root,
+      agentMode,
+      useMemory,
+      autoCompact,
+      noTools,
+      maxIterations,
+      approvalMode,
       model,
-      // `null`, never `undefined`, for an unset field. `JSON.stringify` omits an undefined key, so
-      // an omitted one leaves the previously stored value in the row — clearing "max tokens" would
-      // look like it worked and then quietly come back on the next load.
-      temperature: typeof temperature === "number" ? temperature : null,
-      maxTokens: typeof maxTokens === "number" ? maxTokens : null,
-      // `null` for unset, for the same round-trip reason as the two above.
-      thinking: thinking === "" ? null : thinking,
-      // Always written, empty string included: same reason, for the three prompts.
-      systemPrompt: customSystemPrompt,
-      noToolsSystem: customNoToolsSystem,
-      agentSystem: customAgentSystem,
-      // `null` for "none" — a cleared provider has to overwrite the stored one, not vanish.
-      searchProvider: searchProvider === "none" ? null : searchProvider,
-    }),
-    [root, agentMode, useMemory, noTools, maxIterations, approvalMode, model, temperature, maxTokens, thinking,
-      customSystemPrompt, customNoToolsSystem, customAgentSystem, searchProvider,
-      subagentsCanWrite, subagentsSummaryCap],
+      temperature,
+      maxTokens,
+      thinking,
+      customSystemPrompt,
+      customNoToolsSystem,
+      customAgentSystem,
+      searchProvider,
+      subagentsCanWrite,
+      subagentsSummaryCap,
+    ],
   );
 
   // The debounced write below must serialise the state as it is WHEN IT FIRES, not as it was
@@ -887,8 +875,25 @@ export function AssistantScreen() {
     saveAll();
     // `root` is written by the debounced effect below; depending on it here would write twice.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hydrated, agentMode, useMemory, noTools, maxIterations, approvalMode, model, temperature, maxTokens, thinking,
-      customSystemPrompt, customNoToolsSystem, customAgentSystem]);
+  }, [
+    hydrated,
+    agentMode,
+    useMemory,
+    autoCompact,
+    noTools,
+    maxIterations,
+    approvalMode,
+    model,
+    temperature,
+    maxTokens,
+    thinking,
+    customSystemPrompt,
+    customNoToolsSystem,
+    customAgentSystem,
+    searchProvider,
+    subagentsCanWrite,
+    subagentsSummaryCap,
+  ]);
 
   // ...but the root is typed one character at a time, so it is debounced instead.
   useEffect(() => {
@@ -923,7 +928,12 @@ export function AssistantScreen() {
 
   // Where this screen's turns go. Same shape `Chat` used to compute: an explicit pick wins, the
   // store's default text model is the fallback.
-  const textDef = (router.settings as typeof router.settings & { defaults?: Record<string, string> }).defaults?.text ?? "";
+  const textDef =
+    (
+      router.settings as typeof router.settings & {
+        defaults?: Record<string, string>;
+      }
+    ).defaults?.text ?? "";
   const chosenText = model || textDef;
 
   // The run toolbar (user's layout): one sliders icon beside "Add context" opens the
@@ -933,7 +943,12 @@ export function AssistantScreen() {
   // carries the state at a glance: accent while agent mode is on, a dot whenever anything differs
   // from its default — hiding the switches must not hide their effect.
   const runConfigDirty =
-    agentMode || planMode || !useMemory || !noTools || approvalMode !== "ask" || maxIterations !== null;
+    agentMode ||
+    planMode ||
+    !useMemory ||
+    !noTools ||
+    approvalMode !== "ask" ||
+    maxIterations !== null;
   const runToolbar = (
     <div className="relative shrink-0">
       <button
@@ -943,7 +958,8 @@ export function AssistantScreen() {
         onClick={() => setRunConfigOpen((v) => !v)}
         className="flex items-center gap-1.5 rounded-lg border px-2 py-1 transition-colors"
         style={{
-          borderColor: agentMode || runConfigOpen ? "var(--accent)" : "var(--border)",
+          borderColor:
+            agentMode || runConfigOpen ? "var(--accent)" : "var(--border)",
           color: agentMode ? "var(--accent)" : "var(--text-dim)",
         }}
         title="Agent mode, memory, approval, plan mode, tools and steps for this run"
@@ -964,80 +980,67 @@ export function AssistantScreen() {
           <circle cx="15" cy="17" r="2.2" />
         </svg>
         {/* aria-hidden: the dot is decoration — the state it signals is read from the panel. */}
-        {runConfigDirty && <span aria-hidden="true" className="h-1 w-1 rounded-full" style={{ background: "var(--accent)" }} />}
+        {runConfigDirty && (
+          <span
+            aria-hidden="true"
+            className="h-1 w-1 rounded-full"
+            style={{ background: "var(--accent)" }}
+          />
+        )}
       </button>
       {runConfigOpen && (
         <>
           {/* The outside-click catcher. The composer sits at the screen's bottom, so the panel
               opens UPWARD from the row — a downward dropdown would be clipped. */}
-          <div data-testid="run-config-overlay" className="fixed inset-0 z-40" onClick={() => setRunConfigOpen(false)} />
+          <div
+            data-testid="run-config-overlay"
+            className="fixed inset-0 z-40"
+            onClick={() => setRunConfigOpen(false)}
+          />
           <div
             role="dialog"
             aria-label="Run configuration"
             className="absolute bottom-full left-0 z-50 mb-1.5 w-80 rounded-lg border p-1.5 shadow-lg"
-            style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
+            style={{
+              background: "var(--surface-2)",
+              borderColor: "var(--border)",
+            }}
             onKeyDown={(e) => {
               if (e.key === "Escape") setRunConfigOpen(false);
             }}
           >
-            <RunSwitchRow label="Agent mode" checked={agentMode} onChange={setAgentMode} />
-            <RunSwitchRow label="Memory" checked={useMemory} onChange={setUseMemory} />
-            <div className="px-2 py-1.5">
-              <ApprovalPicker mode={approvalMode} onChange={setApprovalMode} disabled={!agentMode} />
-              {agentMode && planMode && (
-                // Plan mode carries its own read policy (2026-10-10): the gate lets reads run and
-                // refuses every write, whatever the approval select above says. The old copy told
-                // the user to go pair "auto-approve reads" themselves — the design admitting a
-                // friction it could just remove. Living next to the approval select it overrides,
-                // not as a stray line above the transcript.
-                <p className="mt-1 text-[10px]" style={{ color: "var(--text-faint)" }} data-testid="plan-mode-hint">
-                  Plan mode is read-only: reads and searches run without asking, every write is refused.
-                </p>
-              )}
-            </div>
-            <RunSwitchRow
-              label="Plan mode"
-              checked={planMode}
-              onChange={setPlanMode}
-              disabled={!agentMode}
-              note={agentMode ? undefined : "agent mode only"}
+            <RunConfig
+              agentMode={agentMode}
+              setAgentMode={setAgentMode}
+              useMemory={useMemory}
+              setUseMemory={setUseMemory}
+              autoCompact={autoCompact}
+              setAutoCompact={setAutoCompact}
+              approvalMode={approvalMode}
+              setApprovalMode={setApprovalMode}
+              planMode={planMode}
+              setPlanMode={setPlanMode}
+              noTools={noTools}
+              setNoTools={setNoTools}
+              subagentsCanWrite={subagentsCanWrite}
+              setSubagentsCanWrite={setSubagentsCanWrite}
+              maxIterations={maxIterations}
+              setMaxIterations={setMaxIterations}
+              subagentsSummaryCap={subagentsSummaryCap}
+              setSubagentsSummaryCap={setSubagentsSummaryCap}
             />
-            <RunSwitchRow
-              label="tell the model it has no tools"
-              displayLabel="no tools"
-              checked={noTools}
-              onChange={setNoTools}
-              disabled={agentMode}
-              note={agentMode ? "agent mode provides the tools" : undefined}
-            />
-            <RunSwitchRow
-              label="Sub-agent writes"
-              checked={subagentsCanWrite}
-              onChange={setSubagentsCanWrite}
-              disabled={!agentMode}
-              note={
-                !agentMode
-                  ? "agent mode only"
-                  : subagentsCanWrite
-                    ? "a delegated sub-agent may modify the workspace; every write still asks your approval"
-                    : "sub-agents are read-only researchers"
-              }
-            />
-            <div className="mt-1 flex flex-wrap items-center gap-3 border-t px-2 pt-2" style={{ borderColor: "var(--border)" }}>
-              <StepBudget value={maxIterations} onChange={setMaxIterations} disabled={!agentMode} />
-              <SubagentSummaryCap
-                value={subagentsSummaryCap}
-                onChange={setSubagentsSummaryCap}
-                disabled={!agentMode}
-              />
-            </div>
           </div>
         </>
       )}
     </div>
   );
   const modelCorner = (
-    <ModelPicker modality="text" value={chosenText} onChange={setModel} openNonce={pickerNonce} />
+    <ModelPicker
+      modality="text"
+      value={chosenText}
+      onChange={setModel}
+      openNonce={pickerNonce}
+    />
   );
 
   return (
@@ -1052,40 +1055,69 @@ export function AssistantScreen() {
       {/* Gated on `screenActive`, not just `headerSlot`: this screen is mounted while other
           screens are shown, and the slot is a single shared node — an un-gated portal would paint
           the session bar and these tabs over every other screen's header. */}
-      {screenActive && headerSlot && createPortal(
-        <>
-          <div ref={setSessionSlot} className="flex min-w-0 flex-1 items-center gap-2" />
-          {agentMode && root.trim() ? (
-            // In agent mode the root is the one fact the transcript can't show, so it stays visible
-            // here as a chip that opens the Root tab — the pane is one click away either way.
-            <button
-              type="button"
-              onClick={() => setTab("root")}
-              className="nav-icon-btn flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px]"
-              style={{ borderColor: "var(--border)", color: "var(--text-dim)" }}
-              title={`${root}${rootError ? ` — ${rootError}` : " — open the Root tab"}`}
-            >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className="h-3 w-3" aria-hidden="true">
-                <path d="M3.5 7.5h6l2 2.5h9v8.5h-17v-11Z" />
-              </svg>
-              <span className="max-w-[180px] truncate">{root.split("/").filter(Boolean).pop() ?? root}</span>
-            </button>
-          ) : null}
-          <div className="flex shrink-0 gap-1 rounded-lg border p-0.5" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
-            {(["text", "root"] as const).map((t) => (
+      {screenActive &&
+        headerSlot &&
+        createPortal(
+          <>
+            <div
+              ref={setSessionSlot}
+              className="flex min-w-0 flex-1 items-center gap-2"
+            />
+            {agentMode && root.trim() ? (
+              // In agent mode the root is the one fact the transcript can't show, so it stays visible
+              // here as a chip that opens the Root tab — the pane is one click away either way.
               <button
-                key={t}
-                onClick={() => setTab(t)}
-                className="rounded-md px-3 py-1 text-[12px] font-medium transition-colors"
-                style={tab === t ? { background: "var(--surface-2)", color: "var(--text)" } : { color: "var(--text-dim)" }}
+                type="button"
+                onClick={() => setTab("root")}
+                className="nav-icon-btn flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px]"
+                style={{
+                  borderColor: "var(--border)",
+                  color: "var(--text-dim)",
+                }}
+                title={`${root}${rootError ? ` — ${rootError}` : " — open the Root tab"}`}
               >
-                {t === "text" ? "Chat" : "Root"}
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.7"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="h-3 w-3"
+                  aria-hidden="true"
+                >
+                  <path d="M3.5 7.5h6l2 2.5h9v8.5h-17v-11Z" />
+                </svg>
+                <span className="max-w-[180px] truncate">
+                  {root.split("/").filter(Boolean).pop() ?? root}
+                </span>
               </button>
-            ))}
-          </div>
-        </>,
-        headerSlot,
-      )}
+            ) : null}
+            <div
+              className="flex shrink-0 gap-1 rounded-lg border p-0.5"
+              style={{
+                borderColor: "var(--border)",
+                background: "var(--surface)",
+              }}
+            >
+              {(["text", "root"] as const).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setTab(t)}
+                  className="rounded-md px-3 py-1 text-[12px] font-medium transition-colors"
+                  style={
+                    tab === t
+                      ? { background: "var(--surface-2)", color: "var(--text)" }
+                      : { color: "var(--text-dim)" }
+                  }
+                >
+                  {t === "text" ? "Chat" : "Root"}
+                </button>
+              ))}
+            </div>
+          </>,
+          headerSlot,
+        )}
       {/* No `key={tick}` here. Keying on the tick remounted Chat on every store bump, which
           wiped the conversation mid-session — a settings save took the transcript with it.
           Re-rendering is enough: the skills block re-reads on `tick` through its own effect,
@@ -1096,11 +1128,14 @@ export function AssistantScreen() {
           AbortController lived in the component that had just been destroyed, so the run could not
           be cancelled and its Stop button was gone. Keeping both mounted preserves the transcript,
           the run and its Stop button. */}
-      <div className={tab === "text" ? "flex min-h-0 flex-1 flex-col" : "hidden"}>
+      <div
+        className={tab === "text" ? "flex min-h-0 flex-1 flex-col" : "hidden"}
+      >
         <Chat
           noTools={noTools}
           agentMode={agentMode}
           useMemory={useMemory}
+          autoCompact={autoCompact}
           maxIterations={maxIterations}
           subagentsCanWrite={subagentsCanWrite}
           subagentsSummaryCap={subagentsSummaryCap}
@@ -1151,7 +1186,10 @@ export function AssistantScreen() {
             }
           }}
           onSaveSearchKey={(key) => {
-            void invoke("vault_put", { account: "websearch", secret: `${searchProvider}|${key}` })
+            void invoke("vault_put", {
+              account: "websearch",
+              secret: `${searchProvider}|${key}`,
+            })
               .then(() => setHasSearchKey(true))
               .catch(() => undefined);
           }}
@@ -1204,15 +1242,27 @@ function ModelPicker({
   const models = useMemo(() => {
     void tick;
     const slugOf = (pid: string) => registry.getProvider(pid)?.slug ?? pid;
-    const isEnabled = (pid: string) => registry.getProvider(pid)?.status === "enabled";
-    return selectableModels(catalog.forModality(modality), catalog.aliases, slugOf, isEnabled);
+    const isEnabled = (pid: string) =>
+      registry.getProvider(pid)?.status === "enabled";
+    return selectableModels(
+      catalog.forModality(modality),
+      catalog.aliases,
+      slugOf,
+      isEnabled,
+    );
   }, [tick, modality]);
   const filtered = useMemo(
-    () => models.filter((m) => !q || m.id.toLowerCase().includes(q.toLowerCase())),
+    () =>
+      models.filter((m) => !q || m.id.toLowerCase().includes(q.toLowerCase())),
     [models, q],
   );
   const current = models.find((m) => m.id === value)?.label ?? value;
-  if (!models.length) return <span className="text-[12px]" style={{ color: "var(--text-faint)" }}>no {modality} models — connect a provider</span>;
+  if (!models.length)
+    return (
+      <span className="text-[12px]" style={{ color: "var(--text-faint)" }}>
+        no {modality} models — connect a provider
+      </span>
+    );
   return (
     <div className="relative">
       {/* A native select cannot be searched, and the catalog outgrew one: dozens of qualified ids
@@ -1220,11 +1270,18 @@ function ModelPicker({
           keeps the same ids and adds the one thing a select never had. */}
       <button
         type="button"
-        onClick={() => { setOpen((o) => !o); setQ(""); }}
+        onClick={() => {
+          setOpen((o) => !o);
+          setQ("");
+        }}
         aria-label={`Model: ${current} — open picker`}
         aria-expanded={open}
         className="flex max-w-[340px] items-center gap-2 rounded border px-2 py-1 text-[12px]"
-        style={{ background: "var(--bg)", borderColor: "var(--border)", color: "var(--text)" }}
+        style={{
+          background: "var(--bg)",
+          borderColor: "var(--border)",
+          color: "var(--text)",
+        }}
       >
         <span className="mono truncate">{current || "pick a model…"}</span>
         <span style={{ color: "var(--text-faint)" }}>▾</span>
@@ -1241,7 +1298,10 @@ function ModelPicker({
           />
           <div
             className="absolute left-0 top-8 z-50 w-[380px] rounded border p-2 shadow-lg"
-            style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
+            style={{
+              background: "var(--surface-2)",
+              borderColor: "var(--border)",
+            }}
             role="listbox"
             aria-label="Pick a model"
           >
@@ -1261,7 +1321,8 @@ function ModelPicker({
                   aria-selected={m.id === value}
                   className="mono block w-full truncate rounded px-2 py-1.5 text-left text-[12px] transition-colors hover:opacity-80"
                   style={{
-                    background: m.id === value ? "var(--surface)" : "transparent",
+                    background:
+                      m.id === value ? "var(--surface)" : "transparent",
                     color: m.id === value ? "var(--text)" : "var(--text-dim)",
                   }}
                   onClick={() => {
@@ -1284,7 +1345,10 @@ function ModelPicker({
                   {m.vision === true && (
                     <span
                       className="ml-1.5 rounded px-1 py-px text-[10px]"
-                      style={{ background: "var(--accent-soft)", color: "var(--info)" }}
+                      style={{
+                        background: "var(--accent-soft)",
+                        color: "var(--info)",
+                      }}
                       data-testid="model-vision-badge"
                       title="This model can be shown images directly"
                     >
@@ -1294,12 +1358,18 @@ function ModelPicker({
                 </button>
               ))}
               {filtered.length === 0 && (
-                <p className="px-2 py-3 text-[12px]" style={{ color: "var(--text-faint)" }}>
+                <p
+                  className="px-2 py-3 text-[12px]"
+                  style={{ color: "var(--text-faint)" }}
+                >
                   No model matches “{q}”.
                 </p>
               )}
             </div>
-            <p className="mt-1 px-2 text-[10px]" style={{ color: "var(--text-faint)" }}>
+            <p
+              className="mt-1 px-2 text-[10px]"
+              style={{ color: "var(--text-faint)" }}
+            >
               {filtered.length} of {models.length} models
             </p>
           </div>
@@ -1322,17 +1392,26 @@ function ToolCallChip({ seg }: { seg: ToolSegment }) {
       style={{ borderColor: "var(--warn)", background: "var(--surface-2)" }}
     >
       <div className="mono text-[11px]" style={{ color: "var(--warn)" }}>
-        {seg.complete ? "tool call (not executed)" : "tool call… (streaming)"} · {seg.name ?? "unknown"}
+        {seg.complete ? "tool call (not executed)" : "tool call… (streaming)"} ·{" "}
+        {seg.name ?? "unknown"}
       </div>
       {entries.map(([k, v]) => (
-        <div key={k} className="mono mt-1 text-[11px] break-all" style={{ color: "var(--text-dim)" }}>
+        <div
+          key={k}
+          className="mono mt-1 text-[11px] break-all"
+          style={{ color: "var(--text-dim)" }}
+        >
           <span style={{ color: "var(--text-faint)" }}>{k}: </span>
           {v.length > 400 ? `${v.slice(0, 400)}…` : v}
         </div>
       ))}
       {seg.complete && (
-        <div className="mt-1.5 text-[11px]" style={{ color: "var(--text-faint)" }}>
-          Assistant has no tool layer — this was model output, not a real function call.
+        <div
+          className="mt-1.5 text-[11px]"
+          style={{ color: "var(--text-faint)" }}
+        >
+          Assistant has no tool layer — this was model output, not a real
+          function call.
         </div>
       )}
     </div>
@@ -1343,7 +1422,11 @@ function ToolCallChip({ seg }: { seg: ToolSegment }) {
 function AssistantContent({ raw }: { raw: string }) {
   const segs = useMemo(() => parseAssistantStream(raw), [raw]);
   if (segs.length === 0) {
-    return <span className="text-[13px]" style={{ color: "var(--text-faint)" }}>…</span>;
+    return (
+      <span className="text-[13px]" style={{ color: "var(--text-faint)" }}>
+        …
+      </span>
+    );
   }
   return (
     <>
@@ -1364,24 +1447,32 @@ function AssistantContent({ raw }: { raw: string }) {
  * `ComposerProps.seed`), so the card's copy and the model's instructions can say different things
  * without either lying.
  */
-const SUGGESTIONS: readonly { icon: string; title: string; blurb: string; prompt: string }[] = [
+const SUGGESTIONS: readonly {
+  icon: string;
+  title: string;
+  blurb: string;
+  prompt: string;
+}[] = [
   {
     icon: "code",
     title: "Explain this codebase",
     blurb: "Get a clear explanation of how this project works.",
-    prompt: "Explain this codebase: what it does, how it is structured, and where the key entry points are.",
+    prompt:
+      "Explain this codebase: what it does, how it is structured, and where the key entry points are.",
   },
   {
     icon: "bug",
     title: "Find and fix a bug",
     blurb: "Locate issues and propose fixes with code changes.",
-    prompt: "Find a bug in this project, explain the root cause, and propose a fix with code changes.",
+    prompt:
+      "Find a bug in this project, explain the root cause, and propose a fix with code changes.",
   },
   {
     icon: "doc",
     title: "Summarize recent changes",
     blurb: "Review commits, PRs, or file updates.",
-    prompt: "Summarize recent changes in this workspace: commits, pull requests, or file updates.",
+    prompt:
+      "Summarize recent changes in this workspace: commits, pull requests, or file updates.",
   },
 ];
 
@@ -1439,7 +1530,9 @@ function RootPane({
   };
   // Start the browse at the current root's parent, so the first thing you see is the folder you
   // are already in, among its siblings — the fastest route to "somewhere next to where I was".
-  const [browsePath, setBrowsePath] = useState(() => parentOf(root.trim() || "/"));
+  const [browsePath, setBrowsePath] = useState(() =>
+    parentOf(root.trim() || "/"),
+  );
   const [dirs, setDirs] = useState<string[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -1462,28 +1555,56 @@ function RootPane({
   const here = browsePath === root.trim();
 
   return (
-    <div className="mx-auto flex w-full max-w-3xl flex-col gap-4" data-testid="root-pane">
-      <div className="flex items-center gap-1.5 text-[12px]" style={{ color: "var(--text-dim)" }}>
+    <div
+      className="mx-auto flex w-full max-w-3xl flex-col gap-4"
+      data-testid="root-pane"
+    >
+      <div
+        className="flex items-center gap-1.5 text-[12px]"
+        style={{ color: "var(--text-dim)" }}
+      >
         <span className="shrink-0">Root:</span>
         <input
           value={root}
           onChange={(e) => onSetRoot(e.target.value)}
           placeholder="/absolute/path"
-          title={rootError ?? "Workspace root the agent's tools are confined to"}
+          title={
+            rootError ?? "Workspace root the agent's tools are confined to"
+          }
           className="min-w-0 flex-1 rounded border px-2 py-1 text-[12px]"
-          style={rootError ? { ...inputStyle, borderColor: "var(--danger)" } : inputStyle}
+          style={
+            rootError
+              ? { ...inputStyle, borderColor: "var(--danger)" }
+              : inputStyle
+          }
           aria-invalid={rootError ? true : undefined}
         />
       </div>
       {rootError ? (
-        <p className="-mt-2 text-[11px]" style={{ color: "var(--danger)" }} data-testid="root-pane-error">{rootError}</p>
+        <p
+          className="-mt-2 text-[11px]"
+          style={{ color: "var(--danger)" }}
+          data-testid="root-pane-error"
+        >
+          {rootError}
+        </p>
       ) : (
         <p className="-mt-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
-          An absolute path. Agent tools — reading, writing, shell — are confined to this folder; {sandboxPolicy ? `the sandbox allows ${sandboxPolicy.programs.length + sandboxPolicy.extra_programs.length} programs${sandboxPolicy.extra_programs.length ? ` (${sandboxPolicy.extra_programs.length} you added)` : ""}, capped at ${Math.round(sandboxPolicy.max_command_ms / 100) / 10}s per command.` : "the sandbox allowlist applies inside it."}
+          An absolute path. Agent tools — reading, writing, shell — are confined
+          to this folder;{" "}
+          {sandboxPolicy
+            ? `the sandbox allows ${sandboxPolicy.programs.length + sandboxPolicy.extra_programs.length} programs${sandboxPolicy.extra_programs.length ? ` (${sandboxPolicy.extra_programs.length} you added)` : ""}, capped at ${Math.round(sandboxPolicy.max_command_ms / 100) / 10}s per command.`
+            : "the sandbox allowlist applies inside it."}
         </p>
       )}
-      <div className="rounded-xl border" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
-        <div className="flex items-center gap-2 border-b px-3 py-2" style={{ borderColor: "var(--border)" }}>
+      <div
+        className="rounded-xl border"
+        style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+      >
+        <div
+          className="flex items-center gap-2 border-b px-3 py-2"
+          style={{ borderColor: "var(--border)" }}
+        >
           <button
             type="button"
             onClick={() => setBrowsePath(parentOf(browsePath))}
@@ -1493,11 +1614,23 @@ function RootPane({
             className="nav-icon-btn flex h-7 w-7 shrink-0 items-center justify-center rounded-md disabled:opacity-40"
             style={{ color: "var(--text-dim)" }}
           >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className="h-3.5 w-3.5" aria-hidden="true">
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.7"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="h-3.5 w-3.5"
+              aria-hidden="true"
+            >
               <path d="M12 19V5m-6 6 6-6 6 6" />
             </svg>
           </button>
-          <span className="mono min-w-0 flex-1 truncate text-[12px]" title={browsePath}>
+          <span
+            className="mono min-w-0 flex-1 truncate text-[12px]"
+            title={browsePath}
+          >
             {browsePath}
           </span>
           <button
@@ -1505,10 +1638,23 @@ function RootPane({
             onClick={() => onSetRoot(browsePath)}
             disabled={here}
             className={`nav-icon-btn flex shrink-0 items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[11px] disabled:opacity-60`}
-            style={here ? { borderColor: "var(--border)", color: "var(--success)" } : { borderColor: "var(--border)", color: "var(--accent)" }}
+            style={
+              here
+                ? { borderColor: "var(--border)", color: "var(--success)" }
+                : { borderColor: "var(--border)", color: "var(--accent)" }
+            }
           >
             {here ? (
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-3 w-3" aria-hidden="true">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className="h-3 w-3"
+                aria-hidden="true"
+              >
                 <path d="m4.5 12.5 5 5 10-11" />
               </svg>
             ) : null}
@@ -1518,11 +1664,18 @@ function RootPane({
         <div className="grid max-h-[340px] grid-cols-2 gap-1 overflow-y-auto p-2 sm:grid-cols-3">
           {dirs === null && !loadError && (
             <div className="col-span-full px-2 py-3">
-              <span className="spinner" role="status" aria-label="Listing folders" />
+              <span
+                className="spinner"
+                role="status"
+                aria-label="Listing folders"
+              />
             </div>
           )}
           {loadError && (
-            <p className="col-span-full px-2 py-3 text-[11px]" style={{ color: "var(--danger)" }}>
+            <p
+              className="col-span-full px-2 py-3 text-[11px]"
+              style={{ color: "var(--danger)" }}
+            >
               {loadError}
             </p>
           )}
@@ -1530,19 +1683,35 @@ function RootPane({
             <button
               key={d}
               type="button"
-              onClick={() => setBrowsePath(`${browsePath === "/" ? "" : browsePath}/${d}`)}
+              onClick={() =>
+                setBrowsePath(`${browsePath === "/" ? "" : browsePath}/${d}`)
+              }
               className="nav-item flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-left text-[12px]"
               style={{ color: "var(--text-dim)" }}
             >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" className="h-3.5 w-3.5 shrink-0" style={{ color: "var(--accent)" }} aria-hidden="true">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.6"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className="h-3.5 w-3.5 shrink-0"
+                style={{ color: "var(--accent)" }}
+                aria-hidden="true"
+              >
                 <path d="M3.5 7.5h6l2 2.5h9v8.5h-17v-11Z" />
               </svg>
               <span className="truncate">{d}</span>
             </button>
           ))}
           {dirs?.length === 0 && (
-            <p className="col-span-full px-2 py-3 text-[11px]" style={{ color: "var(--text-faint)" }}>
-              No subfolders here — this is a leaf. Set it as the root, or go up a level.
+            <p
+              className="col-span-full px-2 py-3 text-[11px]"
+              style={{ color: "var(--text-faint)" }}
+            >
+              No subfolders here — this is a leaf. Set it as the root, or go up
+              a level.
             </p>
           )}
         </div>
@@ -1560,6 +1729,7 @@ function Chat({
   noTools,
   agentMode,
   useMemory,
+  autoCompact,
   maxIterations,
   subagentsCanWrite,
   subagentsSummaryCap,
@@ -1588,6 +1758,8 @@ function Chat({
   noTools: boolean;
   agentMode: boolean;
   useMemory: boolean;
+  /** Automatic compaction is on unless the user turned it off; see `AssistantSettings`. */
+  autoCompact: boolean;
   /** The user's step budget, or null for no ceiling (the default). */
   maxIterations: number | null;
   /** Whether a delegated sub-agent may modify the workspace. Owned by `AssistantScreen` (it is
@@ -1646,7 +1818,9 @@ function Chat({
   // The empty-state suggestion cards fill the draft through this. `{ text, nonce }` claimed by the
   // composer (see `ComposerProps.seed`); bumping the nonce re-fills even when the text is identical,
   // which is what clicking the same card twice has to do.
-  const [seed, setSeed] = useState<{ text: string; nonce: number } | undefined>(undefined);
+  const [seed, setSeed] = useState<{ text: string; nonce: number } | undefined>(
+    undefined,
+  );
   // (`model` lives in `AssistantScreen` now — see the note on the `chosen` prop — so the Run
   // configuration card and this transcript cannot disagree about where a turn goes.)
   const [msgs, setMsgs] = useState<Msg[]>(() => {
@@ -1678,7 +1852,9 @@ function Chat({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState("");
   const [trace, setTrace] = useState<Trace | null>(null);
-  const [finishReason, setFinishReason] = useState<string | undefined>(undefined);
+  const [finishReason, setFinishReason] = useState<string | undefined>(
+    undefined,
+  );
   const [showTrace, setShowTrace] = useState(false);
   const [busy, setBusy] = useState(false);
   // Plans are no longer inferred from an answer's text. `exit_plan_mode` carries the plan, the
@@ -1704,7 +1880,11 @@ function Chat({
   const [turnInstruction, setTurnInstruction] = useState("");
   /** A one-line notice: a refused attachment, a mention that matched nothing. */
   const [notice, setNotice] = useState<string | null>(null);
-  const [pendingConfirm, setPendingConfirm] = useState<{ call: ToolCall; args: Record<string, unknown>; resolve: (choice: ApprovalChoice) => void } | null>(null);
+  const [pendingConfirm, setPendingConfirm] = useState<{
+    call: ToolCall;
+    args: Record<string, unknown>;
+    resolve: (choice: ApprovalChoice) => void;
+  } | null>(null);
   /**
    * The two plan-mode interactions the loop can raise, or null.
    *
@@ -1717,7 +1897,9 @@ function Chat({
     plan: string;
     resolve: (decision: { approved: boolean; feedback?: string }) => void;
   } | null>(null);
-  const [pendingPlanEntry, setPendingPlanEntry] = useState<{ resolve: (ok: boolean) => void } | null>(null);
+  const [pendingPlanEntry, setPendingPlanEntry] = useState<{
+    resolve: (ok: boolean) => void;
+  } | null>(null);
   /**
    * Whether the pass in flight started in plan mode. A ref, not state: the loop's correction for a
    * stale plan framing is computed per request inside the run, and the state value lags the flip.
@@ -1730,7 +1912,10 @@ function Chat({
    * conversation (and, for "this session", expires with the app anyway), not a persisted setting.
    * The mode is the persisted half; see `AssistantSettings`.
    */
-  const [granted, setGranted] = useState<{ trustedTools: ReadonlySet<string>; allowAll: boolean }>({
+  const [granted, setGranted] = useState<{
+    trustedTools: ReadonlySet<string>;
+    allowAll: boolean;
+  }>({
     trustedTools: new Set(),
     allowAll: false,
   });
@@ -1755,11 +1940,19 @@ function Chat({
   const [lastUsage, setLastUsage] = useState<UsageTokens | null>(null);
   // Tokens this agent run has spent so far — every model call in the loop reports, and the live
   // status line sums them. `lastUsage` stays the single-request readout the meter's tooltip uses.
-  const [runUsage, setRunUsage] = useState<{ tokensIn: number; tokensOut: number }>({ tokensIn: 0, tokensOut: 0 });
+  const [runUsage, setRunUsage] = useState<{
+    tokensIn: number;
+    tokensOut: number;
+  }>({ tokensIn: 0, tokensOut: 0 });
   // `unpricedRows`/`rows` are the honesty inputs for the cost figure: a total that silently skips
   // the requests whose model published no price is a number the user cannot tell apart from a
   // complete one, and this app treats "unknown" and "free" as different facts everywhere else.
-  const [sessionCost, setSessionCost] = useState<{ micros: number; rows: number; unpriced: number; unreported: number }>({
+  const [sessionCost, setSessionCost] = useState<{
+    micros: number;
+    rows: number;
+    unpriced: number;
+    unreported: number;
+  }>({
     micros: 0,
     rows: 0,
     unpriced: 0,
@@ -1788,6 +1981,52 @@ function Chat({
   const ctxRef = useRef<Recorder | null>(null);
   if (!ctxRef.current) ctxRef.current = activeSession();
   const lastNodeRef = useRef<string | null>(null);
+  /**
+   * The manifest the last turn ran with. `manifest` is what the screen echoes — every entry,
+   * included or not, so a contradicted capability can be shown as stale — while `manifestRef`
+   * mirrors it for the turn's async closures, the same rule as `skillOverridesRef`: a closure
+   * must read the manifest built for THAT turn, not the render that sent it.
+   */
+  const [manifest, setManifest] = useState<ComposedManifest | null>(null);
+  const manifestRef = useRef<ComposedManifest | null>(null);
+  manifestRef.current = manifest;
+
+  // The manifest tools read the per-turn composition the screen already holds; deletion goes
+  // through the same store call the Memory screen uses, then removes the row from the card
+  // immediately so the echo cannot disagree with the store for the rest of the session.
+  const manifestPort = useMemo(
+    () => ({
+      read: async () =>
+        (manifestRef.current?.entries ?? []).map((e) => ({
+          id: e.id,
+          kind: e.kind,
+          text: e.text,
+          scope: e.scope.global
+            ? "global"
+            : e.scope.agent
+              ? `agent:${e.scope.agent}`
+              : e.scope.project
+                ? `project:${e.scope.project}`
+                : "unscoped",
+          verified: e.kind === "capability" ? e.verified : null,
+        })),
+      forget: async (id: string) => {
+        const ok = await forgetMemory(id);
+        if (ok) {
+          const next = manifestRef.current
+            ? {
+                ...manifestRef.current,
+                entries: manifestRef.current.entries.filter((e) => e.id !== id),
+              }
+            : null;
+          manifestRef.current = next;
+          setManifest(next);
+        }
+        return ok;
+      },
+    }),
+    [],
+  );
   /**
    * The durable transcript's next sequence number (0027).
    *
@@ -1830,15 +2069,23 @@ function Chat({
   // `manualRefs` is what the user pinned by hand, and `dismissedUrls` what they removed (a scan
   // would otherwise resurrect a dismissed link on the next transcript change).
   const [manualRefs, setManualRefs] = useState<SessionReference[]>([]);
-  const [dismissedUrls, setDismissedUrls] = useState<ReadonlySet<string>>(new Set());
+  const [dismissedUrls, setDismissedUrls] = useState<ReadonlySet<string>>(
+    new Set(),
+  );
   const autoRefs = useMemo(() => refsFromMessages(msgs), [msgs]);
   const sessionRefs = useMemo(
-    () => addReferences(autoRefs, manualRefs).filter((r) => !dismissedUrls.has(r.url)),
+    () =>
+      addReferences(autoRefs, manualRefs).filter(
+        (r) => !dismissedUrls.has(r.url),
+      ),
     [autoRefs, manualRefs, dismissedUrls],
   );
   // The block every reply's system turn carries, plain and agent paths alike: a link pasted in
   // turn one is still the session's source in turn ten.
-  const referencesBlockText = useMemo(() => referencesBlock(sessionRefs), [sessionRefs]);
+  const referencesBlockText = useMemo(
+    () => referencesBlock(sessionRefs),
+    [sessionRefs],
+  );
   useEffect(() => {
     listSkills()
       .then((all) => {
@@ -1859,15 +2106,30 @@ function Chat({
   // before the usage chunk reports nothing — honest, since those tokens were mostly never billed.
   const sessionUsageRef = useRef(emptySessionUsage());
   const addSessionUsage = useCallback(
-    (tokensIn: number, tokensOut: number, provider: string | undefined, model: string | undefined) => {
+    (
+      tokensIn: number,
+      tokensOut: number,
+      provider: string | undefined,
+      model: string | undefined,
+    ) => {
       // Same rule Activity's rows use: a turn's cost is only meaningful when the catalog knows a
       // price for the model that actually served it (the served ids are exactly what pricingFor
       // wants — provider id + native id, per the bridge's Served frame). Without this check an
       // unpriced model contributes 0 and the total reads as though the request were free.
-      const pricing = provider && model ? catalog.pricingFor(provider, model) : undefined;
-      sessionUsageRef.current = chargeSessionUsage(sessionUsageRef.current, { tokensIn, tokensOut, pricing });
+      const pricing =
+        provider && model ? catalog.pricingFor(provider, model) : undefined;
+      sessionUsageRef.current = chargeSessionUsage(sessionUsageRef.current, {
+        tokensIn,
+        tokensOut,
+        pricing,
+      });
       const u = sessionUsageRef.current;
-      setSessionCost({ micros: u.micros, rows: u.rows, unpriced: u.unpriced, unreported: u.unreported });
+      setSessionCost({
+        micros: u.micros,
+        rows: u.rows,
+        unpriced: u.unpriced,
+        unreported: u.unreported,
+      });
       setSessionTokensIn(u.tokensIn);
       setSessionTokensOut(u.tokensOut);
     },
@@ -1936,8 +2198,14 @@ function Chat({
   //
   // The handler reads through refs and is bound once per `active` change: its dependencies are
   // `busy`, `newChat` and the abort controller, all of which change constantly while streaming.
-  const keyActions = useRef<{ newChat: () => void; stop: () => void; busy: boolean }>({
-    newChat, stop: () => undefined, busy,
+  const keyActions = useRef<{
+    newChat: () => void;
+    stop: () => void;
+    busy: boolean;
+  }>({
+    newChat,
+    stop: () => undefined,
+    busy,
   });
   keyActions.current = { newChat, stop: stopRun, busy };
   useEffect(() => {
@@ -1975,7 +2243,8 @@ function Chat({
   const onListScroll = useCallback(() => {
     const el = listRef.current;
     if (!el) return;
-    const near = el.scrollHeight - el.scrollTop - el.clientHeight <= STICK_THRESHOLD_PX;
+    const near =
+      el.scrollHeight - el.scrollTop - el.clientHeight <= STICK_THRESHOLD_PX;
     atBottomRef.current = near;
     setAtBottom(near);
   }, []);
@@ -2009,7 +2278,9 @@ function Chat({
   // router was separately planning against 200k for the same model.
   const modelWindow = useMemo(() => {
     if (!chosen) return null;
-    const nativeId = chosen.includes("/") ? chosen.split("/").slice(1).join("/") : chosen;
+    const nativeId = chosen.includes("/")
+      ? chosen.split("/").slice(1).join("/")
+      : chosen;
     const windows = catalog
       .all()
       .filter((m) => m.nativeId === nativeId && m.modality === "text")
@@ -2038,15 +2309,32 @@ function Chat({
     const all: ChatMessage[] = [
       ...(systemText ? [{ role: "system" as const, content: systemText }] : []),
       ...replayHistory(msgs),
-      ...(draftText.trim() ? [{ role: "user" as const, content: draftText }] : []),
+      ...(draftText.trim()
+        ? [{ role: "user" as const, content: draftText }]
+        : []),
     ];
     return estimateTokens(all);
-  }, [msgs, draftText, turnInstruction, tick, agentMode, noTools, root, agentSystemPrompt, skillsBlock, referencesBlockText, noToolsSystem, systemPrompt]);
+  }, [
+    msgs,
+    draftText,
+    turnInstruction,
+    tick,
+    agentMode,
+    noTools,
+    root,
+    agentSystemPrompt,
+    skillsBlock,
+    referencesBlockText,
+    noToolsSystem,
+    systemPrompt,
+  ]);
   // P7: context meter — fraction of the window consumed, or `null` when no carrier published a
   // window. A bar scaled to a number the catalog never claimed would be the same invention in a
   // different shape.
   const contextUsedRatio =
-    modelWindow === null ? null : Math.min(1, currentPromptTokens / modelWindow);
+    modelWindow === null
+      ? null
+      : Math.min(1, currentPromptTokens / modelWindow);
 
   /**
    * The composer's "Previous results" row: earlier answers in this conversation, newest first.
@@ -2130,37 +2418,101 @@ function Chat({
   // `approvalMode` would keep asking about reads after the user switched to auto-approve
   // mid-run. Reading the latest value is also what makes a modal's "always allow this tool" take
   // effect on the *next* call of the same run, which is the only reason that button exists.
-  const approvalRef = useRef<ApprovalState>({ ...INITIAL_APPROVAL, mode: approvalMode });
-  approvalRef.current = { mode: approvalMode, planMode, trustedTools: granted.trustedTools, allowAll: granted.allowAll };
+  const approvalRef = useRef<ApprovalState>({
+    ...INITIAL_APPROVAL,
+    mode: approvalMode,
+  });
+  approvalRef.current = {
+    mode: approvalMode,
+    planMode,
+    trustedTools: granted.trustedTools,
+    allowAll: granted.allowAll,
+  };
 
-  const handleAgentEvent = useCallback((ev: AgentEvent) => {
-    // One fold for the whole timeline: `applyAgentEvent` owns the ordering rules (thinking and
-    // prose accumulate into their trailing segment, a call opens a tool segment, a result fills
-    // the last one still calling), and it is unit-tested there against no DOM at all. The ref is
-    // updated alongside the state because `onReplaceTranscript` reads it from the turn's async
-    // tail, outside any render this closure could see.
-    const next = applyAgentEvent(timelineRef.current, ev);
+  const pendingAgentText = useRef<{
+    type: "assistant" | "reasoning";
+    text: string;
+  } | null>(null);
+  const agentPaintTimer = useRef<number | null>(null);
+
+  /** Fold buffered prose/reasoning into the timeline. Consecutive deltas become one event; the
+   *  old path ran one React render and one growing markdown parse per token. */
+  const flushAgentText = useCallback(() => {
+    if (agentPaintTimer.current !== null) {
+      window.clearTimeout(agentPaintTimer.current);
+      agentPaintTimer.current = null;
+    }
+    const pending = pendingAgentText.current;
+    if (!pending) return;
+    pendingAgentText.current = null;
+    const next = applyAgentEvent(timelineRef.current, pending as AgentEvent);
     timelineRef.current = next;
     setTimeline(next);
+  }, []);
 
-    if (ev.type === "tool_call") {
-      // The progress capsule's data source: `todo_write` carries the whole list in its arguments,
-      // so the panel can update the moment the call arrives rather than after the result lands.
-      if ((ev.call.name ?? "") === "todo_write") {
-        const parsed = tryParseArgs(ev.call.arguments);
-        const list = parsed?.todos;
-        if (Array.isArray(list)) {
-          setTodos(
-            list
-              .filter((t): t is { content: string; status: TodoItem["status"] } =>
-                typeof t?.content === "string" &&
-                (t?.status === "pending" || t?.status === "in_progress" || t?.status === "completed"))
-              .map((t) => ({ content: t.content, status: t.status })),
-          );
+  useEffect(
+    () => () => {
+      if (agentPaintTimer.current !== null)
+        window.clearTimeout(agentPaintTimer.current);
+    },
+    [],
+  );
+
+  const handleAgentEvent = useCallback(
+    (ev: AgentEvent) => {
+      // Prose and reasoning paint at most every 50 ms. Tool events flush first, so the timeline
+      // keeps the model's order: text that arrived before a call lands before that call.
+      if (ev.type === "assistant" || ev.type === "reasoning") {
+        const pending = pendingAgentText.current;
+        if (pending && pending.type === ev.type) {
+          pending.text += ev.text;
+        } else {
+          if (pending) flushAgentText();
+          pendingAgentText.current = { type: ev.type, text: ev.text };
+        }
+        if (agentPaintTimer.current === null) {
+          agentPaintTimer.current = window.setTimeout(() => {
+            agentPaintTimer.current = null;
+            flushAgentText();
+          }, 50);
+        }
+        return;
+      }
+
+      flushAgentText();
+      // One fold for the whole timeline: `applyAgentEvent` owns the ordering rules (thinking and
+      // prose accumulate into their trailing segment, a call opens a tool segment, a result fills
+      // the last one still calling), and it is unit-tested there against no DOM at all. The ref is
+      // updated alongside the state because `onReplaceTranscript` reads it from the turn's async
+      // tail, outside any render this closure could see.
+      const next = applyAgentEvent(timelineRef.current, ev);
+      timelineRef.current = next;
+      setTimeline(next);
+
+      if (ev.type === "tool_call") {
+        // The progress capsule's data source: `todo_write` carries the whole list in its arguments,
+        // so the panel can update the moment the call arrives rather than after the result lands.
+        if ((ev.call.name ?? "") === "todo_write") {
+          const parsed = tryParseArgs(ev.call.arguments);
+          const list = parsed?.todos;
+          if (Array.isArray(list)) {
+            setTodos(
+              list
+                .filter(
+                  (t): t is { content: string; status: TodoItem["status"] } =>
+                    typeof t?.content === "string" &&
+                    (t?.status === "pending" ||
+                      t?.status === "in_progress" ||
+                      t?.status === "completed"),
+                )
+                .map((t) => ({ content: t.content, status: t.status })),
+            );
+          }
         }
       }
-    }
-  }, []);
+    },
+    [flushAgentText],
+  );
 
   /**
    * The plan-mode ports the loop calls into (`lib/tools/types.ts` states the contract).
@@ -2184,7 +2536,10 @@ function Chat({
     requestApproval: (plan, signal) =>
       new Promise((resolve) => {
         if (signal?.aborted) {
-          resolve({ approved: false, feedback: "the run was stopped before the plan was reviewed" });
+          resolve({
+            approved: false,
+            feedback: "the run was stopped before the plan was reviewed",
+          });
           return;
         }
         setPendingPlanReview({ plan, resolve });
@@ -2192,7 +2547,10 @@ function Chat({
           "abort",
           () => {
             setPendingPlanReview(null);
-            resolve({ approved: false, feedback: "the run was stopped before the review finished" });
+            resolve({
+              approved: false,
+              feedback: "the run was stopped before the review finished",
+            });
           },
           { once: true },
         );
@@ -2213,7 +2571,8 @@ function Chat({
           { once: true },
         );
       }),
-    persist: (plan) => savePlan(root.trim(), ctxRef.current?.sessionId ?? "", plan),
+    persist: (plan) =>
+      savePlan(root.trim(), ctxRef.current?.sessionId ?? "", plan),
   };
 
   /**
@@ -2227,28 +2586,60 @@ function Chat({
    * The sequence number is assigned here rather than by the engine: the engine knows what the turn
    * was, the screen knows which session it belongs to and where that session's transcript ends.
    */
-  const appendTranscript = useCallback(
-    (entries: TranscriptEntry[]) => {
-      const session = ctxRef.current?.sessionId;
-      if (!session || entries.length === 0) return;
-      const ts = Date.now();
-      const rows = entries.map((e) => ({
-        sessionId: session,
-        seq: ++transcriptSeqRef.current,
-        role: e.role,
-        content: e.content,
-        toolCalls: e.toolCalls ?? null,
-        toolCallId: e.toolCallId ?? null,
-        reasoning: e.reasoning ?? null,
-        attachments: e.attachments ?? null,
-        model: e.model ?? null,
-        memoryRefs: e.memoryRefs ?? null,
-        ts,
-      }));
-      void transcriptAppend(rows).catch(() => undefined);
-    },
-    [],
-  );
+  const appendTranscript = useCallback((entries: TranscriptEntry[]) => {
+    const session = ctxRef.current?.sessionId;
+    if (!session || entries.length === 0) return;
+    const ts = Date.now();
+    const rows = entries.map((e) => ({
+      sessionId: session,
+      seq: ++transcriptSeqRef.current,
+      role: e.role,
+      content: e.content,
+      toolCalls: e.toolCalls ?? null,
+      toolCallId: e.toolCallId ?? null,
+      reasoning: e.reasoning ?? null,
+      attachments: e.attachments ?? null,
+      model: e.model ?? null,
+      memoryRefs: e.memoryRefs ?? null,
+      ts,
+    }));
+    void transcriptAppend(rows).catch(() => undefined);
+  }, []);
+
+  /**
+   * Write the visible transcript as the session's transcript. Used by the operations that remove
+   * or rewrite turns — edit, retry, delete, compaction, fork — where appending would leave the
+   * abandoned tail in the database and bring it back on resume.
+   */
+  const replaceTranscript = useCallback((next: Msg[]) => {
+    const session = ctxRef.current?.sessionId;
+    if (!session) return;
+    const ts = Date.now();
+    const rows = next.map((m, i) => ({
+      sessionId: session,
+      seq: i + 1,
+      role: m.role,
+      content: m.content,
+      toolCalls: m.tool_calls ? JSON.stringify(m.tool_calls) : null,
+      toolCallId: m.tool_call_id ?? null,
+      reasoning: m.reasoning ?? null,
+      attachments:
+        m.attachments && m.attachments.length > 0
+          ? attachmentMeta(m.attachments)
+          : m.attachmentMeta && m.attachmentMeta.length > 0
+            ? JSON.stringify(m.attachmentMeta)
+            : null,
+      model: null,
+      memoryRefs:
+        m.recalledMemories && m.recalledMemories.length > 0
+          ? JSON.stringify(m.recalledMemories)
+          : null,
+      ts,
+    }));
+    // The next append continues past the rewritten view, not past the rows just removed.
+    transcriptSeqRef.current = rows.length;
+    void transcriptReplace(session, rows).catch(() => undefined);
+  }, []);
 
   /**
    * The one turn runner. A fresh send, a retry and an edit-&-resend all funnel through here, so
@@ -2270,6 +2661,32 @@ function Chat({
     const perTurn = instructionSystemText(instruction);
     // An image-only turn is a real turn: the composer allows sending one, so the guard must too.
     if ((!trimmed && attachments.length === 0) || busy || !chosen) return;
+    // Automatic compaction, bound to the chosen model. `compressWithSummary` makes no model call
+    // when the history fits, so this is free on ordinary turns and pays only when the request
+    // would overflow. The manual `/compact` action remains the way to make it permanent.
+    const compactRequest = autoCompact
+      ? {
+          compact: (messages: readonly ChatMessage[], budgetTokens: number) =>
+            compressWithSummary(
+              messages,
+              budgetTokens,
+              createSummarizer(chosen),
+            ),
+          compactBudget: Math.max(
+            256,
+            Math.floor((modelWindow ?? DEFAULT_CONTEXT_WINDOW) * 0.75),
+          ),
+          onCompacted: (info: {
+            dropped: number;
+            beforeTokens: number;
+            afterTokens: number;
+          }) =>
+            setNotice(
+              `Auto-compacted ${info.dropped} earlier message${info.dropped === 1 ? "" : "s"} ` +
+                `(${info.beforeTokens} → ${info.afterTokens} tokens) before this turn.`,
+            ),
+        }
+      : {};
 
     /**
      * A model that cannot see, handed an image — read it with one that can.
@@ -2282,7 +2699,9 @@ function Chat({
      * Nothing here is silent. A failure to read, or no vision model at all, stops the turn with a
      * sentence in the transcript instead of sending an image upstream to be ignored or rejected.
      */
-    const imageAttachments = attachments.filter((a) => a.mediaType.startsWith("image/"));
+    const imageAttachments = attachments.filter((a) =>
+      a.mediaType.startsWith("image/"),
+    );
     let wireText = trimmed;
     let wireAttachments = attachments;
     let imageReadings: { name: string; description: string }[] | undefined;
@@ -2296,7 +2715,9 @@ function Chat({
         );
         return;
       }
-      setNotice(`${visionHelper} is reading ${imageAttachments.length === 1 ? "the image" : "the images"}…`);
+      setNotice(
+        `${visionHelper} is reading ${imageAttachments.length === 1 ? "the image" : "the images"}…`,
+      );
       const readings: ImageReading[] = [];
       try {
         for (const img of imageAttachments) {
@@ -2337,18 +2758,25 @@ function Chat({
           readings.push({ name: img.name, description: description.trim() });
         }
       } catch (e) {
-        setNotice(`${visionHelper} could not read the image: ${(e as Error).message}. The turn was not sent.`);
+        setNotice(
+          `${visionHelper} could not read the image: ${(e as Error).message}. The turn was not sent.`,
+        );
         return;
       }
-      wireText = `${trimmed}\n\n${imageContextBlock(readings, visionHelper)}`.trim();
-      wireAttachments = attachments.filter((a) => !a.mediaType.startsWith("image/"));
+      wireText =
+        `${trimmed}\n\n${imageContextBlock(readings, visionHelper)}`.trim();
+      wireAttachments = attachments.filter(
+        (a) => !a.mediaType.startsWith("image/"),
+      );
       // Recorded on the MESSAGE as well as on the wire. The image stays on this turn, so every
       // later turn re-sends it — and `replayHistory` rebuilds content from the message, which is
       // the only thing that survives to the second turn. Without this, a follow-up would put image
       // bytes on the wire for a model that cannot read them.
       imageReadings = readings;
       imagesReadBy = visionHelper;
-      setNotice(`Read by ${visionHelper}. ${chosen} will answer from that reading.`);
+      setNotice(
+        `Read by ${visionHelper}. ${chosen} will answer from that reading.`,
+      );
     }
 
     const userMsg: Msg = {
@@ -2360,11 +2788,17 @@ function Chat({
       ...(imageReadings ? { imageReadings } : {}),
       ...(imagesReadBy ? { imagesReadBy } : {}),
     };
-    const assistantMsg: Msg = { id: newMsgId(), role: "assistant", content: "" };
+    const assistantMsg: Msg = {
+      id: newMsgId(),
+      role: "assistant",
+      content: "",
+    };
     // This turn's own links are folded into the references here: the derived list was computed
     // from the pre-send transcript, so the reply that introduces a source is exactly the reply
     // that would otherwise not read it. First origin wins — a URL the user pasted stays theirs.
-    const turnReferencesBlock = referencesBlock(addReferences(sessionRefs, refsFromMessages([userMsg])));
+    const turnReferencesBlock = referencesBlock(
+      addReferences(sessionRefs, refsFromMessages([userMsg])),
+    );
     setMsgs([...baseMsgs, userMsg, assistantMsg]);
     // A send, retry or edit is a deliberate action: re-anchor to the bottom even if the user had
     // scrolled up, so the reply they just asked for is what they see arrive.
@@ -2378,10 +2812,16 @@ function Chat({
         approvalState: () => approvalRef.current,
         escalate: (next) => {
           approvalRef.current = next;
-          setGranted({ trustedTools: next.trustedTools, allowAll: next.allowAll });
+          setGranted({
+            trustedTools: next.trustedTools,
+            allowAll: next.allowAll,
+          });
         },
       },
-      { onConfirmRequest: setPendingConfirm, onConfirmCleared: () => setPendingConfirm(null) },
+      {
+        onConfirmRequest: setPendingConfirm,
+        onConfirmCleared: () => setPendingConfirm(null),
+      },
     );
     const ac = turn.controller;
     const t0 = Date.now();
@@ -2396,12 +2836,51 @@ function Chat({
     // would otherwise read is one render behind the flip it is correcting.
     passStartedInPlanModeRef.current = planPass;
 
+    // The session manifest: the always-carried header, composed once and verified against what
+    // this app can actually do. Built before the branch so both paths send the same block, and
+    // best-effort — a failed memory or policy read yields an empty manifest, never a failed turn.
+    // A blank root is no workspace, so there is no scope to read; the agent branch's own guard
+    // still refuses the turn outright.
+    let nextManifest: ComposedManifest | null = null;
+    if (useMemory && root.trim()) {
+      nextManifest = await buildManifest(
+        root.trim(),
+        agentMode ? "agent" : "plain",
+        {
+          list: (r) => listScopedMemories({ projectRoot: r, limit: 200 }),
+          related: (r) => listSourceSessions({ root: r, limit: 8 }),
+          tools: AGENT_TOOLS.map((t) => t.name),
+          // The full surface, not the chat mode's: a plain-chat claim about git is still a claim
+          // about this app, and the controller's ruling is that the mode must not blank the lists.
+          policy: await fetchToolsPolicy().catch(() => ({
+            git_subcommands: [] as string[],
+          })),
+        },
+      ).catch(() => ({ entries: [], block: "", tokens: 0, related: [] }));
+    }
+    // Rows the header actually carries, plus *every* capability row. A capability that is
+    // contradicted or unverified is deliberately absent from the block, but it must not re-enter
+    // through relevance recall either: "never trust a capability as text" applies to both paths.
+    // Project facts stay out of both sets, so recall remains their path.
+    const manifestIds: ReadonlySet<string> = new Set(
+      (nextManifest?.entries ?? [])
+        .filter((e) => e.included || e.kind === "capability")
+        .map((e) => e.id),
+    );
+    // Written unconditionally: switching memory off must not keep the previous turn's header.
+    manifestRef.current = nextManifest;
+    setManifest(nextManifest);
+
     // ---- Agent mode: run the loop, execute tools through the sandbox, confirm each call. ----
     if (agentMode) {
       if (!root.trim()) {
         // Undo the optimistic append: the turn never ran, so it must not sit in the transcript.
         setMsgs(baseMsgs);
-        setTrace({ ms: 0, fallbacks: [], error: "set a workspace root before using agent mode" });
+        setTrace({
+          ms: 0,
+          fallbacks: [],
+          error: "set a workspace root before using agent mode",
+        });
         setBusy(false);
         setStopping(false);
         // The turn never ran, so there is no pass whose framing could go stale.
@@ -2424,6 +2903,9 @@ function Chat({
           model: chosen,
           perTurn,
           useMemory,
+          // The verified header for this turn, built above from the scoped rows and live policy.
+          manifestBlock: nextManifest?.block ?? "",
+          ...compactRequest,
           signal: ac.signal,
           startedAt: t0,
           assistantMsgId: assistantMsg.id,
@@ -2436,7 +2918,8 @@ function Chat({
           // The plan-mode facilities: the review modal, the mode switch the gate reads, and the
           // plan file. `exit_plan_mode` / `enter_plan_mode` are settled in the loop against these.
           plan: planPorts,
-          temperature: typeof temperature === "number" ? temperature : undefined,
+          temperature:
+            typeof temperature === "number" ? temperature : undefined,
           maxTokens: typeof maxTokens === "number" ? maxTokens : undefined,
           thinking,
           // Already the parsed shape (`number | null`); the clamp happened when it was typed or
@@ -2454,9 +2937,13 @@ function Chat({
           // legitimate work short, which is exactly the "hit its step budget" complaint. The
           // clamp keeps a corrupted setting from reading as "run one step".
           subagentMaxIterations: (() => {
-            const raw = (router.settings as typeof router.settings & { defaults?: Record<string, string> })
-              .defaults?.subagentIterations;
-            const n = typeof raw === "string" && raw.trim() !== "" ? Number(raw) : NaN;
+            const raw = (
+              router.settings as typeof router.settings & {
+                defaults?: Record<string, string>;
+              }
+            ).defaults?.subagentIterations;
+            const n =
+              typeof raw === "string" && raw.trim() !== "" ? Number(raw) : NaN;
             return Number.isFinite(n) && n >= 1 ? Math.floor(n) : undefined;
           })(),
           // Whether a delegated child may modify the workspace, and how much of its summary comes
@@ -2473,7 +2960,11 @@ function Chat({
           // not available to the run, and saying so beats serving stale instructions.
           loadSkill: async (name) => {
             const all = await listSkills().catch(() => [] as Skill[]);
-            const hit = resolveSessionSkill(all, skillOverridesRef.current, name);
+            const hit = resolveSessionSkill(
+              all,
+              skillOverridesRef.current,
+              name,
+            );
             if (!hit) return null;
             setUsedSkills((u) => recordSkillUse(u, hit, Date.now()));
             return hit.body;
@@ -2483,7 +2974,9 @@ function Chat({
           // wrote or disabled is honored by the very next turn without a restart.
           subagentDefs: await agentDefsList()
             .catch(() => [] as { fileName: string; contentJson: string }[])
-            .then((files) => parseSubagentDefs(files).defs.filter((d) => d.enabled)),
+            .then((files) =>
+              parseSubagentDefs(files).defs.filter((d) => d.enabled),
+            ),
           // Agent-mode image generation is served by the gateway's `/v1/images/generations`,
           // default model from Router Settings → defaults. A provider that answers with a link
           // has its bytes pulled through the host's scoped fetch, so the loop always receives
@@ -2491,21 +2984,34 @@ function Chat({
           generateImage: (prompt, model, signal) => {
             const chosenImage =
               model ||
-              (router.settings as typeof router.settings & { defaults?: Record<string, string> }).defaults?.image ||
+              (
+                router.settings as typeof router.settings & {
+                  defaults?: Record<string, string>;
+                }
+              ).defaults?.image ||
               "";
             if (!chosenImage) {
               return Promise.reject(
-                new Error("no image model is configured — pick one in Router Settings → defaults"),
+                new Error(
+                  "no image model is configured — pick one in Router Settings → defaults",
+                ),
               );
             }
-            return gatewayGenerateImage({ model: chosenImage, prompt }, { signal }).then(async (res) => {
+            return gatewayGenerateImage(
+              { model: chosenImage, prompt },
+              { signal },
+            ).then(async (res) => {
               if (res.base64) return { base64: res.base64 };
               if (res.url) {
                 const dataUri = await fetchImageUrl(res.url);
                 const comma = dataUri.indexOf(",");
-                return { base64: comma >= 0 ? dataUri.slice(comma + 1) : dataUri };
+                return {
+                  base64: comma >= 0 ? dataUri.slice(comma + 1) : dataUri,
+                };
               }
-              throw new Error("the provider returned neither image bytes nor a link");
+              throw new Error(
+                "the provider returned neither image bytes nor a link",
+              );
             });
           },
           // The session image cache: every image the loop attaches gets a second, app-side copy
@@ -2513,12 +3019,15 @@ function Chat({
           // file being cleaned. Null on any failure — the receipt then simply carries no cache
           // line, which is the old behaviour.
           cacheImage: (mediaType, base64) =>
-            invoke<string>("image_cache_write", { mediaType, base64 }).catch(() => null),
+            invoke<string>("image_cache_write", { mediaType, base64 }).catch(
+              () => null,
+            ),
           // The session store behind list_sessions / search_sessions / read_session: the same
           // history commands the History screen reads, normalized to the loop's camelCase shape.
           // Mapping here rather than in the loop keeps the loop ignorant of which backend served
           // the rows — and a failure here surfaces as the tool's "session lookup failed" result,
           // not as a broken turn.
+          manifest: manifestPort,
           sessions: {
             list: (limit) =>
               invoke<
@@ -2590,15 +3099,50 @@ function Chat({
                 })),
               ),
           },
+          // The foreign-agent session surface behind search_agents / load_session: the host's
+          // `/admin/sources*` routes, mapped to the loop's camelCase shape. Read-only on the foreign
+          // store — load_session is the only write, and it is the host's consenting import route.
+          sources: {
+            listSources: () =>
+              invoke<{ name: string; available: boolean; sessionCount: number; note: string | null }[]>(
+                "admin_sources_list",
+              ).catch(() => []),
+            searchSessions: (query, root, limit) =>
+              invoke<
+                {
+                  source: string; nativeId: string; title: string | null; root: string | null;
+                  turns: number; preview: string; importId: string | null;
+                }[]
+              >("admin_source_sessions", { source: null, query, root, limit }).then((rows) =>
+                rows.map((r) => ({
+                  source: r.source, nativeId: r.nativeId, title: r.title, root: r.root,
+                  turns: r.turns, preview: r.preview, importId: r.importId,
+                })),
+              ),
+            importSession: (source, nativeId) =>
+              invoke<{ sessionId: string; turns: number }>("admin_source_import", {
+                source, native_id: nativeId,
+              }),
+          },
         },
         {
           generate: gatewayGenerate,
           recorder: ctxRef.current!,
           lastNode: lastNodeRef,
-          memory: { recall: recallContext, block: memoryBlock, recordRecall, remember: rememberTurn, distil: distilTurn },
+          memory: {
+            recall: (text: string) =>
+              recallContext(text, { root, excludeIds: manifestIds }),
+            block: memoryBlock,
+            recordRecall,
+            remember: rememberTurn,
+            distil: distilTurn,
+          },
           transcript: { append: appendTranscript },
           providerName: (id) => registry.getProvider(id)?.name,
-          patchMsg: (id, patch) => setMsgs((m) => m.map((x) => (x.id === id ? { ...x, ...patch } : x))),
+          patchMsg: (id, patch) =>
+            setMsgs((m) =>
+              m.map((x) => (x.id === id ? { ...x, ...patch } : x)),
+            ),
           onTrace: setTrace,
           onFinishReason: setFinishReason,
           onLastUsage: setLastUsage,
@@ -2607,7 +3151,13 @@ function Chat({
           clearAbort: () => turn.finish(),
           chargeUsage: addSessionUsage,
           now: Date.now,
-          orchestrator: { newRunId, startRun, registerAbort, recordStep, endRun },
+          orchestrator: {
+            newRunId,
+            startRun,
+            registerAbort,
+            recordStep,
+            endRun,
+          },
           makeBaseHost: (r) => createTauriToolHost(r),
           onAgentEvent: handleAgentEvent,
           onAgentStart: () => {
@@ -2616,14 +3166,22 @@ function Chat({
             setRunUsage({ tokensIn: 0, tokensOut: 0 });
           },
           onRunUsageAdded: (tin, tout) =>
-            setRunUsage((r) => ({ tokensIn: r.tokensIn + tin, tokensOut: r.tokensOut + tout })),
+            setRunUsage((r) => ({
+              tokensIn: r.tokensIn + tin,
+              tokensOut: r.tokensOut + tout,
+            })),
           // The loop's transcript carries one assistant message per round-trip and the tool turns
           // that answered it; `attachReasoning` puts each round's deliberation on its own message,
           // which is what makes the finished turn render `Thinking → tool → Thinking → tool →
           // answer` — the order the live view just showed and the model actually worked in.
-          onReplaceTranscript: (next) => setMsgs(attachReasoning(next, timelineRef.current)),
+          onReplaceTranscript: (next) =>
+            setMsgs(attachReasoning(next, timelineRef.current)),
           fillIfEmpty: (id, note) =>
-            setMsgs((m) => m.map((x) => (x.id === id && !x.content.trim() ? { ...x, content: note } : x))),
+            setMsgs((m) =>
+              m.map((x) =>
+                x.id === id && !x.content.trim() ? { ...x, content: note } : x,
+              ),
+            ),
           onRunChanges: setRunChanges,
           clearRunUi: () => {
             setPendingConfirm(null);
@@ -2648,11 +3206,15 @@ function Chat({
         model: chosen,
         perTurn,
         useMemory,
+        // Same block on the plain path — a session's stable knowledge is not an agent-mode feature.
+        manifestBlock: nextManifest?.block ?? "",
+        ...compactRequest,
         // The references block rides the system turn here too — a session's sources are not an
         // agent-mode feature. `undefined` when both halves are empty, which keeps the blank
         // editor's "no system turn at all" third state intact.
         systemPromptText: (() => {
-          const base = (noTools ? (noToolsSystem || NO_TOOLS_SYSTEM) : systemPrompt) ?? "";
+          const base =
+            (noTools ? noToolsSystem || NO_TOOLS_SYSTEM : systemPrompt) ?? "";
           const full = base + turnReferencesBlock;
           return full.trim() ? full : undefined;
         })(),
@@ -2669,10 +3231,18 @@ function Chat({
         generate: gatewayGenerate,
         recorder: ctxRef.current!,
         lastNode: lastNodeRef,
-        memory: { recall: recallContext, block: memoryBlock, recordRecall, remember: rememberTurn, distil: distilTurn },
+        memory: {
+          recall: (text: string) =>
+            recallContext(text, { root, excludeIds: manifestIds }),
+          block: memoryBlock,
+          recordRecall,
+          remember: rememberTurn,
+          distil: distilTurn,
+        },
         transcript: { append: appendTranscript },
         providerName: (id) => registry.getProvider(id)?.name,
-        patchMsg: (id, patch) => setMsgs((m) => m.map((x) => (x.id === id ? { ...x, ...patch } : x))),
+        patchMsg: (id, patch) =>
+          setMsgs((m) => m.map((x) => (x.id === id ? { ...x, ...patch } : x))),
         onTrace: setTrace,
         onFinishReason: setFinishReason,
         onLastUsage: setLastUsage,
@@ -2691,7 +3261,12 @@ function Chat({
    * attachments read. Nothing to clear here — the composer owns the text it just handed over, and
    * clearing it here too is how the two would drift.
    */
-  function send(text: string, attachments: Attachment[], inlined: InlinedText[], instruction = "") {
+  function send(
+    text: string,
+    attachments: Attachment[],
+    inlined: InlinedText[],
+    instruction = "",
+  ) {
     if (busy || !chosen) return;
     void runTurn(text, msgs, attachments, inlined, instruction);
   }
@@ -2714,7 +3289,10 @@ function Chat({
     const failed: string[] = [];
     for (const op of plan.ops) {
       try {
-        const r = await host.run("write_file", { path: op.path, content: op.content });
+        const r = await host.run("write_file", {
+          path: op.path,
+          content: op.content,
+        });
         if (!r.ok) failed.push(op.path);
       } catch {
         failed.push(op.path);
@@ -2722,10 +3300,13 @@ function Chat({
     }
     const restored = plan.ops.length - failed.length;
     // Honest in both directions: what was restored, what could not be, and what was never tracked.
-    const parts = [`reverted ${restored} of ${plan.ops.length} file${plan.ops.length === 1 ? "" : "s"}`];
+    const parts = [
+      `reverted ${restored} of ${plan.ops.length} file${plan.ops.length === 1 ? "" : "s"}`,
+    ];
     if (failed.length) parts.push(`could not restore ${failed.join(", ")}`);
     for (const s of plan.skipped) parts.push(`${s.path}: ${s.reason}`);
-    if (runChanges.untracked.length) parts.push("commands it ran are not undone");
+    if (runChanges.untracked.length)
+      parts.push("commands it ran are not undone");
     setRunChanges(null);
     setNotice(`revert this run — ${parts.join("; ")}`);
   }
@@ -2752,8 +3333,11 @@ function Chat({
    * it is unit-tested rather than embedded here.
    */
   function retryTurn(i: number) {
+    if (busy) return;
     const point = retryPoint(msgs, i);
     if (!point) return;
+    // The abandoned tail leaves the durable record too; otherwise resume replays both answers.
+    replaceTranscript(point.prefix);
     // The prompt's images ride along: dropping them made the retry a question without its
     // attachments, and the model answered a turn it could no longer see.
     void runTurn(point.text, point.prefix, point.attachments ?? []);
@@ -2761,22 +3345,27 @@ function Chat({
 
   /** Commit the inline editor: drop this user turn and everything after it, then resend edited. */
   function submitEdit(i: number) {
+    if (busy) return;
     const text = editDraft.trim();
     if (!text) return;
     const prefix = editPoint(msgs, i);
     // The editor changes text only, so the dropped turn's attachments are re-sent with the edited
     // prompt — the same carry `retryTurn` does, for the same reason.
     const attachments = msgs[i]?.attachments ?? [];
+    replaceTranscript(prefix);
     cancelEdit();
     void runTurn(text, prefix, attachments);
   }
 
   /**
-   * Drop this turn and everything after it. Only the visible transcript is truncated — the context
-   * graph is an append-only record of what happened, so the abandoned turns stay in History.
+   * Drop this turn and everything after it. The visible transcript and the durable one are both
+   * truncated: only the context graph remains append-only, as a record of what happened.
    */
   function deleteFrom(i: number) {
-    setMsgs((m) => m.slice(0, i));
+    if (busy) return;
+    const next = msgs.slice(0, i);
+    setMsgs(next);
+    replaceTranscript(next);
   }
 
   /**
@@ -2784,6 +3373,7 @@ function Chat({
    * its context, and the graph restarts so the two threads do not interleave nodes under one id.
    */
   function forkFrom(i: number) {
+    if (busy) return;
     const prefix = msgs.slice(0, i + 1).map((m) => ({ ...m }));
     ctxRef.current = startSession();
     lastNodeRef.current = null;
@@ -2792,6 +3382,9 @@ function Chat({
     // sequence in a session id that already has rows.
     transcriptSeqRef.current = 0;
     setMsgs(prefix);
+    // The fork's visible prefix is its durable transcript — otherwise resuming the fork loses
+    // the context it was forked with.
+    replaceTranscript(prefix);
     setTrace(null);
     setFinishReason(undefined);
     // The fork is a new session, so the used log restarts — but the overrides stay: it is the
@@ -2802,7 +3395,9 @@ function Chat({
   // ---- Phase 4: session bar -------------------------------------------------------------
 
   const refreshSessions = useCallback(() => {
-    void loadHistorySessions(50).then(setSessions).catch(() => undefined);
+    void loadHistorySessions(50)
+      .then(setSessions)
+      .catch(() => undefined);
   }, []);
 
   // Keep the list fresh, and adopt the current session's stored title whenever it changes.
@@ -2855,6 +3450,18 @@ function Chat({
         setUsedSkills([]);
         setManualRefs([]);
         setDismissedUrls(new Set());
+        // The previous conversation's header does not belong to this resume.
+        manifestRef.current = null;
+        setManifest(null);
+        // Session-scoped live state belongs to the conversation that was on screen. The progress
+        // capsule and a run's "what changed" card must not follow the user into a resumed session;
+        // the card is actionable, and its paths are relative to the old turn.
+        setTodos([]);
+        setRunChanges(null);
+        timelineRef.current = [];
+        setTimeline([]);
+        setTrace(null);
+        setFinishReason(undefined);
       } catch {
         return; // same policy as openSession: an unreadable session is not an error wall
       }
@@ -2917,10 +3524,19 @@ function Chat({
     // sees the global flags again and has loaded nothing.
     setSkillOverrides({});
     setUsedSkills([]);
+    // Session-scoped live state resets with the conversation, like `todos` above: a new chat sees
+    // the global flags again and has loaded nothing.
+    setRunChanges(null);
+    timelineRef.current = [];
+    setTimeline([]);
     // Same for references: the transcript-derived half empties with `msgs`; the curated halves
     // reset here.
     setManualRefs([]);
     setDismissedUrls(new Set());
+    // The card is this session's header. A new chat must not inherit the previous session's
+    // manifest — including rows scoped to a different workspace.
+    manifestRef.current = null;
+    setManifest(null);
     useUi.getState().setResumeSessionId(undefined);
   }
 
@@ -2966,6 +3582,13 @@ function Chat({
     setUsedSkills([]);
     setManualRefs([]);
     setDismissedUrls(new Set());
+    // Same rule as `newChat`: the manifest is scoped to the session/workspace on screen.
+    manifestRef.current = null;
+    setManifest(null);
+    setTodos([]);
+    setRunChanges(null);
+    timelineRef.current = [];
+    setTimeline([]);
     // The session keeps its own name — it IS that session, not a copy. `titleLoadedFor` is
     // stamped so the async list refresh cannot adopt a stale value over it.
     titleLoadedFor.current = sid;
@@ -2984,7 +3607,9 @@ function Chat({
     setSessionTitle(t);
     // Fire and forget: a failed rename must not block the screen, and the History screen will show
     // the stored value on its next read either way.
-    void saveSessionTitle(sessionId, t).then(refreshSessions).catch(() => undefined);
+    void saveSessionTitle(sessionId, t)
+      .then(refreshSessions)
+      .catch(() => undefined);
   }
 
   const ok = trace && !trace.error && trace.fallbacks.length === 0;
@@ -3010,11 +3635,14 @@ function Chat({
       const nativeId = chosen.slice(cut + 1);
       const row = rows.find(
         (m: CatalogModel) =>
-          m.nativeId === nativeId && (registry.getProvider(m.providerId)?.slug ?? m.providerId) === slug,
+          m.nativeId === nativeId &&
+          (registry.getProvider(m.providerId)?.slug ?? m.providerId) === slug,
       );
       return row?.supportsVision;
     }
-    const row = rows.find((m: CatalogModel) => m.nativeId === chosen && m.modality === "text");
+    const row = rows.find(
+      (m: CatalogModel) => m.nativeId === chosen && m.modality === "text",
+    );
     return row?.supportsVision;
   }, [chosen, tick]);
 
@@ -3036,9 +3664,12 @@ function Chat({
    */
   const visionHelper = useMemo(() => {
     void tick;
-    const settings = router.settings as typeof router.settings & { defaults?: Record<string, string> };
+    const settings = router.settings as typeof router.settings & {
+      defaults?: Record<string, string>;
+    };
     const slugOf = (pid: string) => registry.getProvider(pid)?.slug ?? pid;
-    const isEnabled = (pid: string) => registry.getProvider(pid)?.status === "enabled";
+    const isEnabled = (pid: string) =>
+      registry.getProvider(pid)?.status === "enabled";
     return pickVisionModel({
       preferred: settings.defaults?.vision,
       models: catalog.all().map((m: CatalogModel) => ({
@@ -3060,13 +3691,18 @@ function Chat({
     [root, rootError],
   );
 
-  const listWorkspaceFiles = useCallback(async (): Promise<MentionCandidate[]> => {
+  const listWorkspaceFiles = useCallback(async (): Promise<
+    MentionCandidate[]
+  > => {
     if (!mentionHost) return [];
     // `list_dir` recursive, matched on PATH: an `@` reference names a file, and a content search
     // would offer files whose *contents* mention the typed word — a different question. The listing
     // is a formatted string (`file <path>`), so it is parsed by `parseListing` rather than split on
     // whitespace, which a path containing a space would break.
-    const res = await mentionHost.run("list_dir", { path: ".", recursive: true });
+    const res = await mentionHost.run("list_dir", {
+      path: ".",
+      recursive: true,
+    });
     if (!res.ok) return [];
     return parseListing(res.output).slice(0, 2000);
   }, [mentionHost]);
@@ -3094,11 +3730,20 @@ function Chat({
     // Compaction sizes itself off the conservative default when no window is published. That is the
     // *request* path, where under-sending is the safe direction — unlike the meter, which must not
     // present the same default as the model's capacity.
-    const budget = Math.max(256, Math.floor((modelWindow ?? DEFAULT_CONTEXT_WINDOW) * 0.75));
+    const budget = Math.max(
+      256,
+      Math.floor((modelWindow ?? DEFAULT_CONTEXT_WINDOW) * 0.75),
+    );
     try {
-      const result = await compressWithSummary(replayHistory(msgs), budget, createSummarizer(chosen));
+      const result = await compressWithSummary(
+        replayHistory(msgs),
+        budget,
+        createSummarizer(chosen),
+      );
       if (!result.compressed) {
-        setNotice("Nothing to compact — the conversation already fits in the context window.");
+        setNotice(
+          "Nothing to compact — the conversation already fits in the context window.",
+        );
         return;
       }
       const kept: Msg[] = result.messages.map((m) => ({
@@ -3109,11 +3754,16 @@ function Chat({
         ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
       }));
       setMsgs(kept);
-      setNotice(`Compacted ${result.dropped} earlier message${result.dropped === 1 ? "" : "s"} into a summary.`);
+      // The durable transcript follows the compacted view; resume must not restore the
+      // uncompacted history the user just replaced with a summary.
+      replaceTranscript(kept);
+      setNotice(
+        `Compacted ${result.dropped} earlier message${result.dropped === 1 ? "" : "s"} into a summary.`,
+      );
     } catch (e) {
       setNotice(`Could not compact: ${(e as Error).message}`);
     }
-  }, [busy, msgs, modelWindow, chosen]);
+  }, [busy, msgs, modelWindow, chosen, replaceTranscript]);
 
   // The session controls, extracted from the old in-Chat session bar so they can portal into the
   // title row. Their state stays here on purpose: a session is its transcript — New/reset,
@@ -3138,19 +3788,31 @@ function Chat({
         }}
         title="Open this session’s name, a new session, or a previous one"
       >
-        <span className="min-w-0 flex-1 truncate">{sessionTitle || "untitled session"}</span>
+        <span className="min-w-0 flex-1 truncate">
+          {sessionTitle || "untitled session"}
+        </span>
         {/* aria-hidden: the chevron is decoration — the chip is identified by the session name
             itself, which is what the specs and screen readers key on. */}
-        <span className="shrink-0 text-[11px] font-normal" style={{ color: "var(--text-faint)" }} aria-hidden="true">
+        <span
+          className="shrink-0 text-[11px] font-normal"
+          style={{ color: "var(--text-faint)" }}
+          aria-hidden="true"
+        >
           ▾
         </span>
       </button>
       {switcherOpen && (
         <>
-          <div className="fixed inset-0 z-40" onClick={() => setSwitcherOpen(false)} />
+          <div
+            className="fixed inset-0 z-40"
+            onClick={() => setSwitcherOpen(false)}
+          />
           <div
             className="absolute left-0 top-9 z-50 max-h-80 w-72 overflow-y-auto rounded border p-1 shadow-lg"
-            style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
+            style={{
+              background: "var(--surface-2)",
+              borderColor: "var(--border)",
+            }}
             role="menu"
             aria-label="Session actions"
           >
@@ -3184,7 +3846,11 @@ function Chat({
                 {sessionTitle || "name this session…"}
                 {/* aria-hidden: the glyph is decoration — this row is reached as "Rename session",
                     and a named "✎" would make its accessible name ambiguous. */}
-                <span className="ml-1 text-[11px] font-normal" style={{ color: "var(--text-faint)" }} aria-hidden="true">
+                <span
+                  className="ml-1 text-[11px] font-normal"
+                  style={{ color: "var(--text-faint)" }}
+                  aria-hidden="true"
+                >
                   ✎
                 </span>
               </button>
@@ -3200,9 +3866,15 @@ function Chat({
             >
               ＋ New session
             </button>
-            <div className="my-1 border-t" style={{ borderColor: "var(--border)" }} />
+            <div
+              className="my-1 border-t"
+              style={{ borderColor: "var(--border)" }}
+            />
             {sessions.length === 0 ? (
-              <p className="px-2 py-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
+              <p
+                className="px-2 py-2 text-[11px]"
+                style={{ color: "var(--text-faint)" }}
+              >
                 No sessions recorded yet — this one appears once a turn is sent.
               </p>
             ) : (
@@ -3211,12 +3883,22 @@ function Chat({
                   key={s.session_id}
                   role="menuitem"
                   className="block w-full rounded px-2 py-1.5 text-left text-[12px] transition-opacity hover:opacity-80"
-                  style={{ color: s.session_id === sessionId ? "var(--accent)" : "var(--text-dim)" }}
+                  style={{
+                    color:
+                      s.session_id === sessionId
+                        ? "var(--accent)"
+                        : "var(--text-dim)",
+                  }}
                   onClick={() => void openSession(s.session_id)}
                   title={s.title || s.preview}
                 >
-                  <span className="block truncate">{s.title || s.preview || "(no text)"}</span>
-                  <span className="text-[10px]" style={{ color: "var(--text-faint)" }}>
+                  <span className="block truncate">
+                    {s.title || s.preview || "(no text)"}
+                  </span>
+                  <span
+                    className="text-[10px]"
+                    style={{ color: "var(--text-faint)" }}
+                  >
                     {new Date(s.started_ts).toLocaleString()} · {s.turns} turns
                   </span>
                 </button>
@@ -3250,7 +3932,9 @@ function Chat({
         <SessionSkillsDrawer
           overrides={skillOverrides}
           used={usedSkills}
-          onToggle={(slug, next) => setSkillOverrides((o) => ({ ...o, [slug]: next }))}
+          onToggle={(slug, next) =>
+            setSkillOverrides((o) => ({ ...o, [slug]: next }))
+          }
           onResetOverrides={() => setSkillOverrides({})}
         />
         {/* The session-references drawer: the conversation's source links, derived from the
@@ -3258,7 +3942,9 @@ function Chat({
             cannot resurrect it. */}
         <SessionReferencesDrawer
           refs={sessionRefs}
-          onAdd={(url) => setManualRefs((m) => addReferences(m, [{ url, origin: "manual" }]))}
+          onAdd={(url) =>
+            setManualRefs((m) => addReferences(m, [{ url, origin: "manual" }]))
+          }
           onRemove={(url) => {
             setManualRefs((m) => m.filter((r) => r.url !== url));
             setDismissedUrls((d) => new Set(d).add(url));
@@ -3271,213 +3957,342 @@ function Chat({
           // in a boxed panel, so the chat area owns its full height and the hero centers in it.
           className="h-full overflow-y-auto px-1"
         >
-        {msgs.length === 0 && !busy && (
-          // The empty state (mock: "What would you like to build?"). One staggered entrance via
-          // `.aip-rise`, then static — a transcript that replays its own animation on every store
-          // bump would read as broken. The wrapper centers with `m-auto` rather than
-          // `justify-center`: center-justified content taller than the scroll panel clips its TOP
-          // out of scroll reach, which is exactly where the headline lives. `m-auto` keeps the
-          // centering when it fits and degrades to top-aligned scroll when it does not. The hint
-          // line states what actually happens on this screen: the answer streams, and the trace
-          // line under it names the routed provider and any fallbacks — which is why "rotation and
-          // failover are silent" from the old copy survives as "routed provider … appear below each
-          // answer" rather than being dropped.
-          <div className="flex min-h-full flex-col">
-            {/* Compact vertical rhythm: the whole hero has to fit inside the chat area on a
+          {msgs.length === 0 && !busy && (
+            // The empty state (mock: "What would you like to build?"). One staggered entrance via
+            // `.aip-rise`, then static — a transcript that replays its own animation on every store
+            // bump would read as broken. The wrapper centers with `m-auto` rather than
+            // `justify-center`: center-justified content taller than the scroll panel clips its TOP
+            // out of scroll reach, which is exactly where the headline lives. `m-auto` keeps the
+            // centering when it fits and degrades to top-aligned scroll when it does not. The hint
+            // line states what actually happens on this screen: the answer streams, and the trace
+            // line under it names the routed provider and any fallbacks — which is why "rotation and
+            // failover are silent" from the old copy survives as "routed provider … appear below each
+            // answer" rather than being dropped.
+            <div className="flex min-h-full flex-col">
+              {/* Compact vertical rhythm: the whole hero has to fit inside the chat area on a
                 ~1000px-tall window, or the cards clip against the composer. The `m-auto` wrapper
                 still centers it when it fits and degrades to scroll when it cannot. */}
-            <div className="m-auto flex w-full max-w-3xl flex-col items-center px-4 py-5 text-center">
-            <div
-              className="aip-rise hero-glow mb-4 flex h-12 w-12 items-center justify-center rounded-2xl border"
-              style={{ borderColor: "var(--border)" }}
-              aria-hidden="true"
-            >
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="var(--accent)"
-                strokeWidth="1.6"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                className="h-5 w-5"
-              >
-                <path d="M4 5.5h13v9H9l-5 4v-13Z" />
-                <path d="m17.5 14.5 1 2.4 2.4 1-2.4 1-1 2.4-1-2.4-2.4-1 2.4-1 1-2.4Z" fill="var(--accent)" stroke="none" />
-              </svg>
-            </div>
-            <h2 className="aip-rise aip-rise-1 text-[22px] font-semibold tracking-tight">
-              What would you like to build?
-            </h2>
-            <p className="aip-rise aip-rise-1 mt-1 text-[13px]" style={{ color: "var(--text-dim)" }}>
-              Ask a question, run a task, or work with files in your project.
-            </p>
-            <div className="aip-rise aip-rise-2 mt-5 grid w-full max-w-3xl gap-3 sm:grid-cols-3">
-              {SUGGESTIONS.map((s) => (
-                <button
-                  key={s.title}
-                  type="button"
-                  onClick={() => setSeed({ text: s.prompt, nonce: Date.now() })}
-                  className="nav-item rounded-xl border p-3.5 text-left transition-transform enabled:active:scale-[0.99]"
-                  style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
+              <div className="m-auto flex w-full max-w-3xl flex-col items-center px-4 py-5 text-center">
+                <div
+                  className="aip-rise hero-glow mb-4 flex h-12 w-12 items-center justify-center rounded-2xl border"
+                  style={{ borderColor: "var(--border)" }}
+                  aria-hidden="true"
                 >
-                  <span className="mb-2.5 flex h-8 w-8 items-center justify-center rounded-lg" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>
-                    <SuggestionIcon name={s.icon} />
-                  </span>
-                  <span className="block text-[13px] font-semibold">{s.title}</span>
-                  <span className="mt-1 block text-[12px] leading-snug" style={{ color: "var(--text-dim)" }}>
-                    {s.blurb}
-                  </span>
-                </button>
-              ))}
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="var(--accent)"
+                    strokeWidth="1.6"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    className="h-5 w-5"
+                  >
+                    <path d="M4 5.5h13v9H9l-5 4v-13Z" />
+                    <path
+                      d="m17.5 14.5 1 2.4 2.4 1-2.4 1-1 2.4-1-2.4-2.4-1 2.4-1 1-2.4Z"
+                      fill="var(--accent)"
+                      stroke="none"
+                    />
+                  </svg>
+                </div>
+                <h2 className="aip-rise aip-rise-1 text-[22px] font-semibold tracking-tight">
+                  What would you like to build?
+                </h2>
+                <p
+                  className="aip-rise aip-rise-1 mt-1 text-[13px]"
+                  style={{ color: "var(--text-dim)" }}
+                >
+                  Ask a question, run a task, or work with files in your
+                  project.
+                </p>
+                <div className="aip-rise aip-rise-2 mt-5 grid w-full max-w-3xl gap-3 sm:grid-cols-3">
+                  {SUGGESTIONS.map((s) => (
+                    <button
+                      key={s.title}
+                      type="button"
+                      onClick={() =>
+                        setSeed({ text: s.prompt, nonce: Date.now() })
+                      }
+                      className="nav-item rounded-xl border p-3.5 text-left transition-transform enabled:active:scale-[0.99]"
+                      style={{
+                        background: "var(--surface-2)",
+                        borderColor: "var(--border)",
+                      }}
+                    >
+                      <span
+                        className="mb-2.5 flex h-8 w-8 items-center justify-center rounded-lg"
+                        style={{
+                          background: "var(--accent-soft)",
+                          color: "var(--accent)",
+                        }}
+                      >
+                        <SuggestionIcon name={s.icon} />
+                      </span>
+                      <span className="block text-[13px] font-semibold">
+                        {s.title}
+                      </span>
+                      <span
+                        className="mt-1 block text-[12px] leading-snug"
+                        style={{ color: "var(--text-dim)" }}
+                      >
+                        {s.blurb}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+                <p
+                  className="aip-rise aip-rise-3 mt-4 flex items-center gap-1.5 text-[12px]"
+                  style={{ color: "var(--text-faint)" }}
+                >
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.7"
+                    strokeLinecap="round"
+                    className="h-3.5 w-3.5"
+                    aria-hidden="true"
+                  >
+                    <circle cx="12" cy="12" r="8.5" />
+                    <path d="M12 11v5m0-8.5h.01" />
+                  </svg>
+                  Responses stream live; routed provider and tool activity
+                  appear below each answer.
+                </p>
+              </div>
             </div>
-            <p className="aip-rise aip-rise-3 mt-4 flex items-center gap-1.5 text-[12px]" style={{ color: "var(--text-faint)" }}>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" className="h-3.5 w-3.5" aria-hidden="true">
-                <circle cx="12" cy="12" r="8.5" />
-                <path d="M12 11v5m0-8.5h.01" />
-              </svg>
-              Responses stream live; routed provider and tool activity appear below each answer.
-            </p>
-            </div>
-          </div>
-        )}
-        {msgs.map((m, i) =>
-          // A tool turn already shown inside its turn's group card: rendering it again here is what
-          // produced the flat run of anonymous "tool result" bubbles.
-          toolRuns.consumed.has(i) ? null : (
-          <div key={m.id} className="group mb-3">
-            {/* No label on a step of an agent run. A multi-round turn is several messages — one per
+          )}
+          {manifest && manifest.entries.length > 0 ? (
+            <ManifestCard
+              manifest={manifest}
+              onForget={(id) => {
+                void manifestPort.forget(id);
+              }}
+              onImport={async (source, nativeId) => {
+                await importSourceSession(source, nativeId);
+              }}
+            />
+          ) : null}
+          {msgs.map((m, i) =>
+            // A tool turn already shown inside its turn's group card: rendering it again here is what
+            // produced the flat run of anonymous "tool result" bubbles.
+            toolRuns.consumed.has(i) ? null : (
+              <div key={m.id} className="group mb-3">
+                {/* No label on a step of an agent run. A multi-round turn is several messages — one per
                 round-trip, each carrying the round's calls — and labelling every one of them
                 "ASSISTANT" chopped a single continuous turn into a stack of headings. The answer
                 (a message with no calls) still gets its label, so the transcript says where the
                 model stopped working and started answering. */}
-            {!(m.role === "assistant" && Boolean(m.tool_calls)) && (
-              <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wide" style={{ color: m.role === "user" ? "var(--info)" : m.role === "tool" ? "var(--warn)" : "var(--success)" }}>
-                {m.role}
-              </div>
-            )}
-            {editingId === m.id ? (
-              <div>
-                <textarea
-                  autoFocus
-                  value={editDraft}
-                  rows={Math.min(14, Math.max(2, editDraft.split("\n").length))}
-                  onChange={(e) => setEditDraft(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      submitEdit(i);
+                {!(m.role === "assistant" && Boolean(m.tool_calls)) && (
+                  <div
+                    className="mb-0.5 text-[10px] font-semibold uppercase tracking-wide"
+                    style={{
+                      color:
+                        m.role === "user"
+                          ? "var(--info)"
+                          : m.role === "tool"
+                            ? "var(--warn)"
+                            : "var(--success)",
+                    }}
+                  >
+                    {m.role}
+                  </div>
+                )}
+                {editingId === m.id ? (
+                  <div>
+                    <textarea
+                      autoFocus
+                      value={editDraft}
+                      rows={Math.min(
+                        14,
+                        Math.max(2, editDraft.split("\n").length),
+                      )}
+                      onChange={(e) => setEditDraft(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && !e.shiftKey) {
+                          e.preventDefault();
+                          submitEdit(i);
+                        }
+                        if (e.key === "Escape") cancelEdit();
+                      }}
+                      className={`${inputCls} resize-none`}
+                      style={inputStyle}
+                    />
+                    <div className="mt-1 flex flex-wrap items-center gap-2">
+                      <Button variant="primary" onClick={() => submitEdit(i)}>
+                        Save &amp; resend
+                      </Button>
+                      <Button variant="ghost" onClick={cancelEdit}>
+                        Cancel
+                      </Button>
+                      <span
+                        className="text-[11px]"
+                        style={{ color: "var(--text-faint)" }}
+                      >
+                        everything after this message is discarded
+                      </span>
+                    </div>
+                  </div>
+                ) : m.role === "tool" ? (
+                  <ToolResultBubble
+                    content={m.content}
+                    call={
+                      m.tool_call_id ? callById.get(m.tool_call_id) : undefined
                     }
-                    if (e.key === "Escape") cancelEdit();
-                  }}
-                  className={`${inputCls} resize-none`}
-                  style={inputStyle}
-                />
-                <div className="mt-1 flex flex-wrap items-center gap-2">
-                  <Button variant="primary" onClick={() => submitEdit(i)}>Save &amp; resend</Button>
-                  <Button variant="ghost" onClick={cancelEdit}>Cancel</Button>
-                  <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>
-                    everything after this message is discarded
-                  </span>
-                </div>
-              </div>
-            ) : m.role === "tool" ? (
-              <ToolResultBubble content={m.content} call={m.tool_call_id ? callById.get(m.tool_call_id) : undefined} root={root} />
-            ) : m.role === "assistant" ? (
-              agentMode && i === msgs.length - 1 && busy ? (
-                <AgentLive
-                  segments={timeline}
-                  // The three ways a run parks on a person: the per-call gate, the plan review and
-                  // the mode consent. A status line that only knew about the first read "Running
-                  // exit_plan_mode" while a review blocked the run — the one state the line exists
-                  // to make legible.
-                  waiting={
-                    pendingConfirm?.call.name ??
-                    (pendingPlanReview ? "exit_plan_mode" : pendingPlanEntry ? "enter_plan_mode" : null)
-                  }
-                  stopping={stopping}
-                  usage={runUsage}
-                  root={root}
-                />
-              ) : (
-                // A turn that only requested tools has no prose of its own. Rendering the
-                // empty-content placeholder there is what left a bare "…" under a tool call —
-                // indistinguishable from a model that answered with nothing.
-                <>
-                  {/* The reasoning leads the answer, folded away — the order the model produced it
+                    root={root}
+                  />
+                ) : m.role === "assistant" ? (
+                  agentMode && i === msgs.length - 1 && busy ? (
+                    <AgentLive
+                      segments={timeline}
+                      // The three ways a run parks on a person: the per-call gate, the plan review and
+                      // the mode consent. A status line that only knew about the first read "Running
+                      // exit_plan_mode" while a review blocked the run — the one state the line exists
+                      // to make legible.
+                      waiting={
+                        pendingConfirm?.call.name ??
+                        (pendingPlanReview
+                          ? "exit_plan_mode"
+                          : pendingPlanEntry
+                            ? "enter_plan_mode"
+                            : null)
+                      }
+                      stopping={stopping}
+                      usage={runUsage}
+                      root={root}
+                    />
+                  ) : (
+                    // A turn that only requested tools has no prose of its own. Rendering the
+                    // empty-content placeholder there is what left a bare "…" under a tool call —
+                    // indistinguishable from a model that answered with nothing.
+                    <>
+                      {/* The reasoning leads the answer, folded away — the order the model produced it
                       in. A turn that reasoned and then answered shows both; a turn that reasoned
                       and ran out of output budget shows the reasoning instead of the empty bubble
                       it used to show, which is the difference between "nothing happened" and
                       "here is what it was doing". */}
-                  {m.reasoning ? (
-                    <ReasoningPanel text={m.reasoning} streaming={busy && i === msgs.length - 1} />
-                  ) : null}
-                  {/* A plan renders inside its tool call, not here (see `ToolCallRow`): the plan is
+                      {m.reasoning ? (
+                        <ReasoningPanel
+                          text={m.reasoning}
+                          streaming={busy && i === msgs.length - 1}
+                        />
+                      ) : null}
+                      {/* The engine's retry notice. Without it a slow gateway is an empty bubble for
+                      up to 44s; with it the wait reads as `attempt 2/2 in 2s`. Cleared on the
+                      first token and in the turn's `finally`, so it cannot outlive the turn. */}
+                      {m.retryStatus ? (
+                        <div
+                          role="status"
+                          aria-live="polite"
+                          className="mb-1 text-[12px] italic"
+                          style={{ color: "var(--text-faint)" }}
+                        >
+                          {m.retryStatus}
+                        </div>
+                      ) : null}
+                      {/* A plan renders inside its tool call, not here (see `ToolCallRow`): the plan is
                       what `exit_plan_mode` presented, so the card hangs on the call that carried it
                       rather than being guessed from a message's text. */}
-                  {m.content.trim() ? <AssistantContent raw={m.content} /> : null}
-                </>
-              )
-            ) : (
-              <>
-                {/* P3: what this turn was sent with, above the text — the images are part of the
+                      {m.content.trim() ? (
+                        <AssistantContent raw={m.content} />
+                      ) : null}
+                    </>
+                  )
+                ) : (
+                  <>
+                    {/* P3: what this turn was sent with, above the text — the images are part of the
                     question, and a transcript that showed only the words would misrepresent what the
                     model was asked. */}
-                {(m.attachments?.length ?? 0) > 0 && (
-                  <div className="mb-1 flex flex-wrap gap-1.5">
-                    {m.attachments!.map((a) => (
-                      <img
-                        key={a.id}
-                        alt={a.name}
-                        src={`data:${a.mediaType};base64,${a.dataBase64}`}
-                        title={`${a.name} · ${Math.max(1, Math.round(a.bytes / 1024))} KB`}
-                        className="max-h-32 rounded border"
-                        style={{ borderColor: "var(--border)" }}
-                        data-testid="sent-image"
-                      />
-                    ))}
-                  </div>
+                    {(m.attachments?.length ?? 0) > 0 && (
+                      <div className="mb-1 flex flex-wrap gap-1.5">
+                        {m.attachments!.map((a) => (
+                          <img
+                            key={a.id}
+                            alt={a.name}
+                            src={`data:${a.mediaType};base64,${a.dataBase64}`}
+                            title={`${a.name} · ${Math.max(1, Math.round(a.bytes / 1024))} KB`}
+                            className="max-h-32 rounded border"
+                            style={{ borderColor: "var(--border)" }}
+                            data-testid="sent-image"
+                          />
+                        ))}
+                      </div>
+                    )}
+                    {(m.attachments?.length ?? 0) === 0 &&
+                      (m.attachmentMeta?.length ?? 0) > 0 && (
+                        <div
+                          className="mb-1 flex flex-wrap gap-1.5"
+                          data-testid="restored-attachments"
+                        >
+                          {m.attachmentMeta!.map((a) => (
+                            <span
+                              key={`${a.name}:${a.bytes}`}
+                              className="rounded border px-2 py-1 text-[10px]"
+                              style={{
+                                borderColor: "var(--border)",
+                                color: "var(--text-dim)",
+                              }}
+                              title="The attachment was recorded, but its bytes are not stored; send it again to replay the image."
+                            >
+                              📎 {a.name} ·{" "}
+                              {Math.max(1, Math.round(a.bytes / 1024))} KB · not
+                              restored
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    <Markdown source={m.content} />
+                    {(m.inlined?.length ?? 0) > 0 && (
+                      <p
+                        className="mt-1 text-[10px]"
+                        style={{ color: "var(--text-faint)" }}
+                      >
+                        inlined {m.inlined!.map((f) => f.path).join(", ")}
+                      </p>
+                    )}
+                  </>
                 )}
-                <Markdown source={m.content} />
-                {(m.inlined?.length ?? 0) > 0 && (
-                  <p className="mt-1 text-[10px]" style={{ color: "var(--text-faint)" }}>
-                    inlined {m.inlined!.map((f) => f.path).join(", ")}
-                  </p>
+                {toolRuns.byAssistant.has(i) && (
+                  <ToolRunGroup
+                    steps={toolRuns.byAssistant.get(i)!}
+                    root={root}
+                    previewSteps={artifacts.previews.get(i)}
+                    histories={artifacts.histories}
+                  />
                 )}
-              </>
-            )}
-            {toolRuns.byAssistant.has(i) && (
-              <ToolRunGroup
-                steps={toolRuns.byAssistant.get(i)!}
-                root={root}
-                previewSteps={artifacts.previews.get(i)}
-                histories={artifacts.histories}
-              />
-            )}
-            {m.role === "assistant" && (m.recalledMemories?.length ?? 0) > 0 && (
-              <RecallCard memories={m.recalledMemories!} />
-            )}
-            {editingId !== m.id && (
-              <MessageActions
-                disabled={busy}
-                copied={copiedId === m.id}
-                onCopy={() => copyMessage(m)}
-                onRetry={m.role === "assistant" && i > 0 ? () => retryTurn(i) : undefined}
-                onEdit={m.role === "user" ? () => startEdit(m) : undefined}
-                onFork={i > 0 ? () => forkFrom(i) : undefined}
-                onDelete={i > 0 ? () => deleteFrom(i) : undefined}
-              />
-            )}
-          </div>
-        ))}
-        {/* What the assistant just learned. Distillation is asynchronous and batched, so an atom
+                {m.role === "assistant" &&
+                  (m.recalledMemories?.length ?? 0) > 0 && (
+                    <RecallCard memories={m.recalledMemories!} />
+                  )}
+                {editingId !== m.id && (
+                  <MessageActions
+                    disabled={busy}
+                    copied={copiedId === m.id}
+                    onCopy={() => copyMessage(m)}
+                    onRetry={
+                      m.role === "assistant" && i > 0
+                        ? () => retryTurn(i)
+                        : undefined
+                    }
+                    onEdit={m.role === "user" ? () => startEdit(m) : undefined}
+                    onFork={i > 0 ? () => forkFrom(i) : undefined}
+                    onDelete={i > 0 ? () => deleteFrom(i) : undefined}
+                  />
+                )}
+              </div>
+            ),
+          )}
+          {/* What the assistant just learned. Distillation is asynchronous and batched, so an atom
             can land several turns after the exchange that taught it — the strip is where those
             late arrivals become visible instead of silent. */}
-        {learned.length > 0 && (
-          <LearnedStrip
-            items={learned}
-            onDismiss={(id) => setLearned((prev) => prev.filter((p) => p.id !== id))}
-          />
-        )}
+          {learned.length > 0 && (
+            <LearnedStrip
+              items={learned}
+              onDismiss={(id) =>
+                setLearned((prev) => prev.filter((p) => p.id !== id))
+              }
+            />
+          )}
         </div>
         {/* `msgs.length > 0` — an empty transcript's hero is taller than the chat area on short
             windows, which detached the scroll anchor and floated this pill over the suggestion
@@ -3487,7 +4302,11 @@ function Chat({
             type="button"
             onClick={jumpToLatest}
             className="absolute bottom-2 left-1/2 -translate-x-1/2 rounded-full border px-3 py-1 text-[11px] shadow-lg transition-opacity hover:opacity-90"
-            style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text-dim)" }}
+            style={{
+              background: "var(--surface-2)",
+              borderColor: "var(--border)",
+              color: "var(--text-dim)",
+            }}
             title="Scroll to the newest message"
           >
             ↓ jump to latest
@@ -3496,38 +4315,73 @@ function Chat({
       </div>
       {/* P5: what this run changed. Shown after it ends, including after a stop or a failure —
           those runs have still written whatever they got to. */}
-      {!busy && runChanges && (runChanges.files.length > 0 || runChanges.untracked.length > 0) && (
-        <ChangeSetReview
-          set={runChanges}
-          busy={busy}
-          onKeep={() => setRunChanges(null)}
-          onRevert={() => void revertRun()}
-        />
-      )}
+      {!busy &&
+        runChanges &&
+        (runChanges.files.length > 0 || runChanges.untracked.length > 0) && (
+          <ChangeSetReview
+            set={runChanges}
+            busy={busy}
+            onKeep={() => setRunChanges(null)}
+            onRevert={() => void revertRun()}
+          />
+        )}
 
       {trace && (
         <div className="mt-2 text-[12px]">
-          <button className="flex items-center gap-2" onClick={() => setShowTrace((v) => !v)}>
-            <span style={{ color: trace.error ? "var(--danger)" : ok ? "var(--success)" : "var(--warn)" }}>
+          <button
+            className="flex items-center gap-2"
+            onClick={() => setShowTrace((v) => !v)}
+          >
+            <span
+              style={{
+                color: trace.error
+                  ? "var(--danger)"
+                  : ok
+                    ? "var(--success)"
+                    : "var(--warn)",
+              }}
+            >
               {trace.error ? "✕" : ok ? "✓" : "↻"}
             </span>
             <span className="mono">{trace.ms}ms</span>
-            {trace.provider && <span style={{ color: "var(--text-dim)" }}>· {trace.provider}</span>}
-            {trace.fallbacks.length > 0 && (
-              <span style={{ color: "var(--warn)" }}>· {trace.fallbacks.length} fallback{trace.fallbacks.length === 1 ? "" : "s"}</span>
+            {trace.provider && (
+              <span style={{ color: "var(--text-dim)" }}>
+                · {trace.provider}
+              </span>
             )}
-            {trace.error && <span style={{ color: "var(--danger)" }}>{trace.error}</span>}
+            {trace.fallbacks.length > 0 && (
+              <span style={{ color: "var(--warn)" }}>
+                · {trace.fallbacks.length} fallback
+                {trace.fallbacks.length === 1 ? "" : "s"}
+              </span>
+            )}
+            {trace.error && (
+              <span style={{ color: "var(--danger)" }}>{trace.error}</span>
+            )}
             {finishReason === "length" && (
-              <span className="mono" style={{ color: "var(--warn)" }}>· truncated</span>
+              <span className="mono" style={{ color: "var(--warn)" }}>
+                · truncated
+              </span>
             )}
             {(trace.fallbacks.length > 0 || showTrace) && (
-              <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>{showTrace ? "▾" : "▸"}</span>
+              <span
+                className="text-[11px]"
+                style={{ color: "var(--text-faint)" }}
+              >
+                {showTrace ? "▾" : "▸"}
+              </span>
             )}
           </button>
           {showTrace && trace.fallbacks.length > 0 && (
-            <ul className="mono mt-1 ml-4 text-[11px]" style={{ color: "var(--text-dim)" }}>
+            <ul
+              className="mono mt-1 ml-4 text-[11px]"
+              style={{ color: "var(--text-dim)" }}
+            >
               {trace.fallbacks.map((f, i) => (
-                <li key={i}>attempt {i + 1}: {f.provider ?? "?"} · {f.key ?? "?"} → {f.cls}</li>
+                <li key={i}>
+                  attempt {i + 1}: {f.provider ?? "?"} · {f.key ?? "?"} →{" "}
+                  {f.cls}
+                </li>
               ))}
             </ul>
           )}
@@ -3545,11 +4399,14 @@ function Chat({
           model/sandbox chips moved below the composer — the mock's status strip. Above the
           composer only the transcript's own notices remain. */}
 
-
       {/* P3: the composer owns the draft, the attachments and the two menus. It is disabled — not
           hidden — when the turn cannot run, so the reason stays visible next to a live box. */}
       {(notice || (agentMode && (!root.trim() || !!rootError))) && (
-        <p className="mt-2 text-[11px]" style={{ color: notice ? "var(--warn)" : "var(--danger)" }} data-testid="composer-notice">
+        <p
+          className="mt-2 text-[11px]"
+          style={{ color: notice ? "var(--warn)" : "var(--danger)" }}
+          data-testid="composer-notice"
+        >
           {notice ?? "Set a workspace root before using agent mode."}
         </p>
       )}
@@ -3583,7 +4440,11 @@ function Chat({
           keeps the aria-label it had. */}
       <div
         className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border px-3 py-1.5 text-[11px]"
-        style={{ borderColor: "var(--border)", background: "var(--surface)", color: "var(--text-dim)" }}
+        style={{
+          borderColor: "var(--border)",
+          background: "var(--surface)",
+          color: "var(--text-dim)",
+        }}
       >
         {/* The routed badge moved here from the old card's Model & Provider column: a bare model
             id is the only form failover can act on, and the strip is where per-request facts live. */}
@@ -3593,13 +4454,26 @@ function Chat({
             style={{ borderColor: "var(--border)", color: "var(--success)" }}
             title="A bare model id lets the router plan every enabled carrier and fail over between them"
           >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-3 w-3" aria-hidden="true">
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="h-3 w-3"
+              aria-hidden="true"
+            >
               <path d="m4.5 12.5 5 5 10-11" />
             </svg>
             Routed (failover enabled)
           </span>
         ) : null}
-        <span className="h-4 w-px" style={{ background: "var(--border)" }} aria-hidden="true" />
+        <span
+          className="h-4 w-px"
+          style={{ background: "var(--border)" }}
+          aria-hidden="true"
+        />
         <label className="flex items-center gap-1">
           temp
           <input
@@ -3610,7 +4484,9 @@ function Chat({
             value={temperature}
             onChange={(e) => {
               const v = e.target.value;
-              onTemperatureChange(v === "" ? "" : Math.max(0, Math.min(2, Number(v))));
+              onTemperatureChange(
+                v === "" ? "" : Math.max(0, Math.min(2, Number(v))),
+              );
             }}
             placeholder="default"
             disabled={busy}
@@ -3628,7 +4504,9 @@ function Chat({
             value={maxTokens}
             onChange={(e) => {
               const v = e.target.value;
-              onMaxTokensChange(v === "" ? "" : Math.max(1, Math.round(Number(v))));
+              onMaxTokensChange(
+                v === "" ? "" : Math.max(1, Math.round(Number(v))),
+              );
             }}
             placeholder="default"
             disabled={busy}
@@ -3646,7 +4524,9 @@ function Chat({
           thinking
           <select
             value={thinking}
-            onChange={(e) => onThinkingChange(e.target.value as ReasoningEffort | "")}
+            onChange={(e) =>
+              onThinkingChange(e.target.value as ReasoningEffort | "")
+            }
             disabled={busy}
             aria-label="How much the model should think before answering (default uses the provider's own setting)"
             title="Sent as the field this provider's dialect declares (Anthropic thinking, OpenAI reasoning_effort, Gemini thinkingConfig). Below 'default', 'off' asks the provider to disable thinking where it has a way to — where it has none, nothing is sent and its own default stands."
@@ -3656,7 +4536,9 @@ function Chat({
           >
             <option value="">default</option>
             {THINKING_LEVELS.map((l) => (
-              <option key={l} value={l}>{l}</option>
+              <option key={l} value={l}>
+                {l}
+              </option>
             ))}
           </select>
         </label>
@@ -3684,11 +4566,16 @@ function Chat({
             // `undefined` for a missing field), so a provider that omits one reaches here as
             // `prompt_tokens: undefined` and an unguarded `.toLocaleString()` would throw while
             // rendering — turning a missing usage line into a broken screen.
-            (lastUsage ? ` · the last request actually reported ${(lastUsage.prompt_tokens ?? 0).toLocaleString()} in` : "")
+            (lastUsage
+              ? ` · the last request actually reported ${(lastUsage.prompt_tokens ?? 0).toLocaleString()} in`
+              : "")
           }
         >
           <span>context</span>
-          <span className="h-1.5 w-24 overflow-hidden rounded-full" style={{ background: "var(--surface-2)" }}>
+          <span
+            className="h-1.5 w-24 overflow-hidden rounded-full"
+            style={{ background: "var(--surface-2)" }}
+          >
             <span
               className="block h-full"
               style={{
@@ -3711,7 +4598,8 @@ function Chat({
             />
           </span>
           <span className="mono">
-            {formatTokens(currentPromptTokens)} / {modelWindow === null ? "unknown" : formatTokens(modelWindow)}
+            {formatTokens(currentPromptTokens)} /{" "}
+            {modelWindow === null ? "unknown" : formatTokens(modelWindow)}
           </span>
         </span>
         {/* Session totals from the ledger. "Σ" and the tooltip say *this app's whole ledger*, not
@@ -3797,26 +4685,61 @@ function MessageActions({
     "rounded px-1.5 py-0.5 text-[10px] transition-opacity opacity-60 hover:opacity-100 disabled:opacity-30 disabled:hover:opacity-30";
   return (
     <div className="mt-1 flex flex-wrap items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
-      <button type="button" className={btn} style={{ color: "var(--text-dim)" }} disabled={disabled} onClick={onCopy} title="Copy this message">
+      <button
+        type="button"
+        className={btn}
+        style={{ color: "var(--text-dim)" }}
+        disabled={disabled}
+        onClick={onCopy}
+        title="Copy this message"
+      >
         {copied ? "✓ copied" : "copy"}
       </button>
       {onRetry && (
-        <button type="button" className={btn} style={{ color: "var(--accent)" }} disabled={disabled} onClick={onRetry} title="Discard this reply and regenerate it">
+        <button
+          type="button"
+          className={btn}
+          style={{ color: "var(--accent)" }}
+          disabled={disabled}
+          onClick={onRetry}
+          title="Discard this reply and regenerate it"
+        >
           ↻ retry
         </button>
       )}
       {onEdit && (
-        <button type="button" className={btn} style={{ color: "var(--text-dim)" }} disabled={disabled} onClick={onEdit} title="Edit this message and resend">
+        <button
+          type="button"
+          className={btn}
+          style={{ color: "var(--text-dim)" }}
+          disabled={disabled}
+          onClick={onEdit}
+          title="Edit this message and resend"
+        >
           ✎ edit
         </button>
       )}
       {onFork && (
-        <button type="button" className={btn} style={{ color: "var(--text-dim)" }} disabled={disabled} onClick={onFork} title="Continue from here in a new session, keeping this point as context">
+        <button
+          type="button"
+          className={btn}
+          style={{ color: "var(--text-dim)" }}
+          disabled={disabled}
+          onClick={onFork}
+          title="Continue from here in a new session, keeping this point as context"
+        >
           ⑂ fork
         </button>
       )}
       {onDelete && (
-        <button type="button" className={btn} style={{ color: "var(--danger)" }} disabled={disabled} onClick={onDelete} title="Delete this message and everything after it">
+        <button
+          type="button"
+          className={btn}
+          style={{ color: "var(--danger)" }}
+          disabled={disabled}
+          onClick={onDelete}
+          title="Delete this message and everything after it"
+        >
           🗑 delete from here
         </button>
       )}
@@ -3831,7 +4754,8 @@ type UIStep = ToolStep & { status?: ToolStatus };
 function argSummary(args: Record<string, unknown>): string {
   const parts: string[] = [];
   for (const [k, v] of Object.entries(args)) {
-    const s = typeof v === "string" ? v : v === undefined ? "" : JSON.stringify(v);
+    const s =
+      typeof v === "string" ? v : v === undefined ? "" : JSON.stringify(v);
     if (!s) continue;
     parts.push(`${k}: ${s.replace(/\s+/g, " ").slice(0, 64)}`);
     if (parts.length === 2) break;
@@ -3843,7 +4767,10 @@ const STEP_COLOR: Record<ToolStatus, string> = {
   // The dot's color carries the state, so the states the reader triages on get the triage colors:
   // amber for in-flight and refused, green for done, red for failed. A replayed transcript has no
   // status at all and stays neutral below.
-  calling: "var(--warn)", ok: "var(--success)", denied: "var(--warn)", error: "var(--danger)",
+  calling: "var(--warn)",
+  ok: "var(--success)",
+  denied: "var(--warn)",
+  error: "var(--danger)",
 };
 
 const CHILD_STATE_COLOR: Record<SubagentChildProgress["state"], string> = {
@@ -3875,7 +4802,9 @@ function BrowserSetupHint({ port, root }: { port: string; root?: string }) {
   const cmd = /Mac/i.test(navigator.platform)
     ? `open -a "Google Chrome" --args --remote-debugging-port=${port}`
     : `google-chrome --remote-debugging-port=${port}`;
-  const [startState, setStartState] = useState<"idle" | "starting" | "started" | "failed">("idle");
+  const [startState, setStartState] = useState<
+    "idle" | "starting" | "started" | "failed"
+  >("idle");
   const [startNote, setStartNote] = useState("");
 
   const startBrowser = async () => {
@@ -3889,7 +4818,11 @@ function BrowserSetupHint({ port, root }: { port: string; root?: string }) {
         setStartNote(res.output);
         setStartState("started");
       } else {
-        setStartNote(res.error?.trim() || res.output || "the launch failed without a reason");
+        setStartNote(
+          res.error?.trim() ||
+            res.output ||
+            "the launch failed without a reason",
+        );
         setStartState("failed");
       }
     } catch (e) {
@@ -3907,7 +4840,10 @@ function BrowserSetupHint({ port, root }: { port: string; root?: string }) {
       <div className="mono text-[11px]" style={{ color: "var(--warn)" }}>
         no browser is listening on the debugger port
       </div>
-      <div className="mono mt-1 break-all text-[10px]" style={{ color: "var(--text-dim)" }}>
+      <div
+        className="mono mt-1 break-all text-[10px]"
+        style={{ color: "var(--text-dim)" }}
+      >
         start one and open a tab, then try the call again:
         <code style={{ color: "var(--text)" }}> {cmd}</code>
       </div>
@@ -3924,18 +4860,27 @@ function BrowserSetupHint({ port, root }: { port: string; root?: string }) {
             {startState === "starting" ? "starting…" : "start a browser for me"}
           </button>
         )}
-        <div className="mono text-[10px]" style={{ color: "var(--text-faint)" }}>
+        <div
+          className="mono text-[10px]"
+          style={{ color: "var(--text-faint)" }}
+        >
           {startNote ||
             `Chromium or Edge work the same way — any browser started with --remote-debugging-port=${port}`}
         </div>
       </div>
       {startState === "started" && (
-        <div className="mono mt-1 text-[10px]" style={{ color: "var(--success)" }}>
+        <div
+          className="mono mt-1 text-[10px]"
+          style={{ color: "var(--success)" }}
+        >
           the browser is up — ask again and the call will go through
         </div>
       )}
       {startState === "failed" && (
-        <div className="mono mt-1 break-all text-[10px]" style={{ color: "var(--warn)" }}>
+        <div
+          className="mono mt-1 break-all text-[10px]"
+          style={{ color: "var(--warn)" }}
+        >
           {startNote}
         </div>
       )}
@@ -3954,24 +4899,31 @@ function ToolCallRow({
   /** Whether THIS step is the one that may render the file's preview — see `artifacts.previews`. */
   previewAllowed?: boolean;
   /** Version histories by path, so the card can walk what the transcript recorded. */
-  histories?: ReadonlyMap<string, { versions: ArtifactVersion[]; unresolved: number }>;
+  histories?: ReadonlyMap<
+    string,
+    { versions: ArtifactVersion[]; unresolved: number }
+  >;
 }) {
   const [open, setOpen] = useState(false);
   // `exit_plan_mode`'s argument is a document, not call detail: it renders as the plan card below
   // instead of a clipped `plan: …` summary plus a 600-character argument dump — the same text
   // three times in three truncations. `enter_plan_mode` carries no arguments at all.
   const planDoc =
-    step.name === "exit_plan_mode" && typeof step.args.plan === "string" ? step.args.plan : null;
+    step.name === "exit_plan_mode" && typeof step.args.plan === "string"
+      ? step.args.plan
+      : null;
   // Where the approved plan landed, when the result says it did. Parsed by the sentence's owner
   // (`planPathFromResult`), never by a regex of this component's own — see that function.
-  const planPath = planDoc && step.result ? planPathFromResult(step.result) : null;
+  const planPath =
+    planDoc && step.result ? planPathFromResult(step.result) : null;
   const change = fileChangeFor(step.name, step.args);
   // A card only where the step is the file's newest successful write AND the run has finished; a
   // refused write keeps its diff either way (`writtenArtifactPath` carries that gate).
   const previewable = previewAllowed && root ? writtenArtifactPath(step) : null;
   const color = step.status ? STEP_COLOR[step.status] : "var(--text-faint)";
   const summary = planDoc ? "" : argSummary(step.args);
-  const preview = step.result !== undefined ? step.result.replace(/\s+/g, " ").trim() : null;
+  const preview =
+    step.result !== undefined ? step.result.replace(/\s+/g, " ").trim() : null;
   const hasOutput = preview !== null && preview.length > 0;
   // A background start's result mints a job the sandbox keeps running after this row closes —
   // the one thing a finished row can still be doing. The card polls it live; on a replayed
@@ -3986,7 +4938,10 @@ function ToolCallRow({
   // the same flooding the loop's receipt protocol stops on the wire (browser_screenshot joined
   // that protocol late; before it did, its rows were megabytes of unreadable text).
   const shotPath =
-    (step.name === "browser_screenshot" || step.name === "read_image" || step.name === "generate_image") &&
+    (step.name === "browser_screenshot" ||
+      step.name === "device_screenshot" ||
+      step.name === "read_image" ||
+      step.name === "generate_image") &&
     typeof step.result === "string"
       ? imagePathFromResult(step.result)
       : null;
@@ -4006,11 +4961,23 @@ function ToolCallRow({
         className="mono flex w-full items-baseline gap-1.5 text-left text-[11px]"
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
-        title={open ? "collapse the call's arguments and output" : "expand the call's arguments and output"}
+        title={
+          open
+            ? "collapse the call's arguments and output"
+            : "expand the call's arguments and output"
+        }
       >
-        <span className="shrink-0" style={{ color }}>⏺</span>
-        <span className="shrink-0" style={{ color: "var(--text)" }}>{step.name}</span>
-        {summary && <span className="truncate" style={{ color: "var(--text-dim)" }}>({summary})</span>}
+        <span className="shrink-0" style={{ color }}>
+          ⏺
+        </span>
+        <span className="shrink-0" style={{ color: "var(--text)" }}>
+          {step.name}
+        </span>
+        {summary && (
+          <span className="truncate" style={{ color: "var(--text-dim)" }}>
+            ({summary})
+          </span>
+        )}
       </button>
       {planDoc && (
         <div className="ml-3.5 mt-1">
@@ -4029,9 +4996,17 @@ function ToolCallRow({
       {showArgs && !planDoc && Object.keys(step.args).length > 0 && (
         <div className="ml-3.5">
           {Object.entries(step.args).map(([k, v]) => (
-            <div key={k} className="mono break-all text-[11px]" style={{ color: "var(--text-dim)" }}>
+            <div
+              key={k}
+              className="mono break-all text-[11px]"
+              style={{ color: "var(--text-dim)" }}
+            >
               <span style={{ color: "var(--text-faint)" }}>{k}: </span>
-              {typeof v === "string" ? (v.length > 600 ? `${v.slice(0, 600)}…` : v) : JSON.stringify(v)}
+              {typeof v === "string"
+                ? v.length > 600
+                  ? `${v.slice(0, 600)}…`
+                  : v
+                : JSON.stringify(v)}
             </div>
           ))}
         </div>
@@ -4044,7 +5019,10 @@ function ToolCallRow({
         >
           {step.children.map((c, i) => (
             <div key={i} className="mono flex items-baseline gap-1.5">
-              <span className="shrink-0" style={{ color: CHILD_STATE_COLOR[c.state] }}>
+              <span
+                className="shrink-0"
+                style={{ color: CHILD_STATE_COLOR[c.state] }}
+              >
                 ⏺
               </span>
               <span style={{ color: "var(--text)" }}>{c.label}</span>
@@ -4070,8 +5048,13 @@ function ToolCallRow({
               per-turn bubble showed this line; dropping it here was a regression the browser
               suite caught (agent-approval.spec.ts, "in PLAN MODE"). */}
           {step.result !== undefined && (
-            <div className="mono mt-0.5 truncate text-[10px]" style={{ color: hasOutput ? "var(--text-faint)" : "var(--warn)" }}>
-              {hasOutput ? `⎿ ${preview!.slice(0, 120)}${step.result.replace(/\s+/g, " ").trim().length > 120 ? "…" : ""}` : "⎿ (no output)"}
+            <div
+              className="mono mt-0.5 truncate text-[10px]"
+              style={{ color: hasOutput ? "var(--text-faint)" : "var(--warn)" }}
+            >
+              {hasOutput
+                ? `⎿ ${preview!.slice(0, 120)}${step.result.replace(/\s+/g, " ").trim().length > 120 ? "…" : ""}`
+                : "⎿ (no output)"}
             </div>
           )}
           {previewable && (
@@ -4106,12 +5089,21 @@ function ToolCallRow({
           <ScreenshotPreview
             root={root}
             path={shotPath}
-            cacheName={typeof step.result === "string" ? imageCacheFromResult(step.result) : null}
+            cacheName={
+              typeof step.result === "string"
+                ? imageCacheFromResult(step.result)
+                : null
+            }
           />
         </div>
       ) : null}
       {open && hasOutput && (
-        <pre className="mono ml-3.5 mt-1 max-h-52 overflow-auto whitespace-pre-wrap text-[11px]" style={{ color: "var(--text-dim)" }}>{step.result}</pre>
+        <pre
+          className="mono ml-3.5 mt-1 max-h-52 overflow-auto whitespace-pre-wrap text-[11px]"
+          style={{ color: "var(--text-dim)" }}
+        >
+          {step.result}
+        </pre>
       )}
     </div>
   );
@@ -4131,7 +5123,10 @@ function ToolRunGroup({
   root?: string;
   /** Indices of the steps in THIS turn allowed to render an artifact preview. */
   previewSteps?: Set<number>;
-  histories?: ReadonlyMap<string, { versions: ArtifactVersion[]; unresolved: number }>;
+  histories?: ReadonlyMap<
+    string,
+    { versions: ArtifactVersion[]; unresolved: number }
+  >;
 }) {
   return (
     <div className="mt-1.5 space-y-2" data-testid="tool-run-group">
@@ -4173,7 +5168,13 @@ function ToolResultBubble({
       <div>
         <DiffView change={change} />
         {!empty && (
-          <div className="mono text-[10px]" style={{ color: "var(--text-faint)" }}>{preview}{content.length > 70 ? "…" : ""}</div>
+          <div
+            className="mono text-[10px]"
+            style={{ color: "var(--text-faint)" }}
+          >
+            {preview}
+            {content.length > 70 ? "…" : ""}
+          </div>
         )}
       </div>
     );
@@ -4182,31 +5183,56 @@ function ToolResultBubble({
   // An image-carrying call renders the picture above its bubble — the persisted transcript keeps
   // the short receipt (the loop's marker protocol), so the path is what the result names.
   const shotPath =
-    call && (call.name === "browser_screenshot" || call.name === "read_image" || call.name === "generate_image")
+    call &&
+    (call.name === "browser_screenshot" ||
+      call.name === "device_screenshot" ||
+      call.name === "read_image" ||
+      call.name === "generate_image")
       ? imagePathFromResult(content)
       : null;
   if (shotPath && root) {
     return (
       <div>
-        <ScreenshotPreview root={root} path={shotPath} cacheName={imageCacheFromResult(content)} />
+        <ScreenshotPreview
+          root={root}
+          path={shotPath}
+          cacheName={imageCacheFromResult(content)}
+        />
       </div>
     );
   }
 
-  const groups = call && isSearchResult(call.name) ? groupSearchMatches(content) : [];
+  const groups =
+    call && isSearchResult(call.name) ? groupSearchMatches(content) : [];
   // A replayed browser call that found no debugger endpoint keeps the same hint the live row
   // showed — the fix is not something the user does once.
-  const setupMiss = call && call.name.startsWith("browser_") ? browserSetupMiss(content) : null;
+  const setupMiss =
+    call && call.name.startsWith("browser_") ? browserSetupMiss(content) : null;
 
   return (
-    <div className="rounded border px-2.5 py-1.5" style={{ borderColor: empty ? "var(--warn)" : "var(--border)", background: "var(--surface-2)" }}>
+    <div
+      className="rounded border px-2.5 py-1.5"
+      style={{
+        borderColor: empty ? "var(--warn)" : "var(--border)",
+        background: "var(--surface-2)",
+      }}
+    >
       {setupMiss && <BrowserSetupHint port={setupMiss.port} root={root} />}
-      <button className="mono text-[11px]" style={{ color: "var(--text-dim)" }} onClick={() => setOpen((v) => !v)}>
+      <button
+        className="mono text-[11px]"
+        style={{ color: "var(--text-dim)" }}
+        onClick={() => setOpen((v) => !v)}
+      >
         {open ? "▾" : "▸"} tool result
-        {open ? "" : ` · ${empty ? "(no output)" : `${preview}${content.length > 70 ? "…" : ""}`}`}
+        {open
+          ? ""
+          : ` · ${empty ? "(no output)" : `${preview}${content.length > 70 ? "…" : ""}`}`}
       </button>
       {open && (
-        <div className="mono mt-1 max-h-60 overflow-auto text-[11px]" style={{ color: "var(--text)" }}>
+        <div
+          className="mono mt-1 max-h-60 overflow-auto text-[11px]"
+          style={{ color: "var(--text)" }}
+        >
           {empty ? (
             "(no output — the tool returned nothing, and said nothing about why)"
           ) : groups.length > 0 ? (
@@ -4216,10 +5242,19 @@ function ToolResultBubble({
               {groups.map((g) => (
                 <div key={g.file}>
                   <div style={{ color: "var(--text-dim)" }}>
-                    {g.file} <span style={{ color: "var(--text-faint)" }}>({g.hits.length})</span>
+                    {g.file}{" "}
+                    <span style={{ color: "var(--text-faint)" }}>
+                      ({g.hits.length})
+                    </span>
                   </div>
                   {g.hits.map((h, i) => (
-                    <div key={i} className="break-all pl-3" style={{ color: "var(--text-dim)" }}>{h}</div>
+                    <div
+                      key={i}
+                      className="break-all pl-3"
+                      style={{ color: "var(--text-dim)" }}
+                    >
+                      {h}
+                    </div>
                   ))}
                 </div>
               ))}
@@ -4251,7 +5286,13 @@ function ToolResultBubble({
  * read. Either way the character count stays visible, because 25 000 characters and 40 characters
  * are different findings.
  */
-function ReasoningPanel({ text, streaming }: { text: string; streaming?: boolean }) {
+function ReasoningPanel({
+  text,
+  streaming,
+}: {
+  text: string;
+  streaming?: boolean;
+}) {
   // `null` = the reader has not expressed a preference, so follow the stream. An explicit toggle
   // then sticks, including through the moment streaming ends.
   const [choice, setChoice] = useState<boolean | null>(null);
@@ -4323,16 +5364,28 @@ function AgentStatus({
   // The call in flight, if any — it is the one a "is it hung?" glance is really about, so it is
   // the one the status line names. Elapsed for it comes for free: the last "calling" item started
   // when the tool_call event arrived, and the timer above started when the run did.
-  const running = items.length > 0 && items[items.length - 1]!.status === "calling" ? items[items.length - 1]! : null;
+  const running =
+    items.length > 0 && items[items.length - 1]!.status === "calling"
+      ? items[items.length - 1]!
+      : null;
   // `exit_plan_mode`'s argument is a document, and the status line is one line: naming the call is
   // the informative half, and a 64-character slice of a plan is neither a summary nor a plan. The
   // same suppression `ToolCallRow` applies to the full arguments.
-  const summary = running && running.name !== "exit_plan_mode" ? argSummary(running.args) : "";
+  const summary =
+    running && running.name !== "exit_plan_mode"
+      ? argSummary(running.args)
+      : "";
   return (
-    <div className="mono flex flex-wrap items-baseline gap-x-2 text-[11px]" data-testid="agent-status">
+    <div
+      className="mono flex flex-wrap items-baseline gap-x-2 text-[11px]"
+      data-testid="agent-status"
+    >
       {/* role="status" so the activity change is announced — but it sits on this span only, never
           on the metrics, which re-render every second and would flood a live region. */}
-      <span role="status" style={{ color: waiting ? "var(--warn)" : "var(--info)" }}>
+      <span
+        role="status"
+        style={{ color: waiting ? "var(--warn)" : "var(--info)" }}
+      >
         {waiting
           ? `Waiting for you — ${waiting} needs approval`
           : stopping
@@ -4342,11 +5395,18 @@ function AgentStatus({
               : "Thinking…"}
       </span>
       {running && summary && (
-        <span className="truncate" style={{ color: "var(--text-faint)" }}>{summary}</span>
+        <span className="truncate" style={{ color: "var(--text-faint)" }}>
+          {summary}
+        </span>
       )}
-      <span className="ml-auto whitespace-nowrap" style={{ color: "var(--text-faint)" }}>
+      <span
+        className="ml-auto whitespace-nowrap"
+        style={{ color: "var(--text-faint)" }}
+      >
         {formatElapsed(elapsed)}
-        {usage.tokensOut > 0 ? ` · ↑ ${formatTokens(usage.tokensOut)} tokens` : ""}
+        {usage.tokensOut > 0
+          ? ` · ↑ ${formatTokens(usage.tokensOut)} tokens`
+          : ""}
         {/* While the approval modal is up, Escape belongs to the modal (deny), not to stop. */}
         {!waiting && " · Esc to stop"}
       </span>
@@ -4384,13 +5444,24 @@ function AgentLive({
 }) {
   return (
     <>
-      <AgentStatus items={toolSegments(segments)} waiting={waiting} stopping={stopping} usage={usage} />
+      <AgentStatus
+        items={toolSegments(segments)}
+        waiting={waiting}
+        stopping={stopping}
+        usage={usage}
+      />
       {segments.map((seg, i) => {
         if (seg.kind === "thinking") {
           // Open while it streams — the run's own record of what it is working through, and the
           // only evidence that a 40-second round-trip is progressing rather than hung — then it
           // folds itself the moment the next segment (a call, or the answer) arrives.
-          return <ReasoningPanel key={i} text={seg.text} streaming={i === segments.length - 1} />;
+          return (
+            <ReasoningPanel
+              key={i}
+              text={seg.text}
+              streaming={i === segments.length - 1}
+            />
+          );
         }
         if (seg.kind === "text") {
           return <RichMarkdown key={i} source={seg.text} />;
@@ -4416,49 +5487,3 @@ function AgentLive({
 /* The per-call gate used to live here as `ConfirmModal` — allow/deny and nothing else. It is now
    `components/ApproveModal`, because the answer set grew a scope (this call / this tool / this
    session) and the component has one job worth testing on its own. */
-
-/**
- * The approval-mode picker (Phase 5).
- *
- * A `<select>` rather than three radio buttons: the row already carries a checkbox group and a
- * number field, and the mode is the one control here that changes what the others *mean* — it
- * reads better as a named choice with its consequence spelled out underneath.
- */
-function ApprovalPicker({
-  mode,
-  onChange,
-  disabled,
-}: {
-  mode: ApprovalMode;
-  onChange: (m: ApprovalMode) => void;
-  disabled?: boolean;
-}) {
-  const current = APPROVAL_MODES.find((m) => m.id === mode) ?? APPROVAL_MODES[0]!;
-  return (
-    // The run toolbar's approval control: the named choice inline with the toggles, its
-    // consequence carried by the tooltip rather than a visible hint line — the row has no room
-    // for a sentence, and hiding it here would be worse than shortening it.
-    <label
-      className={`flex items-center gap-1.5 text-[11px] ${disabled ? "opacity-50" : ""}`}
-      style={{ color: "var(--text-dim)" }}
-      title={current.hint}
-    >
-      <span>Approval mode</span>
-      <select
-        value={mode}
-        disabled={disabled}
-        onChange={(e) => onChange(e.target.value as ApprovalMode)}
-        aria-label="How agent tool calls are approved"
-        data-testid="approval-mode"
-        className="mono max-w-[150px] rounded-md border px-1.5 py-0.5 text-[11px] disabled:opacity-40"
-        style={inputStyle}
-      >
-        {APPROVAL_MODES.map((m) => (
-          <option key={m.id} value={m.id}>
-            {m.label}
-          </option>
-        ))}
-      </select>
-    </label>
-  );
-}

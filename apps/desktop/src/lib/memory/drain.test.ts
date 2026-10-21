@@ -55,6 +55,12 @@ beforeEach(() => {
     scope: { user: "local", project: null, agent: null, global: false },
     score: -1,
     superseded_at: null,
+    kind: m.layer === "L3" ? "identity" : m.layer === "L0" ? "conversation" : "project_fact",
+    source: "inferred",
+    verified: null,
+    expires_at: null,
+    retrieval_count: 0,
+    last_retrieved_at: null,
   }));
   sessionMemories.mockResolvedValue([]);
 });

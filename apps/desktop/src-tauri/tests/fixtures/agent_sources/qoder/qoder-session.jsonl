@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"q0000000-0000-0000-0000-000000000003","cwd":"/tmp/proj-beta","timestamp":"2026-10-03T11:00:00Z","uuid":"q1","parentUuid":null,"message":{"role":"user","content":"why is the build slow?"}}
+{"type":"assistant","sessionId":"q0000000-0000-0000-0000-000000000003","cwd":"/tmp/proj-beta","timestamp":"2026-10-03T11:00:07Z","uuid":"q2","parentUuid":"q1","message":{"role":"assistant","content":[{"type":"text","text":"The typecheck runs twice; dedupe the plugin."}]}}

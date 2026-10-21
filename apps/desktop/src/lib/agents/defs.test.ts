@@ -39,7 +39,7 @@ describe("parseSubagentDef", () => {
     expect(isValidDefId("doc-sweeper_2")).toBe(true);
   });
 
-  it("rejects an allowlist naming a tool that is not a read-effect builtin", () => {
+  it("rejects an allowlist naming a mutating or unknown tool", () => {
     // `write_file` exists in the registry but mutates; `not_a_tool` does not exist at all.
     for (const tool of ["write_file", "not_a_tool"]) {
       const got = parseSubagentDef({ ...VALID, tools: ["read_file", tool] });
@@ -47,9 +47,12 @@ describe("parseSubagentDef", () => {
     }
   });
 
-  it("accepts a read-effect allowlist and de-duplicates it", () => {
-    const got = parseSubagentDef({ ...VALID, tools: ["read_file", "list_dir", "read_file"] });
-    expect("def" in got && got.def.tools).toEqual(["read_file", "list_dir"]);
+  it("accepts read and network allowlists and de-duplicates them", () => {
+    const got = parseSubagentDef({
+      ...VALID,
+      tools: ["read_file", "web_fetch", "list_dir", "read_file"],
+    });
+    expect("def" in got && got.def.tools).toEqual(["read_file", "web_fetch", "list_dir"]);
   });
 
   it("clamps maxIterations into the loop's bounds and rejects non-numbers", () => {

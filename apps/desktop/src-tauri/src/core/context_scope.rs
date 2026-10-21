@@ -1498,6 +1498,8 @@ mod context_scope_tests {
                 session_id: None,
                 subject: None,
                 pinned: false,
+                kind: None,
+                source: None,
             },
         )
         .unwrap();
@@ -1544,6 +1546,8 @@ mod context_scope_tests {
                 session_id: None,
                 subject: None,
                 pinned: false,
+                kind: None,
+                source: None,
             },
         )
         .unwrap();
@@ -1649,6 +1653,8 @@ mod context_scope_tests {
                 session_id: None,
                 subject: None,
                 pinned: false,
+                kind: None,
+                source: None,
             },
         )
         .unwrap();
@@ -1720,6 +1726,8 @@ mod context_scope_tests {
                 session_id: None,
                 subject: None,
                 pinned: false,
+                kind: None,
+                source: None,
             },
         )
         .unwrap();
@@ -1794,6 +1802,8 @@ mod context_scope_tests {
                 session_id: None,
                 subject: None,
                 pinned: false,
+                kind: None,
+                source: None,
             },
         )
         .unwrap();
@@ -2181,6 +2191,8 @@ mod context_scope_tests {
                     session_id: None,
                     subject: None,
                     pinned,
+                    kind: None,
+                    source: None,
                 },
             )
             .unwrap();
@@ -2260,6 +2272,8 @@ mod context_scope_tests {
                     session_id: None,
                     subject: None,
                     pinned: false,
+                    kind: None,
+                    source: None,
                 },
             )
             .unwrap();

@@ -20,7 +20,8 @@ use crate::core::usage::UsageTokens;
 use super::attempt::{
     attempt_budget, attempt_disposition, attempt_outcome, candidate_is_affordable, labelled,
     records_key_health, saturated_outcome, transport_outcome, AttemptDisposition, AttemptError,
-    AttemptOutcome, SERVER_ERROR_REPROBES_MAX, SERVER_ERROR_RETRY_BACKOFF,
+    AttemptOutcome, RetryNotice, NETWORK_REPROBES_MAX, NETWORK_RETRY_BACKOFF,
+    SERVER_ERROR_REPROBES_MAX, SERVER_ERROR_RETRY_BACKOFF,
 };
 use super::health::HealthTracker;
 use super::taxonomy::{ErrorClass, COOLDOWN_FLOOR_MS};
@@ -61,6 +62,9 @@ pub struct ExecuteTextArgs<'a> {
     /// chunk stream and out of the disposition entirely: reasoning is not delivered output, so a
     /// stream that carries only reasoning is still a drained stream for every classification.
     pub on_reasoning: Option<&'a mut (dyn FnMut(&str) + Send)>,
+    /// Called before the engine sleeps to re-dial a candidate. The bridge forwards it to the
+    /// client's progress channel; it never affects the attempt, the disposition, or the chain.
+    pub on_retry: Option<&'a mut (dyn FnMut(RetryNotice) + Send)>,
     pub max_attempts: Option<usize>,
     /// Mark the last system message block with `cache_control` on egress. See
     /// [`crate::core::router::TextRequest::prompt_cache_enabled`] for the read-side note.
@@ -176,6 +180,39 @@ pub enum TextFailure {
 /// allocation on every failure. `gateway.rs:1402` allows this lint on `try_slot` for the same shape
 /// of reason: the lint's premise — a large error paid on the happy path — does not hold. The
 /// arithmetic is asserted by `the_text_results_size_comes_from_the_payload_not_from_the_error`.
+/// Put a different provider's candidates ahead of the failed provider's after a pre-output
+/// timeout.
+///
+/// **A header/first-byte timeout says the host did not answer, not that the key was refused.**
+/// The plan is ordered provider-by-provider, so the immediate next candidate is normally another
+/// key on the same host — the very retry the egress refuses to make because it reproduces the
+/// wait. On 2026-10-19 (`agent-router` / `deepseek-v4-flash`) both of one provider's keys stalled
+/// for 20 s each while `vice` carried the same model and would have been the next carrier; the
+/// second key was dialled because the plan had no reason to prefer the other host. This is that
+/// reason.
+///
+/// **Only the *remaining* candidates move, and only across providers.** Relative order is
+/// preserved inside each group, so a provider's own key rotation is untouched when it is reached;
+/// a plan with no other carrier is left exactly as it was. The caller decides *when* this applies
+/// (a `NETWORK` failure with nothing emitted); this function only states the preference.
+fn prefer_different_providers(
+    plan: &mut VecDeque<(Candidate, usize)>,
+    failed_provider_id: &str,
+    failed_provider_slug: &str,
+) {
+    if !plan.iter().any(|(c, _)| c.provider.id != failed_provider_id) {
+        return;
+    }
+    let (same_host, other_hosts): (Vec<_>, Vec<_>) =
+        plan.drain(..).partition(|(c, _)| c.provider.id == failed_provider_id);
+    plan.extend(other_hosts);
+    plan.extend(same_host);
+    tracing::info!(
+        provider = failed_provider_slug,
+        "pre-output timeout — preferring a different provider for the next dial",
+    );
+}
+
 #[allow(clippy::result_large_err)]
 pub async fn execute_text(
     adapters: &dyn AdapterFactory,
@@ -451,6 +488,8 @@ pub async fn execute_text(
                 // the re-probe from the class and wait it recorded.
                 let (outcome_cls, outcome_status, outcome_retry_after) =
                     (outcome.cls, outcome.status, outcome.retry_after_ms);
+                // Read before the push: a retry notice names the upstream's own words.
+                let outcome_reason = outcome.reason.clone();
                 if records_key_health(disposition) {
                     health.record_result(
                         &candidate.key.id,
@@ -475,6 +514,10 @@ pub async fn execute_text(
                     }
                     AttemptDisposition::Stop => break 'plan Ended::Cancelled,
                     AttemptDisposition::Next => {
+                        // Read before the re-probe below can move `candidate` into the queue.
+                        let failed_provider_id = candidate.provider.id.clone();
+                        let failed_provider_slug = candidate.provider.slug.clone();
+                        let failed_key_label = candidate.key.label.clone();
                         // **The same-key re-probe: the plan just ran out on a 5xx.** A plan with a
                         // next candidate fails over immediately — a healthy provider beats a wait
                         // on a wobbling one. With none, the only thing failover could do is give
@@ -488,8 +531,9 @@ pub async fn execute_text(
                         // floored like every other named wait, and the flat backoff otherwise.
                         // Flat, not growing, and that is measured: the admission rule below
                         // reserves a full `UPSTREAM_HEADER_TIMEOUT` behind every wait, so an 8 s
-                        // third round never fits under `PLAN_BUDGET` while a flat 2 s keeps every
-                        // round affordable (see `SERVER_ERROR_RETRY_BACKOFF`). **Admission is
+                        // third round fits only narrowly under `PLAN_BUDGET` (41.3 s of 44 s)
+                        // while a flat 2 s keeps every configured round comfortable (see
+                        // `SERVER_ERROR_RETRY_BACKOFF`). **Admission is
                         // the plan budget's own rule**: a re-probe is a candidate start, so it is
                         // priced by `candidate_is_affordable` with the wait added to the elapsed
                         // time — one full `UPSTREAM_HEADER_TIMEOUT` must still fit, which is what
@@ -517,8 +561,71 @@ pub async fn execute_text(
                                 max = SERVER_ERROR_REPROBES_MAX,
                                 "plan exhausted on SERVER_ERROR — re-probing the same key",
                             );
+                            if let Some(cb) = args.on_retry.as_deref_mut() {
+                                cb(RetryNotice {
+                                    provider: failed_provider_slug.clone(),
+                                    key: failed_key_label.clone(),
+                                    attempt: reprobes + 2,
+                                    max: SERVER_ERROR_REPROBES_MAX + 1,
+                                    delay_ms: wait.as_millis() as u64,
+                                    reason: outcome_reason.clone().unwrap_or_else(|| {
+                                        format!("upstream server error ({outcome_status})")
+                                    }),
+                                });
+                            }
                             tokio::time::sleep(wait).await;
                             plan.push_front((candidate, reprobes + 1));
+                        } else if outcome_cls == ErrorClass::Network {
+                            // **A pre-output timeout gets a different host when one exists.** The
+                            // egress does not retry a header timeout because the prompt and host
+                            // are unchanged; the same argument applies to the next key of the same
+                            // provider, which is only a fresh credential. `vice` carries the same
+                            // model in the measured case. `SERVER_ERROR` keeps the existing order —
+                            // a 5xx can be key-specific, and a same-key re-probe already covers
+                            // the exhausted-plan case.
+                            let has_other_provider =
+                                plan.iter().any(|(c, _)| c.provider.id != failed_provider_id);
+                            if !has_other_provider
+                                && reprobes < NETWORK_REPROBES_MAX
+                                && !cancel.is_cancelled()
+                                && candidate_is_affordable(
+                                    plan_started.elapsed() + NETWORK_RETRY_BACKOFF,
+                                    false,
+                                )
+                            {
+                                // **Borrowed from ZCode: one bounded roll of the same request
+                                // after a pause when there is nowhere else to go.** The wait is
+                                // priced by the same admission rule, so it cannot extend the plan
+                                // budget; after a full header timeout exactly one retry fits.
+                                tracing::info!(
+                                    provider = %candidate.provider.slug,
+                                    key = %candidate.key.label,
+                                    wait_ms = NETWORK_RETRY_BACKOFF.as_millis() as u64,
+                                    round = reprobes + 1,
+                                    max = NETWORK_REPROBES_MAX,
+                                    "no different provider — re-probing the same key after a pause",
+                                );
+                                if let Some(cb) = args.on_retry.as_deref_mut() {
+                                    cb(RetryNotice {
+                                        provider: failed_provider_slug.clone(),
+                                        key: failed_key_label.clone(),
+                                        attempt: reprobes + 2,
+                                        max: NETWORK_REPROBES_MAX + 1,
+                                        delay_ms: NETWORK_RETRY_BACKOFF.as_millis() as u64,
+                                        reason: outcome_reason.clone().unwrap_or_else(|| {
+                                            "the upstream sent no response".to_string()
+                                        }),
+                                    });
+                                }
+                                tokio::time::sleep(NETWORK_RETRY_BACKOFF).await;
+                                plan.push_front((candidate, reprobes + 1));
+                            } else if has_other_provider {
+                                prefer_different_providers(
+                                    &mut plan,
+                                    &failed_provider_id,
+                                    &failed_provider_slug,
+                                );
+                            }
                         }
                         continue;
                     }

@@ -7,7 +7,11 @@
  * paint half stays in the screen — this module owns the recording half, so a run's steps are
  * recorded as they arrive even though the UI is only forwarding them.
  */
-import { userContent, textOfContent, type ChatMessage } from "@aiprovider/router-core";
+import {
+  userContent,
+  textOfContent,
+  type ChatMessage,
+} from "@aiprovider/router-core";
 import { runAgentLoop, withSubagentDefs } from "../../tools";
 import { fetchMcpTools } from "../../tools/mcp-client";
 import { RunCheckpoint, createCheckpointingHost } from "../../tools/changeset";
@@ -17,6 +21,7 @@ import { clip, recordAgentTurn } from "./graph-record";
 import { attachmentMeta } from "./ports";
 import type { TurnRequestBase } from "./ports";
 import type { AgentTurnPorts, FallbackAttempt } from "./ports";
+import { retryNoticeLabel } from "../../gateway-turn";
 
 export interface AgentTurnRequest extends TurnRequestBase {
   /** The workspace root; blank refuses the run (the guard is the engine's, not the UI's). */
@@ -40,7 +45,9 @@ export interface AgentTurnRequest extends TurnRequestBase {
    * where nobody can press Stop, and the Assistant's user can. A verification demand is not a bound
    * — it holds a turn that claimed completion without evidence, and the user can still stop it.
    */
-  verificationNudgeMax?: Parameters<typeof runAgentLoop>[0]["verificationNudgeMax"];
+  verificationNudgeMax?: Parameters<
+    typeof runAgentLoop
+  >[0]["verificationNudgeMax"];
   /**
    * The active AXIOM version's prompt blocks, applied to this turn's system prompt — see
    * `AgentSystemParts.axiomPatches`. Absent means the agent runs exactly as it did before AXIOM
@@ -71,13 +78,26 @@ export interface AgentTurnRequest extends TurnRequestBase {
    */
   sessions?: Parameters<typeof runAgentLoop>[0]["sessions"];
   /**
+   * The foreign-agent session surface behind `search_agents` / `load_session` — see
+   * `AgentLoopOptions.sources`. The screen owns the Tauri bridge to the host's `/admin/sources*`
+   * routes; the loop only serves the tools.
+   */
+  sources?: Parameters<typeof runAgentLoop>[0]["sources"];
+  /**
+   * The manifest behind `read_manifest` / `forget_memory` — see `AgentLoopOptions.manifest`. The
+   * screen owns both the composed manifest and the memory store; the loop only serves the tools.
+   */
+  manifest?: Parameters<typeof runAgentLoop>[0]["manifest"];
+  /**
    * The plan-mode facilities behind `enter_plan_mode` / `exit_plan_mode`: the review modal, the
    * mode switch the gate reads, and the plan file. The screen owns all three — it holds the
    * approval ref, the session id and the workspace root — and the loop only forwards them.
    */
   plan?: Parameters<typeof runAgentLoop>[0]["plan"];
   /** The sub-agent's step budget, from the user's defaults; absent means the loop's built-in. */
-  subagentMaxIterations?: Parameters<typeof runAgentLoop>[0]["subagentMaxIterations"];
+  subagentMaxIterations?: Parameters<
+    typeof runAgentLoop
+  >[0]["subagentMaxIterations"];
   /**
    * The enabled user-authored subagent specialists, parsed and validated by the screen (the
    * same screen-owns-the-store rule as `loadSkill`). Their ids join `dispatch_agent`'s
@@ -99,11 +119,18 @@ export interface AgentTurnRequest extends TurnRequestBase {
   confirm: Parameters<typeof runAgentLoop>[0]["confirm"];
 }
 
-export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts): Promise<void> {
+export async function runAgentTurn(
+  req: AgentTurnRequest,
+  ports: AgentTurnPorts,
+): Promise<void> {
   if (!req.root.trim()) {
     // Undo the optimistic append: the turn never ran, so it must not sit in the transcript.
     ports.onReplaceTranscript(req.baseMsgs);
-    ports.onTrace({ ms: 0, fallbacks: [], error: "set a workspace root before using agent mode" });
+    ports.onTrace({
+      ms: 0,
+      fallbacks: [],
+      error: "set a workspace root before using agent mode",
+    });
     ports.onBusy(false);
     ports.onStopping(false);
     ports.clearAbort();
@@ -125,13 +152,21 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
   // reads the file's previous contents *before* the write — that is what makes both the review
   // diff and "revert this run" show what actually changed rather than what the model claimed.
   const checkpoint = new RunCheckpoint();
-  const host = createCheckpointingHost(ports.makeBaseHost(req.root.trim()), checkpoint);
+  const host = createCheckpointingHost(
+    ports.makeBaseHost(req.root.trim()),
+    checkpoint,
+  );
   // The user's node is created here rather than inside recordAgentTurn, because the recall edges
   // need an anchor before the run starts. Same shape as the plain-chat branch: one node per turn,
   // reused by everything that needs to point at it.
   const rec = ports.recorder;
-  const userNode = rec.node("message", clip(req.text, 120), { role: "user", model: req.model, text: req.text });
-  if (ports.lastNode.current) rec.edge(ports.lastNode.current, userNode, "follows");
+  const userNode = rec.node("message", clip(req.text, 120), {
+    role: "user",
+    model: req.model,
+    text: req.text,
+  });
+  if (ports.lastNode.current)
+    rec.edge(ports.lastNode.current, userNode, "follows");
   // P7: recall before the run so the agent starts from what is already known. Awaited, because the
   // recalled block has to be in the system prompt before the first call.
   const recalled = req.useMemory ? await ports.memory.recall(req.text) : [];
@@ -142,11 +177,32 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
   const recalledRefs = recalledLight(recalled);
   // Replay prior turns verbatim — including assistant turns that carry tool_calls and the
   // tool-result turns that answer them — so the model keeps its chaining context.
+  let replayed = replayHistory(req.baseMsgs);
+  // Automatic compaction happens before the current user turn is appended, so the turn that
+  // triggered it is never summarized away. The slice below uses the compacted history's length,
+  // which keeps this turn's durable rows separate from the summary.
+  if (req.compact && req.compactBudget) {
+    const compacted = await req.compact(replayed, req.compactBudget);
+    if (compacted.compressed) {
+      replayed = compacted.messages;
+      req.onCompacted?.({
+        dropped: compacted.dropped,
+        beforeTokens: compacted.beforeTokens,
+        afterTokens: compacted.afterTokens,
+      });
+    }
+  }
   const history: ChatMessage[] = [
-    ...replayHistory(req.baseMsgs),
+    ...replayed,
     {
       role: "user",
-      content: userContent(req.text, req.attachments.map((a) => ({ mediaType: a.mediaType, dataBase64: a.dataBase64 }))),
+      content: userContent(
+        req.text,
+        req.attachments.map((a) => ({
+          mediaType: a.mediaType,
+          dataBase64: a.dataBase64,
+        })),
+      ),
     },
   ];
   let iterations = 0;
@@ -163,7 +219,12 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
     // P6: every event is appended to the run record as it arrives, not batched at the end, so a
     // run that is stopped or crashes is still fully inspectable from the dashboard.
     if (ev.type === "tool_call") {
-      ports.orchestrator.recordStep(runId, "tool_call", ev.call.name ?? "?", ev.call.arguments ?? undefined);
+      ports.orchestrator.recordStep(
+        runId,
+        "tool_call",
+        ev.call.name ?? "?",
+        ev.call.arguments ?? undefined,
+      );
     } else if (ev.type === "tool_result") {
       // `refused` as well as `denied`: plan mode refuses a write on its own behalf, and the two
       // are the same thing to the reader ("the agent did not run this") while being different
@@ -171,7 +232,13 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
       // full sentence is in the recorded step. Without `refused` in this test every plan-mode
       // refusal painted the caller's block as an unexpected failure.
       const denied = /denied|refused/i.test(ev.result);
-      ports.orchestrator.recordStep(runId, denied ? "denied" : "tool_result", ev.call.name ?? "?", ev.result.slice(0, 500), ev.ok);
+      ports.orchestrator.recordStep(
+        runId,
+        denied ? "denied" : "tool_result",
+        ev.call.name ?? "?",
+        ev.result.slice(0, 500),
+        ev.ok,
+      );
     } else if (ev.type === "done") {
       iterations = ev.iterations;
       ports.orchestrator.recordStep(
@@ -196,8 +263,17 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
     }
     ports.onAgentEvent(ev);
   };
+  // The durable transcript is written on the success path below. If the turn stops or throws,
+  // the `finally` writes the turn anyway — a partial turn is still part of the conversation, and
+  // the plain-chat branch already does this. `transcriptWritten` keeps the two paths exclusive.
+  let transcriptWritten = false;
+  let failureText = "";
   try {
-    const { text: finalText, messages, hitCeiling } = await runAgentLoop({
+    const {
+      text: finalText,
+      messages,
+      hitCeiling,
+    } = await runAgentLoop({
       model: req.model,
       messages: history,
       // The per-turn instruction goes last: it is the most specific thing in the prompt, and it is
@@ -208,6 +284,7 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
         custom: req.customAgentPrompt,
         skillsBlock: req.skillsBlock,
         referencesBlock: req.referencesBlock,
+        manifest: req.manifestBlock,
         recalledMemory: ports.memory.block(recalled),
         planMode: req.planMode,
         perTurn: req.perTurn,
@@ -219,7 +296,9 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
       // The enabled specialists ride `dispatch_agent`'s description (cloned, never mutating
       // AGENT_TOOLS) so the model can pick one by id.
       registry: [
-        ...withSubagentDefs(req.subagentDefs ?? [], { canWrite: req.subagentCanWrite === true }),
+        ...withSubagentDefs(req.subagentDefs ?? [], {
+          canWrite: req.subagentCanWrite === true,
+        }),
         ...(await fetchMcpTools()),
       ],
       // Tier 2: when this request has to drop context, the dropped turns are summarized rather
@@ -233,18 +312,33 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
         // as a zero-token one (see `chargeSessionUsage`).
         let callIn: number | undefined;
         let callOut: number | undefined;
+        /** Only clear a retry line that this call actually painted. */
+        let retryPainted = false;
         const p = ports.generate(
           {
             ...(req.thinking ? { reasoning: req.thinking } : {}),
             ...loopReq,
-            ...(typeof req.temperature === "number" ? { temperature: req.temperature } : {}),
-            ...(typeof req.maxTokens === "number" ? { maxTokens: req.maxTokens } : {}),
+            ...(typeof req.temperature === "number"
+              ? { temperature: req.temperature }
+              : {}),
+            ...(typeof req.maxTokens === "number"
+              ? { maxTokens: req.maxTokens }
+              : {}),
+            onRetry: (n) => {
+              retryPainted = true;
+              ports.patchMsg(req.assistantMsgId, {
+                retryStatus: retryNoticeLabel(n),
+              });
+            },
             onUsage: (u) => {
               loopReq.onUsage?.(u);
               ports.onLastUsage(u);
               // Summed, not replaced: an agent turn is several model calls, and the live status
               // line shows what the whole run has spent so far.
-              ports.onRunUsageAdded(u.prompt_tokens ?? 0, u.completion_tokens ?? 0);
+              ports.onRunUsageAdded(
+                u.prompt_tokens ?? 0,
+                u.completion_tokens ?? 0,
+              );
               runIn += u.prompt_tokens ?? 0;
               runOut += u.completion_tokens ?? 0;
               callIn = (callIn ?? 0) + (u.prompt_tokens ?? 0);
@@ -260,9 +354,21 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
           // stopped run still charges the usage it already received. Served ids only exist once
           // the stream ends, so pricing happens here rather than in `onUsage`.
           chunks: (async function* () {
+            let cleared = false;
             try {
-              for await (const chunk of exec.chunks) yield chunk;
+              for await (const chunk of exec.chunks) {
+                if (retryPainted && !cleared) {
+                  cleared = true;
+                  ports.patchMsg(req.assistantMsgId, {
+                    retryStatus: undefined,
+                  });
+                }
+                yield chunk;
+              }
             } finally {
+              if (retryPainted && !cleared) {
+                ports.patchMsg(req.assistantMsgId, { retryStatus: undefined });
+              }
               const s = exec.served();
               ports.chargeUsage(callIn, callOut, s?.provider, s?.model);
               if (s?.fallbacks) chain.push(...s.fallbacks);
@@ -275,6 +381,8 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
       loadSkill: req.loadSkill,
       cacheImage: req.cacheImage,
       sessions: req.sessions,
+      manifest: req.manifest,
+      sources: req.sources,
       plan: req.plan,
       subagentMaxIterations: req.subagentMaxIterations,
       // The user-authored specialists: the loop resolves `agent` ids to their prompt, toolset,
@@ -328,7 +436,10 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
           : `the step budget for this turn was ${budget}. Raise or clear “Steps” in the run ` +
             "configuration to let one turn go further, then ask again to carry on.")
       : finalText;
-    const fullMessages: ChatMessage[] = [...messages, { role: "assistant", content: closingText }];
+    const fullMessages: ChatMessage[] = [
+      ...messages,
+      { role: "assistant", content: closingText },
+    ];
     ports.onReplaceTranscript(
       fullMessages.map((m, i) => ({
         id: newMsgId(),
@@ -349,7 +460,12 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
     // Only this turn's messages. `runAgentLoop` seeds its working copy from `history` and returns
     // the whole transcript, so slicing off the replayed prefix is what keeps an earlier turn from
     // being re-recorded — and keeps the graph linear in turns.
-    ports.lastNode.current = recordAgentTurn(rec, userNode, fullMessages.slice(history.length), req.model);
+    ports.lastNode.current = recordAgentTurn(
+      rec,
+      userNode,
+      fullMessages.slice(history.length),
+      req.model,
+    );
     // The durable transcript (0027), from the same slice the graph just recorded — only this
     // turn's messages, so a resumed conversation does not re-record its own prefix. The tool pair
     // is carried verbatim: `tool_calls` on the assistant turn and `tool_call_id` on each result,
@@ -375,11 +491,14 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
         // The durable copy of the recall record, on the closing assistant row — the same row the
         // resumed transcript renders the card under.
         memoryRefs:
-          i === slice.length - 1 && m.role === "assistant" && recalledRefs.length > 0
+          i === slice.length - 1 &&
+          m.role === "assistant" &&
+          recalledRefs.length > 0
             ? JSON.stringify(recalledRefs)
             : null,
       })),
     ]);
+    transcriptWritten = true;
     // P7: remember the exchange, then distil it. Distillation is deliberately not awaited —
     // it is an extra model call, and a slow or failing one must not hold up the answer the
     // user is already reading.
@@ -387,7 +506,9 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
       void ports.memory
         .remember(rec.sessionId, req.text, finalText)
         .then(() => ports.memory.distil(rec.sessionId, req.model))
-        .catch(() => { /* memory distillation is best-effort */ });
+        .catch(() => {
+          /* memory distillation is best-effort */
+        });
     }
     // An abort mid-stream with no tool calls yet returns from the loop normally (the chunk loop
     // just breaks), so the success path — not only the catch — must distinguish a stopped run.
@@ -411,7 +532,14 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
     } else {
       // Arity kept at three for the clean paths, as it was: only a run that ended for a reason
       // carries one, which is also how the catch path below already calls it.
-      ports.orchestrator.endRun(runId, stopped ? "stopped" : "ok", iterations, undefined, runIn, runOut);
+      ports.orchestrator.endRun(
+        runId,
+        stopped ? "stopped" : "ok",
+        iterations,
+        undefined,
+        runIn,
+        runOut,
+      );
     }
     ports.onTrace({
       ms: ports.now() - req.startedAt,
@@ -428,15 +556,57 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
     // assistant turn behind, which rendered as a bare "…" — indistinguishable from a model that
     // had not answered yet — with the only clue a thin red line above the composer.
     if (req.controller.signal.aborted) {
-      ports.orchestrator.endRun(runId, "stopped", iterations, undefined, runIn, runOut);
-      ports.onTrace({ ms: ports.now() - req.startedAt, fallbacks: [], error: "stopped by you" });
-      ports.fillIfEmpty(req.assistantMsgId, "⚠ stopped by you — this turn did not finish. Send again, or retry it from the message actions.");
+      ports.orchestrator.endRun(
+        runId,
+        "stopped",
+        iterations,
+        undefined,
+        runIn,
+        runOut,
+      );
+      ports.onTrace({
+        ms: ports.now() - req.startedAt,
+        fallbacks: [],
+        error: "stopped by you",
+      });
+      failureText =
+        "⚠ stopped by you — this turn did not finish. Send again, or retry it from the message actions.";
+      ports.fillIfEmpty(req.assistantMsgId, failureText);
     } else {
-      ports.orchestrator.endRun(runId, "error", iterations, (e as Error).message, runIn, runOut);
-      ports.onTrace({ ms: ports.now() - req.startedAt, fallbacks: [], error: (e as Error).message });
-      ports.fillIfEmpty(req.assistantMsgId, `⚠ ${(e as Error).message}`);
+      ports.orchestrator.endRun(
+        runId,
+        "error",
+        iterations,
+        (e as Error).message,
+        runIn,
+        runOut,
+      );
+      ports.onTrace({
+        ms: ports.now() - req.startedAt,
+        fallbacks: [],
+        error: (e as Error).message,
+      });
+      failureText = `⚠ ${(e as Error).message}`;
+      ports.fillIfEmpty(req.assistantMsgId, failureText);
     }
   } finally {
+    // A stopped or failed run never reached the success append. Record the user's turn and the
+    // failure the bubble shows, so resuming the session does not silently lose the exchange.
+    if (!transcriptWritten) {
+      ports.transcript.append([
+        {
+          role: "user",
+          content: req.text,
+          attachments: attachmentMeta(req.attachments),
+          model: null,
+        },
+        {
+          role: "assistant",
+          content: failureText || "⚠ this turn did not finish",
+          model: req.model,
+        },
+      ]);
+    }
     // Flush here, not on the success path only. The user's node — and any recall edges anchored
     // to it — is created before the run starts, so a stopped or failed run would otherwise leave
     // those nodes buffered and silently prepend them to the next turn's batch. Same policy as the

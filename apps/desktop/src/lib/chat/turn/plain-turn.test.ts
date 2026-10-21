@@ -3,6 +3,7 @@ import { runPlainTurn, REASONING_PAINT_MS, type PlainTurnRequest } from "./plain
 import type { Trace, TranscriptEntry, TurnPorts } from "./ports";
 import type { ServedBy } from "../../gateway-turn";
 import type { Memory } from "../../../store";
+import type { ChatMessage, CompressResult } from "@aiprovider/router-core";
 
 /** A recording fake of the Recorder interface. */
 function fakeRecorder() {
@@ -118,7 +119,7 @@ function makeRequest(over: Partial<PlainTurnRequest> = {}): PlainTurnRequest {
 }
 
 describe("runPlainTurn", () => {
-  it("patches the transcript per chunk with the accumulated content, and flushes the final reasoning", async () => {
+  it("coalesces content patches and flushes the final text", async () => {
     const { ports, patches, lastReq } = makePorts({ chunks: ["hel", "lo w", "orld"] });
     const run = runPlainTurn(makeRequest(), ports);
     // Deltas arrive mid-stream in the real wire; drive reasoning the same way.
@@ -127,8 +128,62 @@ describe("runPlainTurn", () => {
     (lastReq()!.onReasoning as (t: string) => void)("thinking hard");
     await run;
     const contentPatches = patches.filter((p) => "content" in p.patch);
-    expect(contentPatches.map((p) => p.patch.content)).toEqual(["hel", "hello w", "hello world"]);
+    // The first delta paints; the rest of a fast burst is coalesced, then the tail is flushed.
+    expect(contentPatches.map((p) => p.patch.content)).toEqual(["hel", "hello world"]);
     expect(patches[patches.length - 1]!.patch).toHaveProperty("reasoning", "thinking hard");
+  });
+
+  it("coalesces a long stream instead of painting every delta", async () => {
+    const chunks = Array.from({ length: 5_000 }, (_, i) => `t${i} `);
+    const { ports, patches } = makePorts({ chunks });
+    await runPlainTurn(makeRequest(), ports);
+    const contentPatches = patches.filter((p) => "content" in p.patch);
+    // The first delta paints, the rest of the burst coalesces, and the tail flushes.
+    expect(contentPatches.length).toBeLessThan(200);
+    expect(contentPatches[contentPatches.length - 1]!.patch.content).toBe(chunks.join(""));
+  });
+
+  it("auto-compacts the replayed history before the request", async () => {
+    const compacted = [
+      { role: "system" as const, content: "summary of earlier turns" },
+      { role: "user" as const, content: "hello there" },
+    ];
+    const compact = vi.fn(async () => ({
+      messages: compacted,
+      dropped: 2,
+      droppedMessages: [],
+      beforeTokens: 900,
+      afterTokens: 300,
+      budget: 400,
+      compressed: true,
+    }));
+    const onCompacted = vi.fn();
+    const { ports, lastReq } = makePorts({ chunks: ["ok"] });
+    await runPlainTurn(makeRequest({ compact, compactBudget: 400, onCompacted }), ports);
+
+    expect(compact).toHaveBeenCalledOnce();
+    expect(onCompacted).toHaveBeenCalledWith({ dropped: 2, beforeTokens: 900, afterTokens: 300 });
+    const messages = lastReq()!.messages as { role: string; content: string }[];
+    expect(messages).toContainEqual({ role: "system", content: "summary of earlier turns" });
+  });
+
+  it("does not announce compaction when the history fits", async () => {
+    const compact = vi.fn(
+      async (messages: readonly ChatMessage[], budget: number): Promise<CompressResult> => ({
+        messages: [...messages],
+        dropped: 0,
+        droppedMessages: [],
+        beforeTokens: 100,
+        afterTokens: 100,
+        budget,
+        compressed: false,
+      }),
+    );
+    const onCompacted = vi.fn();
+    const { ports } = makePorts({ chunks: ["ok"] });
+    await runPlainTurn(makeRequest({ compact, compactBudget: 400, onCompacted }), ports);
+    expect(compact).toHaveBeenCalledOnce();
+    expect(onCompacted).not.toHaveBeenCalled();
   });
 
   it("paints reasoning on the throttle interval, not per delta", async () => {
@@ -311,6 +366,12 @@ describe("runPlainTurn", () => {
       scope: { user: "local", project: null, agent: null, global: false },
       score: -1,
       superseded_at: null,
+      kind: "project_fact",
+      source: "inferred",
+      verified: null,
+      expires_at: null,
+      retrieval_count: 0,
+      last_retrieved_at: null,
     };
     const { ports, patches, appended } = makePorts({ chunks: ["got it"], recalled: [remembered] });
     await runPlainTurn(makeRequest(), ports);

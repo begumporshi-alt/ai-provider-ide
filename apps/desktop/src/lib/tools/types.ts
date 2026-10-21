@@ -9,11 +9,21 @@
  * `createTauriToolHost` (host.ts); unit tests inject a fake. That is what makes the loop
  * deterministic and testable without a desktop shell.
  */
-import type { ChatMessage, TextRequest, TextStream, UsageTokens } from "@aiprovider/router-core";
+import type {
+  ChatMessage,
+  TextRequest,
+  TextStream,
+  UsageTokens,
+} from "@aiprovider/router-core";
 
 /** What a tool does to the workspace. Declared per tool so the approval policy can be a function
  *  of the declaration instead of a second hardcoded list that drifts away from this one. */
-export type ToolEffect = "read" | "mutate";
+/**
+ * What a tool does to the world. `network` is separate from `read`: a fetch sends data out as
+ * well as bringing it in, so "auto-approve reads" must not silently approve it — a prompt-injected
+ * page can encode workspace content in a URL. `mutate` still covers the workspace.
+ */
+export type ToolEffect = "read" | "network" | "mutate";
 
 /**
  * One delegated child's live state, as the parent loop sees it. Emitted while a
@@ -74,13 +84,22 @@ export type AgentEvent =
    */
   | { type: "reasoning"; text: string }
   | { type: "tool_call"; call: import("@aiprovider/router-core").ToolCall }
-  | { type: "tool_result"; call: import("@aiprovider/router-core").ToolCall; result: string; ok: boolean }
+  | {
+      type: "tool_result";
+      call: import("@aiprovider/router-core").ToolCall;
+      result: string;
+      ok: boolean;
+    }
   /**
    * A full snapshot of one delegation call's children. Carries the whole list, not a delta, so
    * the fold is idempotent and a UI that missed an earlier event is corrected by the next one.
    * `callId` is the `dispatch_agent` / `fan_out` call the children belong to.
    */
-  | { type: "subagent_progress"; callId: string; children: SubagentChildProgress[] }
+  | {
+      type: "subagent_progress";
+      callId: string;
+      children: SubagentChildProgress[];
+    }
   /**
    * The model's stream ended before it declared a finish (the provider cut a declared-finish
    * stream short) and the loop is re-asking the same iteration. `attempt` counts re-asks.
@@ -108,7 +127,13 @@ export type AgentEvent =
    * things and the UI owes the reader a different sentence for each — measured 2026-10-06, where
    * a ceiling exit appended an empty assistant turn and the transcript showed a bare bubble.
    */
-  | { type: "done"; text: string; iterations: number; truncated?: boolean; hitCeiling?: boolean };
+  | {
+      type: "done";
+      text: string;
+      iterations: number;
+      truncated?: boolean;
+      hitCeiling?: boolean;
+    };
 
 /**
  * Everything the two plan-mode control tools need from their owner (the screen, in production).
@@ -209,6 +234,62 @@ export interface SessionPorts {
   read(sessionId: string): Promise<SessionTurn[]>;
 }
 
+/**
+ * The foreign-agent session surface behind `search_agents` / `load_session`.
+ *
+ * One read-only index across every adapter the host can see, and a snapshot import that copies
+ * a chosen session into this app's transcript store. The rows are the loop's normalized shape
+ * (camelCase, not the HTTP wire shape) — the port implementation maps from the gateway route.
+ */
+export interface AgentSourceSession {
+  source: string;
+  nativeId: string;
+  title: string | null;
+  root: string | null;
+  turns: number;
+  preview: string;
+  importId: string | null;
+}
+
+export interface SourceListEntry {
+  name: string;
+  available: boolean;
+  sessionCount: number;
+  note: string | null;
+}
+
+/** Read-only discovery and a consenting, idempotent import of foreign sessions. */
+export interface AgentSourcePorts {
+  listSources(): Promise<SourceListEntry[]>;
+  searchSessions(
+    query: string,
+    root: string | null,
+    limit: number,
+  ): Promise<AgentSourceSession[]>;
+  importSession(
+    source: string,
+    nativeId: string,
+  ): Promise<{ sessionId: string; turns: number }>;
+}
+
+/**
+ * One row as `read_manifest` hands it to the model: the stable id, what kind of row it is, the
+ * text, the scope it applies to, and — for a capability — what the live policy said about it.
+ */
+export interface ManifestToolEntry {
+  id: string;
+  kind: string;
+  text: string;
+  scope: string;
+  verified: string | null;
+}
+
+/** The manifest tools' seam: read the session's composed manifest, delete one entry by id. */
+export interface ManifestPorts {
+  read(): Promise<ManifestToolEntry[]>;
+  forget(id: string): Promise<boolean>;
+}
+
 export interface AgentLoopOptions {
   model: string;
   /** Initial conversation (user turns). The loop appends assistant/tool turns internally. */
@@ -256,6 +337,20 @@ export interface AgentLoopOptions {
    * contract `generateImage` has — because an empty list and "no store" are different facts.
    */
   sessions?: SessionPorts;
+  /**
+   * The foreign-agent session surface behind `search_agents` / `load_session`: a read-only
+   * list of adapters and their sessions, plus a consenting import that copies a chosen session
+   * into this app's transcript. Absent — tests, the gateway bridge — both tools refuse with a
+   * sentence saying so, the same contract `sessions` has.
+   */
+  sources?: AgentSourcePorts;
+  /**
+   * The manifest behind `read_manifest` / `forget_memory`: the scoped rows this turn was given,
+   * and deletion by id. The screen owns the composed manifest (it builds it per turn) and the
+   * memory store; the loop only serves the tools. Absent — tests, the gateway bridge — both
+   * refuse with a sentence rather than reading as "the manifest is empty".
+   */
+  manifest?: ManifestPorts;
   /**
    * The plan-mode facilities behind `enter_plan_mode` / `exit_plan_mode`. Absent — tests, the
    * gateway bridge — both tools refuse with a sentence telling the model to present the plan in
@@ -346,7 +441,13 @@ export interface AgentLoopOptions {
       model: string;
       prompt?: string;
     }): void;
-    recordStep(runId: string, kind: string, label?: string, detail?: string, ok?: boolean): void;
+    recordStep(
+      runId: string,
+      kind: string,
+      label?: string,
+      detail?: string,
+      ok?: boolean,
+    ): void;
     /** `promptTokens`/`completionTokens` are the run's own model calls, summed. */
     endRun(
       runId: string,

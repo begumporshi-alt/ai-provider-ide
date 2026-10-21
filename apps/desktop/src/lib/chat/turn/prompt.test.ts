@@ -6,6 +6,17 @@ import { PROMPT_CAP, countPatches } from "@aiprovider/axiom-core";
 import type { ChatMessage } from "@aiprovider/router-core";
 
 describe("buildAgentSystem", () => {
+  it("names the checks to run when a project has no test script, and how to verify print and devices", () => {
+    // The failure this pins: a project with only dev/build/start/typecheck was reported as
+    // "nothing to run", and print verification stopped at Chrome's default Letter paper. The
+    // prompt has to name the fallback checks and the tools that reach real paper sizes/devices.
+    expect(AGENT_SYSTEM).toContain("no test script");
+    expect(AGENT_SYSTEM).toContain("typecheck");
+    expect(AGENT_SYSTEM).toContain("nothing to run");
+    expect(AGENT_SYSTEM).toContain("paper");
+    expect(AGENT_SYSTEM).toContain("device_screenshot");
+  });
+
   it("concatenates base → skills → memory → plan mode → per-turn, omitting absent pieces", () => {
     const out = buildAgentSystem({
       root: "/tmp/ws",
@@ -67,6 +78,17 @@ describe("buildAgentSystem", () => {
     expect(without).not.toContain("References gathered");
     const empty = buildAgentSystem({ root: "", skillsBlock: "", referencesBlock: "" });
     expect(empty).toBe(without);
+  });
+
+  it("puts the manifest above the recalled block so stable knowledge reads first", () => {
+    const out = buildAgentSystem({
+      root: "",
+      skillsBlock: "",
+      manifest: "Session manifest",
+      recalledMemory: "remembered fact",
+    });
+    expect(out.indexOf("Session manifest")).toBeGreaterThan(-1);
+    expect(out.indexOf("Session manifest")).toBeLessThan(out.indexOf("remembered fact"));
   });
 
   it("puts a promoted version's blocks after the base prompt and before the per-turn context", () => {
@@ -133,7 +155,7 @@ describe("buildPlainRequestMessages", () => {
   ];
 
   it("orders system → recall → per-turn → history → user", () => {
-    const out = buildPlainRequestMessages("be terse", "remembered", "stay short", history, { content: "now this" });
+    const out = buildPlainRequestMessages("be terse", undefined, "remembered", "stay short", history, { content: "now this" });
     expect(out.map((m) => m.role)).toEqual(["system", "system", "system", "user", "assistant", "user"]);
     expect(out[0]).toEqual({ role: "system", content: "be terse" });
     expect(out[1]).toEqual({ role: "system", content: "remembered" });
@@ -141,18 +163,27 @@ describe("buildPlainRequestMessages", () => {
     expect(out[5]).toEqual({ role: "user", content: "now this" });
   });
 
+  it("puts the manifest above the recalled block so stable knowledge reads first", () => {
+    const out = buildPlainRequestMessages(
+      "system", "Session manifest", "Context recalled from memory", "", [],
+      { content: "hi", attachments: [] },
+    );
+    const system = out.filter((m) => m.role === "system").map((m) => m.content);
+    expect(system).toEqual(["system", "Session manifest", "Context recalled from memory"]);
+  });
+
   it("omits the system turn entirely when the prompt resolves to nothing (blank editor's third state)", () => {
-    const out = buildPlainRequestMessages(undefined, undefined, "", [], { content: "hi" });
+    const out = buildPlainRequestMessages(undefined, undefined, undefined, "", [], { content: "hi" });
     expect(out).toEqual([{ role: "user", content: "hi" }]);
   });
 
   it("falls back to the built-in no-tools guard only when the caller resolved it that way", () => {
-    const out = buildPlainRequestMessages(NO_TOOLS_SYSTEM, undefined, "", [], { content: "hi" });
+    const out = buildPlainRequestMessages(NO_TOOLS_SYSTEM, undefined, undefined, "", [], { content: "hi" });
     expect(out[0]).toEqual({ role: "system", content: NO_TOOLS_SYSTEM });
   });
 
   it("sends an image-bearing user turn as content parts", () => {
-    const out = buildPlainRequestMessages(undefined, undefined, "", [], {
+    const out = buildPlainRequestMessages(undefined, undefined, undefined, "", [], {
       content: "what is this?",
       attachments: [{ mediaType: "image/png", dataBase64: "aGk=" } as never],
     });

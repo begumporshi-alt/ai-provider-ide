@@ -41,6 +41,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::core::agent_sources;
 use crate::core::context;
 use crate::core::gateway::{
     check_gateway_key, err, openai_error, peer_ip, GatewayCore, APP_KEY_PREFIX,
@@ -1061,6 +1062,16 @@ pub struct MemoryRecallBody {
     pub query: String,
     pub limit: Option<usize>,
     pub layers: Option<Vec<String>>,
+    /// Workspace root; resolved host-side to the same project key the gateway uses.
+    /// Omitted means the Memory screen's intentional global search.
+    pub project_root: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ScopedListBody {
+    pub project_root: Option<String>,
+    pub limit: Option<usize>,
+    pub pinned_only: Option<bool>,
 }
 
 pub async fn memory_recall_h(
@@ -1075,12 +1086,99 @@ pub async fn memory_recall_h(
         Ok(s) => s,
         Err(r) => return *r,
     };
-    match memory::recall(store, &body.query, body.limit.unwrap_or(8), body.layers.as_deref()) {
+    let scope = body
+        .project_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .and_then(crate::core::gateway::context_scope::project_key_from_root)
+        .map(|project| memory::RecallScope { user: None, project: Some(project), agent: None });
+    let limit = body.limit.unwrap_or(8);
+    let result = match scope {
+        Some(sc) => memory::recall_scoped(store, &body.query, limit, body.layers.as_deref(), &sc),
+        None => memory::recall(store, &body.query, limit, body.layers.as_deref()),
+    };
+    match result {
         Ok(rows) => (StatusCode::OK, Json(rows)).into_response(),
         Err(e) => admin_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("could not recall: {e}"),
             Some("memory_recall_failed"),
+        ),
+    }
+}
+
+/// `POST /admin/memory/scoped` — rows visible to one workspace. This is the Assistant's
+/// read surface: the same predicate `recall_scoped` applies, without the FTS query, so
+/// identity/preferences can ride along even when the user's turn shares no words with them.
+pub async fn memory_scoped_list_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Json(body): Json<ScopedListBody>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers).await {
+        return *r;
+    }
+    let store = match require_store(&core, "POST /admin/memory/scoped") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    let Some(project) = body
+        .project_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .and_then(crate::core::gateway::context_scope::project_key_from_root)
+    else {
+        return admin_error(
+            StatusCode::BAD_REQUEST,
+            "project_root is required and must resolve to a workspace",
+            Some("scope_required"),
+        );
+    };
+    let scope = memory::RecallScope { user: None, project: Some(project), agent: None };
+    match memory::list_scoped(
+        store,
+        Some(&scope),
+        body.limit.unwrap_or(200),
+        body.pinned_only.unwrap_or(false),
+    ) {
+        Ok(rows) => (StatusCode::OK, Json(rows)).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not list scoped memories: {e}"),
+            Some("memory_scope_list_failed"),
+        ),
+    }
+}
+
+/// `POST /admin/memory/retrieved` — bump the usage counters for the rows a turn recalled.
+///
+/// The gateway's read path is deliberately read-only; the webview reports what it actually
+/// injected after the request is already in flight, so a counter write can never delay a turn.
+#[derive(Deserialize)]
+pub struct RetrievedBody {
+    pub ids: Vec<String>,
+}
+
+pub async fn memory_retrieved_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Json(body): Json<RetrievedBody>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers).await {
+        return *r;
+    }
+    let store = match require_store(&core, "POST /admin/memory/retrieved") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    match memory::mark_retrieved(store, &body.ids) {
+        Ok(n) => (StatusCode::OK, Json(serde_json::json!({ "updated": n }))).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not mark retrieved: {e}"),
+            Some("memory_retrieved_failed"),
         ),
     }
 }
@@ -1718,4 +1816,257 @@ pub async fn workspace_root_set_h(
             Some("bad_workspace_root"),
         ),
     }
+}
+
+// ---------- cross-agent session sources ----------
+
+/// `GET /admin/sources` — every adapter, its availability, and how many sessions it sees.
+///
+/// Availability is data, not an error: an agent that is not installed is a normal machine state,
+/// and the UI says "nothing found" for it rather than reporting a broken surface.
+pub async fn sources_list_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorize(&core, &headers).await {
+        return *r;
+    }
+    let sources = agent_sources::all_sources(core.store().cloned());
+    let mut out = Vec::new();
+    for source in sources {
+        let refs = source.list().unwrap_or_default();
+        out.push(json!({
+            "name": source.name(),
+            "available": !refs.is_empty(),
+            "sessionCount": refs.len(),
+            "note": if refs.is_empty() { Some("no sessions found") } else { None },
+        }));
+    }
+    (StatusCode::OK, Json(json!({ "sources": out }))).into_response()
+}
+
+/// `GET /admin/sources/{name}/sessions?root=&q=&limit=` — list one source, or search all of them.
+///
+/// `q` is the combined search: fan out to every adapter, match titles/previews/roots
+/// case-insensitively, rank same-workspace first and then by recency. `root` filters to one
+/// workspace when listing. Only the intentional combined search ignores `root`; a plain listing
+/// never widens to "everything" when the caller asked for a workspace.
+pub async fn source_sessions_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers).await {
+        return *r;
+    }
+    let query = params.get("q").map(|q| q.trim().to_lowercase()).filter(|q| !q.is_empty());
+    let root = params.get("root").map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
+    let limit = params.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(25).min(100);
+
+    let sources = agent_sources::all_sources(core.store().cloned());
+    if query.is_none() && !sources.iter().any(|s| s.name() == name) {
+        return admin_error(
+            StatusCode::NOT_FOUND,
+            &format!("unknown session source '{name}'"),
+            Some("unknown_source"),
+        );
+    }
+
+    let mut refs = Vec::new();
+    for source in sources {
+        if query.is_none() && source.name() != name {
+            continue;
+        }
+        refs.extend(source.list().unwrap_or_default());
+    }
+
+    let mut hits: Vec<agent_sources::SessionRef> = refs
+        .into_iter()
+        .filter(|r| match (&root, &query) {
+            // A listing for one workspace stays inside it.
+            (Some(root), None) => r.root.as_deref() == Some(root.as_str()),
+            _ => true,
+        })
+        .filter(|r| match &query {
+            Some(q) => {
+                r.title.as_deref().unwrap_or("").to_lowercase().contains(q)
+                    || r.preview.to_lowercase().contains(q)
+                    || r.root.as_deref().unwrap_or("").to_lowercase().contains(q)
+            }
+            None => true,
+        })
+        .collect();
+
+    hits.sort_by(|a, b| {
+        let a_home = root.as_deref().is_some_and(|r| a.root.as_deref() == Some(r));
+        let b_home = root.as_deref().is_some_and(|r| b.root.as_deref() == Some(r));
+        b_home.cmp(&a_home).then_with(|| b.updated_at.cmp(&a.updated_at))
+    });
+    hits.truncate(limit);
+    // Mark the sessions already pulled in. The derived id is deterministic, so a cheap existence
+    // probe is the whole answer — and the card can show "imported" instead of offering the same
+    // import twice.
+    if let Some(store) = core.store() {
+        for hit in &mut hits {
+            let id = agent_sources::imported_session_id(&hit.source, &hit.native_id);
+            if context::session_exists(store, &id).unwrap_or(false) {
+                hit.import_id = Some(id);
+            }
+        }
+    }
+    (StatusCode::OK, Json(json!({ "sessions": hits }))).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct SourceImportBody {
+    pub source: String,
+    pub native_id: String,
+}
+
+/// `POST /admin/sources/import` — copy one external session into this app's history.
+///
+/// Per-session consent, never a sweep. The write is a snapshot: the native store is untouched,
+/// the content is scrubbed with the capture path's own secret scrub, and the id is derived from
+/// the source + native id so re-importing is idempotent (`(session_id, seq)` is the primary key).
+pub async fn source_import_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Json(body): Json<SourceImportBody>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers).await {
+        return *r;
+    }
+    let store = match require_store(&core, "POST /admin/sources/import") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    let sources = agent_sources::all_sources(core.store().cloned());
+    let Some(source) = sources.iter().find(|s| s.name() == body.source) else {
+        return admin_error(
+            StatusCode::NOT_FOUND,
+            &format!("unknown session source '{}'", body.source),
+            Some("unknown_source"),
+        );
+    };
+    let ref_root = source
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|r| r.native_id == body.native_id)
+        .and_then(|r| r.root);
+
+    let turns = match source.read(&body.native_id) {
+        Ok(t) => t,
+        Err(e) => {
+            return admin_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("could not read that session: {e}"),
+                Some("source_read_failed"),
+            )
+        }
+    };
+    if turns.is_empty() {
+        return admin_error(
+            StatusCode::NOT_FOUND,
+            &format!("no readable turns in '{}' for '{}'", body.source, body.native_id),
+            Some("unknown_session"),
+        );
+    }
+
+    /// The import ceiling. A session with tool output can be tens of megabytes; the transcript is
+    /// a reference, not the store of record, and the original stays intact.
+    const IMPORT_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+    let session_id = agent_sources::imported_session_id(&body.source, &body.native_id);
+
+    let mut rows = Vec::new();
+    let mut bytes = 0usize;
+    let mut truncated = false;
+    let mut first_user: Option<String> = None;
+    for (i, turn) in turns.iter().enumerate() {
+        let mut content = crate::core::capture::scrub(&turn.content);
+        if bytes + content.len() > IMPORT_MAX_BYTES {
+            truncated = true;
+            break;
+        }
+        bytes += content.len();
+        // A labeled turn is machine output wearing a message role. It imports as assistant prose
+        // with a visible prefix rather than as a `tool` row: an orphan tool row (no matching
+        // tool_call_id) is the shape providers reject when an imported session is resumed.
+        let role = match (turn.role.as_str(), turn.label.as_deref()) {
+            ("tool", _) => "assistant",
+            ("user", _) | ("assistant", _) => turn.role.as_str(),
+            _ => "assistant",
+        };
+        if role == "user" && first_user.is_none() {
+            first_user = Some(content.clone());
+        }
+        if content.trim().is_empty() {
+            continue;
+        }
+        if turn.label.as_deref() == Some("tool") && !content.starts_with("[tool") {
+            content = format!("[tool] {content}");
+        }
+        if turn.label.as_deref() == Some("thinking") && !content.starts_with("[thinking]") {
+            content = format!("[thinking] {content}");
+        }
+        rows.push(context::SessionMessageRow {
+            session_id: session_id.clone(),
+            seq: i as i64 + 1,
+            role: role.to_string(),
+            content,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: None,
+            attachments: None,
+            model: None,
+            memory_refs: None,
+            ts: turn.ts,
+            root: ref_root.clone(),
+        });
+    }
+    if truncated {
+        rows.push(context::SessionMessageRow {
+            session_id: session_id.clone(),
+            seq: rows.len() as i64 + 1,
+            role: "assistant".to_string(),
+            content: format!(
+                "[import truncated at the 2 MB cap; the original session is intact in {}]",
+                body.source
+            ),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: None,
+            attachments: None,
+            model: None,
+            memory_refs: None,
+            ts: 0,
+            root: ref_root.clone(),
+        });
+    }
+
+    if let Err(e) = context::append_session_messages(store, &rows) {
+        return admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not store the imported session: {e}"),
+            Some("import_write_failed"),
+        );
+    }
+    let title = format!(
+        "{}: {}",
+        body.source,
+        first_user
+            .as_deref()
+            .map(|t| t.chars().take(60).collect::<String>())
+            .unwrap_or_else(|| body.native_id.clone())
+    );
+    let _ = context::set_session_title(store, &session_id, Some(&title));
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "sessionId": session_id,
+            "turns": rows.len(),
+            "truncated": truncated,
+        })),
+    )
+        .into_response()
 }

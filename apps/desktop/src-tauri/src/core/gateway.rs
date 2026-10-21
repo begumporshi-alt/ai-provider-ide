@@ -465,6 +465,19 @@ pub enum BridgeMsg {
     /// `ProseGate` — the gate holds *prose* back across tool-loop turns, and reasoning is not part
     /// of any turn's answer.
     Reasoning(String),
+    /// A retry the engine is about to perform, for the client's progress channel.
+    ///
+    /// Not a wire event in any dialect. The OpenAI-shaped gateway surfaces it as an `aip_retry`
+    /// field on a contentless chunk, which OpenAI clients ignore and the Assistant paints; the
+    /// other dialects drop it. It never counts as output and never disarms a disposition.
+    Retry {
+        provider: String,
+        key: String,
+        attempt: usize,
+        max: usize,
+        delay_ms: u64,
+        reason: String,
+    },
     /// Client-declared tool calls to hand back untouched (pass-through mode only).
     ToolCalls(Value),
     Result(Value),
@@ -729,15 +742,21 @@ pub trait Bridge: Send + Sync + 'static {
 /// A consequence worth stating: `reply` after the core is gone is an ordinary `false` —
 /// "nobody is listening", the same answer it already gives for a stale id — not a panic, and
 /// not a reason to keep anything alive.
+/// How many bridge messages may be queued for one request before its consumer is declared
+/// stalled. A `Delta` is small and a healthy SSE reader drains continuously; 2,048 messages is
+/// far past any ordinary burst. Past it the request is cancelled and the channel is closed,
+/// which bounds per-request memory instead of letting a slow webview grow an unbounded queue.
+const REPLY_QUEUE_CAPACITY: usize = 2048;
+
 #[derive(Clone, Default)]
 pub struct ReplyHandle {
-    pending: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<BridgeMsg>>>>,
+    pending: Arc<Mutex<HashMap<u64, mpsc::Sender<BridgeMsg>>>>,
 }
 
 impl ReplyHandle {
     /// Register a waiting request. Called by the core when a request takes a slot; not part of
     /// the bridge's surface.
-    fn register(&self, id: u64, tx: mpsc::UnboundedSender<BridgeMsg>) {
+    fn register(&self, id: u64, tx: mpsc::Sender<BridgeMsg>) {
         self.pending.lock().unwrap().insert(id, tx);
     }
 
@@ -747,19 +766,33 @@ impl ReplyHandle {
     /// bridge streams into this channel, and if the client has already gone (disconnect, or a
     /// completed pass-through response) there is no point paying for more upstream tokens.
     /// `false` lets the caller tear the loop down instead of streaming into a void.
+    ///
+    /// **A full queue is treated as a dead consumer.** Removing the registration drops the last
+    /// sender, the receiver observes the close, and the handler stops waiting. The alternative —
+    /// buffering without bound — is how a slow renderer turns into a multi-gigabyte process.
     pub fn reply(&self, id: u64, msg: BridgeMsg) -> bool {
         let tx = self.pending.lock().unwrap().get(&id).cloned();
-        match tx {
-            Some(tx) => {
-                let terminal = matches!(msg, BridgeMsg::Done | BridgeMsg::Error { .. });
-                let sent = tx.send(msg).is_ok();
-                if terminal {
-                    self.pending.lock().unwrap().remove(&id);
-                }
-                sent
+        let Some(tx) = tx else { return false };
+        let terminal = matches!(&msg, BridgeMsg::Done | BridgeMsg::Error { .. });
+        let sent = match tx.try_send(msg) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    request_id = id,
+                    "bridge reply queue full — cancelling the request rather than buffering without bound"
+                );
+                self.pending.lock().unwrap().remove(&id);
+                false
             }
-            None => false,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.pending.lock().unwrap().remove(&id);
+                false
+            }
+        };
+        if terminal {
+            self.pending.lock().unwrap().remove(&id);
         }
+        sent
     }
 
     /// Drop a request's registration without answering it — the client is gone.
@@ -774,8 +807,8 @@ impl ReplyHandle {
     /// `core::router_bridge`'s tests are a sibling and cannot. This is the same accommodation
     /// `HealthTracker::keys` makes for assertions that need the shape rather than the accessor.
     #[cfg(test)]
-    pub(crate) fn test_channel(&self, id: u64) -> mpsc::UnboundedReceiver<BridgeMsg> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub(crate) fn test_channel(&self, id: u64) -> mpsc::Receiver<BridgeMsg> {
+        let (tx, rx) = mpsc::channel(REPLY_QUEUE_CAPACITY);
         self.register(id, tx);
         rx
     }
@@ -891,10 +924,20 @@ pub const MEMORY_FREEZE_TTL: Duration = Duration::from_secs(600);
 /// accumulates one entry per session for ever.
 const MAX_FROZEN_BLOCKS: usize = 256;
 
-/// Gateway-side tools that can change the workspace — or, for `http_request`, send data out of
-/// it. Everything else only reads.
-pub const MUTATING_TOOLS: [&str; 6] =
-    ["write_file", "edit_file", "mkdir", "run_command", "http_request", "apply_patch"];
+/// Gateway-side tools that can change the workspace **or send data out of it** — egress counts
+/// with writes here because the gateway executes tools with no user confirmation. `web_fetch` and
+/// `web_search` can carry workspace content in a URL/query, which is the same class of consequence
+/// as `http_request`. Everything else only reads locally.
+pub const MUTATING_TOOLS: [&str; 8] = [
+    "write_file",
+    "edit_file",
+    "mkdir",
+    "run_command",
+    "http_request",
+    "apply_patch",
+    "web_fetch",
+    "web_search",
+];
 
 /// Audit H1b: is `tool` permitted on the gateway path? `Some(reason)` = refused.
 ///
@@ -911,8 +954,8 @@ pub fn gateway_tool_refusal(tool: &str, mutation_enabled: bool) -> Option<String
     if MUTATING_TOOLS.contains(&tool) && !mutation_enabled {
         Some(format!(
             "\"{tool}\" is disabled on the gateway. The gateway executes tools with no user \
-             confirmation, so mutation is off by default. Enable it in Gateway settings, or use \
-             the Assistant, which asks before every call."
+             confirmation, so tools that write or send data out are off by default. Enable it in \
+             Gateway settings, or use the Assistant, which asks before every call."
         ))
     } else {
         None
@@ -1404,15 +1447,16 @@ impl GatewayCore {
 /// Only the FIRST message is bounded. Once the bridge is demonstrably working on the request, a
 /// slow stream is a slow stream, and cutting it off would break long answers.
 ///
-/// **40s, raised from 30s on 2026-10-13 to keep this strictly above the engine's plan budget.** The
-/// two are one ordering — `PLAN_BUDGET (36s) < FIRST_MSG_TIMEOUT (40s)` — and it is load-bearing in
+/// **48s, raised from 40s on 2026-10-19 to keep this strictly above the engine's plan budget.** The
+/// two are one ordering — `PLAN_BUDGET (44s) < FIRST_MSG_TIMEOUT (48s)` — and it is load-bearing in
 /// one direction only: the engine must give up *first*, so the request carries the real error class
 /// from the attempt chain instead of being cancelled here and filed `CANCELLED`. The plan budget had
-/// to grow to make the re-probe rounds reachable (see `engine::SERVER_ERROR_REPROBES_MAX`), so this
-/// grew with it. The cost is honest and bounded: a bridge that never speaks at all now fails after
-/// 40s rather than 30s. It does not lengthen a normal request — this bounds the wait for the *first*
-/// message, and a provider that answers starts the stream long before it.
-pub const FIRST_MSG_TIMEOUT: Duration = Duration::from_secs(40);
+/// to grow to make a second full attempt reachable after a pre-headers timeout (see
+/// `engine::PLAN_BUDGET`), so this grew with it. The cost is honest and bounded: a bridge that never
+/// speaks at all now fails after 48s rather than 40s. It does not lengthen a normal request — this
+/// bounds the wait for the *first* message, and a provider that answers starts the stream long
+/// before it.
+pub const FIRST_MSG_TIMEOUT: Duration = Duration::from_secs(48);
 
 /// RAII slot: permit + registration + receiver, all released on drop — including on client
 /// disconnect mid-stream, which is what makes §3.5 cancellation work.
@@ -1423,7 +1467,7 @@ struct Slot {
     /// routing slot until it finishes — dropping it earlier would let a ninth request dispatch.
     _dispatch: OwnedSemaphorePermit,
     id: u64,
-    rx: mpsc::UnboundedReceiver<BridgeMsg>,
+    rx: mpsc::Receiver<BridgeMsg>,
     /// Set once the bridge has produced its first message; only that wait is bounded.
     started: bool,
     /// When the handler first polled this slot — i.e. when the request reached the bridge.
@@ -1548,7 +1592,7 @@ async fn try_slot(core: &Arc<GatewayCore>) -> Result<Slot, Response> {
         }
     };
     let id = core.next_id.fetch_add(1, Ordering::Relaxed);
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(REPLY_QUEUE_CAPACITY);
     core.replies.register(id, tx);
     Ok(Slot {
         core: core.clone(),
@@ -2414,6 +2458,8 @@ pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, St
         )
         .route("/admin/memory/batch", post(admin::memory_capture_batch_h))
         .route("/admin/memory/recall", post(admin::memory_recall_h))
+        .route("/admin/memory/scoped", post(admin::memory_scoped_list_h))
+        .route("/admin/memory/retrieved", post(admin::memory_retrieved_h))
         .route("/admin/memory/stats", get(admin::memory_stats_h))
         .route("/admin/memory/conflicts", get(admin::memory_conflicts_h))
         .route("/admin/memory/prune", post(admin::memory_prune_h))
@@ -2427,6 +2473,11 @@ pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, St
         .route("/admin/memory/{id}/pin", post(admin::memory_set_pinned_h))
         .route("/admin/memory/{id}/scope", post(admin::memory_assign_scope_h))
         .route("/admin/memory/{id}/unsupersede", post(admin::memory_unsupersede_h))
+        // Cross-agent session sources. `import` is a static segment and must precede the
+        // `{name}/sessions` pattern the same way the memory statics precede `/admin/memory/{id}`.
+        .route("/admin/sources", get(admin::sources_list_h))
+        .route("/admin/sources/import", post(admin::source_import_h))
+        .route("/admin/sources/{name}/sessions", get(admin::source_sessions_h))
         .route(
             "/admin/context",
             get(admin::context_graph_h)

@@ -370,6 +370,9 @@ pub struct TextRequest<'a> {
     /// into the chunk stream. See [`crate::core::adapter::TextArgs::on_reasoning`] for why the
     /// channel exists and why firing it must not change any disposition.
     pub on_reasoning: Option<&'a mut (dyn FnMut(&str) + Send)>,
+    /// Called before the engine sleeps to re-dial a candidate. The bridge forwards it to the
+    /// client's progress channel; the engine never reads it back.
+    pub on_retry: Option<&'a mut (dyn FnMut(crate::core::engine::RetryNotice) + Send)>,
     /// How many candidates this request may try. `None` is [`crate::core::engine::MAX_ATTEMPTS_DEFAULT`].
     pub max_attempts: Option<usize>,
     /// Whether to mark the system prompt with `cache_control` on egress so a provider with
@@ -957,6 +960,7 @@ impl<'a> ModelRouter<'a> {
             on_usage,
             on_finish,
             on_reasoning,
+            on_retry,
             max_attempts,
             prompt_cache_enabled,
         } = req;
@@ -1030,6 +1034,14 @@ impl<'a> ModelRouter<'a> {
                     cb(t);
                 }
             };
+            // The progress channel's forwarder, with the same local-closure shape and the same
+            // borrow-check reason. It is write-only: the engine never reads a caller's response.
+            let mut caller_on_retry = on_retry;
+            let mut forward_retry = |notice: crate::core::engine::RetryNotice| {
+                if let Some(cb) = caller_on_retry.as_deref_mut() {
+                    cb(notice);
+                }
+            };
             let args = ExecuteTextArgs {
                 plan,
                 messages,
@@ -1045,6 +1057,7 @@ impl<'a> ModelRouter<'a> {
                 on_usage: Some(&mut forward_usage),
                 on_finish: Some(&mut forward_finish),
                 on_reasoning: Some(&mut forward_reasoning),
+                on_retry: Some(&mut forward_retry),
                 max_attempts,
                 prompt_cache_enabled,
             };
@@ -1467,6 +1480,8 @@ impl<'a> ModelRouter<'a> {
                 on_finish: None,
                 // The summarizer/generator's own call: it consumes the answer, not the notes.
                 on_reasoning: None,
+                // No client progress channel on this path; it is awaited, not streamed.
+                on_retry: None,
                 max_attempts: None,
                 // Read from the router settings rather than hardcoded off, so the operator's
                 // toggle governs this path too. `CompleteRequest` carries no flag of its own:
@@ -2198,6 +2213,7 @@ mod tests {
             on_usage: None,
             on_finish: None,
             on_reasoning: None,
+            on_retry: None,
             max_attempts: None,
             prompt_cache_enabled: false,
         }
@@ -2751,9 +2767,16 @@ mod tests {
         );
         assert_eq!(row.provider_id, None, "nothing served, so no provider is named");
         let entries = chain(row);
-        assert_eq!(entries.len(), 3, "one entry per attempt");
+        assert_eq!(
+            entries.len(),
+            5,
+            "three candidates, then two network re-probes of the last one"
+        );
         assert_eq!(entries[0]["cls"], json!("NOT_FOUND"));
-        assert_eq!(entries[2]["cls"], json!("NETWORK"));
+        assert_eq!(entries[1]["cls"], json!("RATE_LIMITED"));
+        for entry in &entries[2..] {
+            assert_eq!(entry["cls"], json!("NETWORK"));
+        }
         assert_eq!(entries[0]["provider"], json!("p1"));
         assert_eq!(entries[0]["key"], json!("k1"), "the chain names the key that was tried");
     }
