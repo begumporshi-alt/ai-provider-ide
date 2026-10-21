@@ -4594,6 +4594,7 @@ async fn admin_routes_refuse_without_the_master_key() {
         // Cross-agent session sources. `import` writes rows, so it authenticates like every
         // other mutating admin route.
         ("GET", "/admin/sources", json!(null)),
+        ("GET", "/admin/sources/sessions", json!(null)),
         ("GET", "/admin/sources/claude/sessions", json!(null)),
         ("POST", "/admin/sources/import", json!({ "source": "claude", "native_id": "x" })),
         // The master switch. Listed with the memory statics because it is one, and because a reader
