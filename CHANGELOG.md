@@ -13,6 +13,18 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 
 ### Added
 
+- **Per-provider network budgets, with a patient `agent-router` profile seeded once.** A provider can
+  now carry its own header/first-byte/first-output timeouts, plan budget and attempt count in the
+  `router` settings row (`providerTimeouts`), edited under **Providers → Edit → Timeouts & retries**.
+  The engine applies the serving provider's profile per attempt, the plan uses the largest plan budget
+  in it, and the gateway's first-message backstop grows to the largest configured plan plus 8 s so the
+  engine always fails first. Unlisted providers keep the 20 s/44 s/6 defaults. `agent-router` is seeded
+  with 60 s per phase, 180 s plan and 4 attempts: `agentrouter.org` routinely takes 20–42 s to send
+  headers, which the old 20 s bound turned into a failed turn. A pre-output `NETWORK` failure now also
+  advances to the next key of the same provider instead of re-dialling the failed key while other keys
+  are queued. The Assistant paints `Still waiting on <model> (Ns)…` after 10 s, and the egress logs
+  `first_header_ms` per attempt so slow providers are measurable.
+
 - **AXIOM: the app can now audit, diagnose and improve its own Assistant, and refuses to believe the
   Assistant's word about any of it.** A new sidebar screen and a new package,
   `packages/axiom-core`, run the seven-stage loop — observe, evaluate, diagnose, design, modify,

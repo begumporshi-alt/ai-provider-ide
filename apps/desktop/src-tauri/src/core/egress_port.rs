@@ -106,16 +106,18 @@ impl HttpPort for EgressPort {
             // into the egress request. Reading `req.stream` after moving `req.url` would not
             // compile, and reading it *before* is the kind of ordering a later edit silently
             // inverts.
-            let HttpRequest { url, method, headers, body, secret_ref, stream } = req;
+            let HttpRequest { url, method, headers, body, secret_ref, stream, timeouts } = req;
             let req = EgressRequest {
                 url,
                 method: method.as_str().to_string(),
                 headers,
                 body,
                 secret_ref,
-                // `http_port` has no timeout field on purpose (`http_port.rs:43`); the egress
+                // `http_port` has no total-body timeout on purpose (`http_port.rs:43`); the egress
                 // applies its own connect and idle budgets.
                 timeout_ms: None,
+                header_timeout_ms: timeouts.map(|t| t.header.as_millis() as u64),
+                first_byte_timeout_ms: timeouts.map(|t| t.first_byte.as_millis() as u64),
             };
             if !stream {
                 let res =
@@ -388,6 +390,7 @@ mod tests {
             body: Some(r#"{"stream":false}"#.to_string()),
             secret_ref: None,
             stream,
+            timeouts: None,
         }
     }
 

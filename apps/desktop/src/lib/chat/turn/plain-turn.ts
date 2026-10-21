@@ -9,6 +9,7 @@ import { clip } from "./graph-record";
 import type { TurnPorts, TurnRequestBase } from "./ports";
 import { attachmentMeta } from "./ports";
 import { retryNoticeLabel, type ServedBy } from "../../gateway-turn";
+import { startWaitingNotice } from "./waiting";
 
 /** The model's reasoning paints at most every 80 ms. Time-based rather than count-based: a fixed
  *  "every Nth delta" is wrong at both ends of the range — the measured failure carried **8197**
@@ -63,6 +64,13 @@ export async function runPlainTurn(req: PlainTurnRequest, ports: TurnPorts): Pro
   /** Only patch the clear when a retry line was actually painted — otherwise the clear becomes a
    *  spurious final patch on turns that never retried. */
   let retryPainted = false;
+  /** The local "still waiting" line. The retry notices only fire when a retry is scheduled; this
+   *  covers the one long attempt that has not produced anything yet. */
+  let waitingPainted = false;
+  const stopWaiting = startWaitingNotice((text) => {
+    waitingPainted = true;
+    ports.patchMsg(req.assistantMsgId, { retryStatus: text });
+  }, req.model);
   try {
     // The same replay the agent path uses. Sharing it is the fix: this path used to map only
     // {role, content}, so a session that had used agent mode sent its tool results with no
@@ -126,6 +134,10 @@ export async function runPlainTurn(req: PlainTurnRequest, ports: TurnPorts): Pro
         // The engine's retry notice: paint `attempt N/M` in the assistant bubble so a 40s wait
         // is visibly progress rather than a frozen screen.
         onRetry: (n) => {
+          // The retry notice is the more specific line; stop the local timer so the two cannot
+          // overwrite each other.
+          stopWaiting();
+          waitingPainted = false;
           retryPainted = true;
           ports.patchMsg(req.assistantMsgId, { retryStatus: retryNoticeLabel(n) });
         },
@@ -133,6 +145,11 @@ export async function runPlainTurn(req: PlainTurnRequest, ports: TurnPorts): Pro
       { signal: req.signal },
     );
     for await (const chunk of exec.chunks) {
+      if (waitingPainted) {
+        waitingPainted = false;
+        stopWaiting();
+        ports.patchMsg(req.assistantMsgId, { retryStatus: undefined });
+      }
       if (retryPainted && !retryCleared) {
         retryCleared = true;
         ports.patchMsg(req.assistantMsgId, { retryStatus: undefined });
@@ -202,6 +219,11 @@ export async function runPlainTurn(req: PlainTurnRequest, ports: TurnPorts): Pro
   } finally {
     // A retry line must not outlive the turn: success, failure and stop all land here. Only when
     // one was painted, so a turn that never retried leaves its last content patch untouched.
+    stopWaiting();
+    if (waitingPainted) {
+      waitingPainted = false;
+      ports.patchMsg(req.assistantMsgId, { retryStatus: undefined });
+    }
     if (retryPainted && !retryCleared) {
       ports.patchMsg(req.assistantMsgId, { retryStatus: undefined });
     }

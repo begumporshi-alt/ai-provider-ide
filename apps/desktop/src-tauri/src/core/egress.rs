@@ -50,6 +50,10 @@ pub enum EgressError {
     Store(#[from] crate::core::store::StoreError),
     #[error("image fetch refused: {0}")]
     ImageFetch(String),
+    /// The upstream accepted the connection and sent no response headers inside the attempt's
+    /// budget. A transport failure, not a policy refusal.
+    #[error("{0}")]
+    UpstreamTimeout(String),
     /// A cleartext destination this process refuses. See [`require_secure_scheme`].
     #[error(
         "refusing cleartext {scheme}:// to non-local host {host} — a provider credential would cross the network unencrypted (invariant 3)"
@@ -144,6 +148,13 @@ pub struct EgressRequest {
     pub secret_ref: Option<String>,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Per-request pre-header budget. Absent keeps [`UPSTREAM_HEADER_TIMEOUT`]. Set by the
+    /// engine from the provider's timeout profile.
+    #[serde(default)]
+    pub header_timeout_ms: Option<u64>,
+    /// Per-request pre-first-byte budget. Absent keeps [`UPSTREAM_FIRST_BYTE_TIMEOUT`].
+    #[serde(default)]
+    pub first_byte_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -397,7 +408,29 @@ pub async fn request(
     state: &EgressState,
     req: EgressRequest,
 ) -> Result<EgressResponse, EgressError> {
-    let res = build(state, req).await?.send().await?;
+    // The header phase is bounded here too, but **only when the caller opted in**. Unary calls are
+    // not all prompt-bound: an image generation legitimately spends tens of seconds producing the
+    // response, and the interpreter deliberately passes no profile for it. A default 20s bound here
+    // would turn that into a failure. Text calls (including `complete`) do pass the profile, so
+    // they get the same patience the streaming path has.
+    let header_timeout = req.header_timeout_ms.map(Duration::from_millis);
+    let builder = build(state, req).await?;
+    let res = match header_timeout {
+        Some(bound) => match tokio::time::timeout(bound, builder.send()).await {
+            Ok(res) => res?,
+            Err(_) => {
+                tracing::warn!(
+                    header_secs = bound.as_secs(),
+                    "upstream sent no response headers — abandoning the unary attempt",
+                );
+                return Err(EgressError::UpstreamTimeout(format!(
+                    "upstream sent no response headers for {}s — abandoning the request",
+                    bound.as_secs()
+                )));
+            }
+        },
+        None => builder.send().await?,
+    };
     let status = res.status().as_u16();
     let headers = res
         .headers()
@@ -485,7 +518,7 @@ pub async fn fetch_image(
 /// 30s. 120s is more than 4x the worst observed, so no legitimate request is at risk, while a
 /// genuine stall now ends in two minutes instead of never. It bounds *silence*, not duration:
 /// a stream that keeps producing data is never cut off, however long it runs.
-const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+pub const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long the upstream may take to produce **response headers** before the attempt is
 /// abandoned and retried.
@@ -690,6 +723,18 @@ pub async fn stream(
     // Counted, not subtracted: it can exceed the budget on the way out, and `panic = "abort"`
     // makes an underflowing `usize` a dead daemon rather than a bad number in a log line.
     let mut transport_attempt = 0usize;
+    // **Resolved once, outside the dial loop.** A profile is a fact about the provider, not
+    // about how many times the transport was retried, and resolving it here is what keeps the
+    // retry path identical to the first dial. Absent means "the host default", which is the
+    // pre-profile behaviour for every provider that has no entry.
+    let header_timeout = req
+        .header_timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(state.header_timeout);
+    let first_byte_timeout = req
+        .first_byte_timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(state.first_byte_timeout);
     loop {
         let b = match build(state, req.clone()).await {
             Ok(b) => b,
@@ -709,10 +754,17 @@ pub async fn stream(
         // following it. A deadline stamped after `send()` returns cannot bound a header stall at
         // all — it would restart the clock exactly when the phase it is meant to bound ended.
         let sent_at = Instant::now();
-        let sent = tokio::time::timeout(state.header_timeout, b.send()).await;
+        let sent = tokio::time::timeout(header_timeout, b.send()).await;
         match sent {
             Ok(Ok(res)) => {
                 let status = res.status().as_u16();
+                // Time-to-headers is the number a timeout calibration reads, and the ledger's
+                // `latency_ms` cannot supply it: that field is dominated by prompt size and
+                // output length, so a stall and a long generation look the same there.
+                tracing::info!(
+                    first_header_ms = sent_at.elapsed().as_millis() as u64,
+                    "upstream response headers",
+                );
                 let headers = res
                     .headers()
                     .iter()
@@ -736,7 +788,7 @@ pub async fn stream(
                 // the gateway's bound — the wrong-unit shape
                 // `the_plan_budget_fits_inside_the_gateway_bound` exists to forbid. Stamped from
                 // `sent_at` so it encloses the header wait. See `UPSTREAM_FIRST_BYTE_TIMEOUT`.
-                let first_byte_deadline = sent_at + state.first_byte_timeout;
+                let first_byte_deadline = sent_at + first_byte_timeout;
                 let mut saw_byte = false;
                 loop {
                     // Each wait for the next chunk is bounded, not the stream as a whole: a
@@ -762,7 +814,7 @@ pub async fn stream(
                             // sink, so `emitted` is false and the attempt advances to the next
                             // candidate. See `UPSTREAM_FIRST_BYTE_TIMEOUT`.
                             tracing::warn!(
-                                first_byte_secs = state.first_byte_timeout.as_secs(),
+                                first_byte_secs = first_byte_timeout.as_secs(),
                                 elapsed_ms = sent_at.elapsed().as_millis() as u64,
                                 "upstream sent response headers but no body — abandoning the \
                                  attempt",
@@ -770,7 +822,7 @@ pub async fn stream(
                             let _ = sink.send(StreamEvent::error(format!(
                                 "upstream sent response headers but no body within {}s — \
                                  abandoning the attempt",
-                                state.first_byte_timeout.as_secs()
+                                first_byte_timeout.as_secs()
                             )));
                             return Ok(());
                         }
@@ -859,12 +911,12 @@ pub async fn stream(
                     // The *header* budget, which is the one this arm actually waited out.
                     // Reporting `idle_timeout` here named a number 12x the one that expired, so
                     // the line misdescribed its own cause.
-                    header_secs = state.header_timeout.as_secs(),
+                    header_secs = header_timeout.as_secs(),
                     "upstream sent no response headers — abandoning the attempt",
                 );
                 let _ = sink.send(StreamEvent::error(format!(
                     "upstream sent no response headers for {}s — abandoning the request",
-                    state.header_timeout.as_secs()
+                    header_timeout.as_secs()
                 )));
                 return Ok(());
             }
@@ -1535,6 +1587,8 @@ mod secret_provider_tests {
             body: None,
             secret_ref: Some(secret_ref.to_string()),
             timeout_ms: None,
+            header_timeout_ms: None,
+            first_byte_timeout_ms: None,
         }
     }
 
@@ -1753,6 +1807,8 @@ mod stall_tests {
             body: None,
             secret_ref: None,
             timeout_ms: None,
+            header_timeout_ms: None,
+            first_byte_timeout_ms: None,
         }
     }
 
@@ -1868,6 +1924,38 @@ mod stall_tests {
             "the consumer must be told what happened, not merely that something did: {}",
             messages[0]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A request's own budget wins over the host default.** The engine fills this from the
+    /// provider's profile, so a per-provider policy has to reach the phase it names — an override
+    /// that was silently ignored would leave the 20s cutoff in place while the settings row said
+    /// 60s, which is the exact defect this change exists to remove.
+    #[tokio::test]
+    async fn a_request_header_override_beats_the_host_default() {
+        let dir = std::env::temp_dir().join(format!("aip-header-override-{}", std::process::id()));
+        let (connections, url) = silent_listener(Stall::BeforeHeaders);
+        let mut s = state(&dir);
+        // The host default is longer than the request override, so the message names which one
+        // actually expired. If the override were ignored this test would take 3s and say "for 3s".
+        s.header_timeout = Duration::from_secs(3);
+        s.first_byte_timeout = Duration::from_secs(3);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut request = req(url);
+        request.header_timeout_ms = Some(1_000);
+
+        let r = stream(&s, request, tx).await;
+        assert!(r.is_ok(), "an abandoned stall is not an egress failure: {r:?}");
+
+        let (messages, headers) = drain(&mut rx);
+        assert!(!headers);
+        assert_eq!(messages.len(), 1, "exactly one error reaches the consumer: {messages:?}");
+        assert!(
+            messages[0].contains("for 1s"),
+            "the per-request budget must win over the state default: {}",
+            messages[0]
+        );
+        assert_eq!(connections.load(Ordering::SeqCst), 1, "no retry on a header timeout");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2202,6 +2290,8 @@ mod user_agent_tests {
             body: None,
             secret_ref: None,
             timeout_ms: None,
+            header_timeout_ms: None,
+            first_byte_timeout_ms: None,
         }
     }
 

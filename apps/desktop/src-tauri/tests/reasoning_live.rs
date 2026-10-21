@@ -219,6 +219,7 @@ async fn call(
         on_finish: None,
         on_reasoning: None,
         prompt_cache_enabled: false,
+        timeouts: None,
         observation: None,
     };
     let stream = interp

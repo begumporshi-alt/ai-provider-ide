@@ -13,12 +13,14 @@ use tokio::time::Instant;
 use crate::core::adapter::{
     AdapterFactory, Cancel, ReasoningEffort, StreamObservation, TextArgs, ToolCall,
 };
+use crate::core::http_port::RequestTimeouts;
 use crate::core::limiter::ProviderLimiter;
 use crate::core::planner::Candidate;
+use crate::core::provider_timeouts::ProviderTimeouts;
 use crate::core::usage::UsageTokens;
 
 use super::attempt::{
-    attempt_budget, attempt_disposition, attempt_outcome, candidate_is_affordable, labelled,
+    attempt_budget, attempt_disposition, attempt_outcome, candidate_is_affordable_with, labelled,
     records_key_health, saturated_outcome, transport_outcome, AttemptDisposition, AttemptError,
     AttemptOutcome, RetryNotice, NETWORK_REPROBES_MAX, NETWORK_RETRY_BACKOFF,
     SERVER_ERROR_REPROBES_MAX, SERVER_ERROR_RETRY_BACKOFF,
@@ -26,7 +28,6 @@ use super::attempt::{
 use super::health::HealthTracker;
 use super::taxonomy::{ErrorClass, COOLDOWN_FLOOR_MS};
 use super::{now_ms, AllAttemptsFailed};
-use crate::core::egress::UPSTREAM_FIRST_OUTPUT_TIMEOUT;
 
 /// What one text request is asked to do. The Rust port of `executeText`'s argument
 /// (`execution-engine.ts:23-39`).
@@ -66,6 +67,9 @@ pub struct ExecuteTextArgs<'a> {
     /// client's progress channel; it never affects the attempt, the disposition, or the chain.
     pub on_retry: Option<&'a mut (dyn FnMut(RetryNotice) + Send)>,
     pub max_attempts: Option<usize>,
+    /// Per-provider budgets, read from the `router` settings row by the caller. The plan uses the
+    /// most patient profile in it; each attempt uses its own provider's profile.
+    pub provider_timeouts: ProviderTimeouts,
     /// Mark the last system message block with `cache_control` on egress. See
     /// [`crate::core::router::TextRequest::prompt_cache_enabled`] for the read-side note.
     pub prompt_cache_enabled: bool,
@@ -224,7 +228,14 @@ pub async fn execute_text(
 ) -> Result<TextSuccess, TextFailure> {
     let mut attempts: Vec<AttemptOutcome> = Vec::new();
     let mut usage: Option<UsageTokens> = None;
-    let budget = attempt_budget(args.plan.len(), args.max_attempts);
+    // The plan's budget covers its slowest carrier, and its attempt allowance is the largest one
+    // any carrier allows. A mixed plan must not be truncated to whichever provider happened to
+    // come first.
+    let plan_budget = args.provider_timeouts.max_plan_budget_for(&args.plan);
+    let max_attempts = args
+        .max_attempts
+        .unwrap_or_else(|| args.provider_timeouts.max_attempts_for(&args.plan));
+    let budget = attempt_budget(args.plan.len(), Some(max_attempts));
 
     // How the loop stopped. It cannot return directly, because `usage` is written by a callback the
     // adapter may hold for as long as its stream lives — so a read *inside* the body would sit
@@ -270,6 +281,9 @@ pub async fn execute_text(
         let mut plan: VecDeque<(Candidate, usize)> =
             args.plan.into_iter().take(budget).map(|c| (c, 0)).collect();
         while let Some((candidate, reprobes)) = plan.pop_front() {
+            // The profile is a property of the provider being dialled, and every budget below —
+            // admission, the first-output deadline, and the egress override — reads it.
+            let profile = args.provider_timeouts.resolve(&candidate.provider.id);
             // `:80`, checked *before* the permit is taken — see `candidate_gate`, which states the
             // order and why: a cancelled request must not consume a slot on its way out.
             if cancel.is_cancelled() {
@@ -293,7 +307,12 @@ pub async fn execute_text(
             // so the router records the class the attempts actually produced. Letting the request
             // run on instead would let the gateway's bound fire first and file the row as
             // `CANCELLED` — which is what made rows 1652/1655/1656/1658 look like client aborts.
-            if !candidate_is_affordable(plan_started.elapsed(), !attempted_any) {
+            if !candidate_is_affordable_with(
+                plan_started.elapsed(),
+                !attempted_any,
+                profile.header,
+                plan_budget,
+            ) {
                 break 'plan Ended::Spent;
             }
             attempted_any = true;
@@ -401,6 +420,10 @@ pub async fn execute_text(
                     on_finish: Some(&mut forward_finish),
                     on_reasoning: Some(&mut forward_reasoning),
                     prompt_cache_enabled: args.prompt_cache_enabled,
+                    timeouts: Some(RequestTimeouts {
+                        header: profile.header,
+                        first_byte: profile.first_byte,
+                    }),
                     observation: Some(&mut observation),
                 };
 
@@ -434,7 +457,7 @@ pub async fn execute_text(
                         // output has flowed the gateway is no longer about to cancel, and the
                         // stream's own idle bound is the right budget again.
                         let mut armed =
-                            Some(Box::pin(tokio::time::sleep(UPSTREAM_FIRST_OUTPUT_TIMEOUT)));
+                            Some(Box::pin(tokio::time::sleep(profile.first_output)));
                         loop {
                             let item = match armed.as_mut() {
                                 Some(sleep) => tokio::select! {
@@ -446,7 +469,7 @@ pub async fn execute_text(
                                         }
                                         tracing::warn!(
                                             silent_ms =
-                                                UPSTREAM_FIRST_OUTPUT_TIMEOUT.as_millis() as u64,
+                                                profile.first_output.as_millis() as u64,
                                             "upstream produced no output — ending the attempt \
                                              before the gateway's first-message bound does",
                                         );
@@ -550,7 +573,12 @@ pub async fn execute_text(
                             && plan.is_empty()
                             && reprobes < SERVER_ERROR_REPROBES_MAX
                             && !cancel.is_cancelled()
-                            && candidate_is_affordable(plan_started.elapsed() + wait, false)
+                            && candidate_is_affordable_with(
+                                plan_started.elapsed() + wait,
+                                false,
+                                profile.header,
+                                plan_budget,
+                            )
                         {
                             tracing::info!(
                                 provider = %candidate.provider.slug,
@@ -585,12 +613,14 @@ pub async fn execute_text(
                             // the exhausted-plan case.
                             let has_other_provider =
                                 plan.iter().any(|(c, _)| c.provider.id != failed_provider_id);
-                            if !has_other_provider
+                            if plan.is_empty()
                                 && reprobes < NETWORK_REPROBES_MAX
                                 && !cancel.is_cancelled()
-                                && candidate_is_affordable(
+                                && candidate_is_affordable_with(
                                     plan_started.elapsed() + NETWORK_RETRY_BACKOFF,
                                     false,
+                                    profile.header,
+                                    plan_budget,
                                 )
                             {
                                 // **Borrowed from ZCode: one bounded roll of the same request

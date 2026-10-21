@@ -71,6 +71,7 @@ import { createHttpPort, createKeyVaultPort } from "./ipc-client";
 import { noteTrailFailure, type TrailId } from "./lib/trail-health";
 import { parseRecalledMemoryRefs } from "./lib/chat/turn/memory-refs";
 import { resolveProviderManifest } from "./lib/providers/profile-select";
+import { seedAgentRouterTimeouts } from "./lib/providers/timeout-defaults";
 import type { HostContextNode, HostContextEdge } from "./lib/context/engine";
 import {
   isConclusive,
@@ -719,6 +720,20 @@ async function runBootstrap(): Promise<void> {
   // `{}`, and assigning an empty object keeps the defaults, which is what the old
   // `if (settingsRaw)` guard did.
   Object.assign(router.settings, routerSettings);
+
+  // **Seed the slow-aggregator profile once.** `agentrouter.org` routinely takes 20–40s to send
+  // headers; the built-in 20s budget used to abandon those turns. The helper returns `null` when
+  // the provider is absent, disabled, or already profiled, so a value the operator set is never
+  // overwritten and the seed is a no-op on every later launch. It lives in the `router` row, not
+  // the manifest: changing a budget must not mint a manifest version.
+  const seeded = seedAgentRouterTimeouts(
+    router.settings.providerTimeouts,
+    registry.listProviders(),
+  );
+  if (seeded) {
+    router.settings.providerTimeouts = seeded;
+    persistRouterSettings();
+  }
 
   // Heal a System AI setting that outlived its provider (deleted while selected, before
   // `deleteProvider` learned to clear it). Hydration is the one moment the registry and the

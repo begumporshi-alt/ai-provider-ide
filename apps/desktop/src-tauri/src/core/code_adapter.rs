@@ -603,6 +603,7 @@ mod tests {
                     on_finish: None,
                     on_reasoning: None,
                     prompt_cache_enabled: false,
+                    timeouts: None,
                     observation: None,
                 },
                 &cancel,
@@ -722,6 +723,7 @@ mod tests {
             on_finish: None,
             on_reasoning: None,
             prompt_cache_enabled: false,
+            timeouts: None,
             observation: None,
         };
         let json: Value = serde_json::from_str(&text_args_json(&args, None)).expect("valid JSON");
@@ -802,6 +804,7 @@ mod tests {
             on_finish: None,
             on_reasoning: None,
             prompt_cache_enabled: false,
+            timeouts: None,
             observation: None,
         }
     }

@@ -71,6 +71,7 @@ pub mod persist;
 pub mod plan_doc;
 pub mod planner;
 pub mod pricing;
+pub mod provider_timeouts;
 pub mod retention;
 pub mod router;
 pub mod router_bridge;

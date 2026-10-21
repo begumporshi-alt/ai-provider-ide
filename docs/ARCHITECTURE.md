@@ -551,12 +551,23 @@ execution-engine implement a per-phase budget:
 | Budget | Default | Notes |
 |---|---|---|
 | Connect | 10 s | TCP/TLS to the provider |
-| First byte | 30 s | covers model queueing |
-| Idle stream | 60 s | resets on every SSE chunk — long generations are not "timed out" at 30 s |
-| Total per attempt | none | bounded by the budgets above |
+| Upstream headers | 20 s | `UPSTREAM_HEADER_TIMEOUT`; a header stall is not retried |
+| Upstream first byte | 20 s | `UPSTREAM_FIRST_BYTE_TIMEOUT`; encloses the header wait |
+| First output | 20 s | `UPSTREAM_FIRST_OUTPUT_TIMEOUT`; reasoning disarms it |
+| Idle stream | 120 s | resets on every chunk — long generations are not "timed out" |
+| Plan budget | 44 s | `PLAN_BUDGET`; bounds every candidate in one request |
+| Gateway first message | 48 s | `FIRST_MSG_TIMEOUT`; must stay above the plan budget |
 | Max attempts per request | 6 | across the whole plan (rotation + failover combined) |
 | Backoff | jittered exponential | on `RATE_LIMITED`/`SERVER_ERROR`, honoring `Retry-After` |
 | Per-provider concurrency cap | 4 | with a bounded queue; protects all consumers from one fan-out app |
+
+**Per-provider override.** A provider may carry its own profile in the `router` settings row
+(`providerTimeouts[providerId]`), edited under **Providers → Edit → Timeouts & retries**. The
+engine uses the profile's header/first-byte budgets per attempt, its plan budget across the plan,
+and its attempt count; the gateway's first-message backstop grows to the largest configured plan
+plus 8 s. Unconfigured providers keep every default above, so a slow aggregator can wait longer
+without making every other provider's failures slow. The built-in `agent-router` profile is
+60 s per phase, 180 s plan, 4 attempts.
 
 Retries vs. rotation: each attempt on the plan (next key or next provider) IS the retry — there
 is no separate hidden retry loop. Per-app gateway keys (traffic attribution, revoking one

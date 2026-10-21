@@ -236,6 +236,7 @@ impl ManifestInterpreter {
                     body: None,
                     secret_ref: Some(secret_ref.to_string()),
                     stream: false,
+                    timeouts: None,
                 },
                 cancel,
             )
@@ -365,6 +366,7 @@ impl ManifestInterpreter {
                     body: Some(serialize(&body)),
                     secret_ref: Some(secret_ref.to_string()),
                     stream: false,
+                    timeouts: None,
                 },
                 cancel,
             )
@@ -421,6 +423,7 @@ impl ManifestInterpreter {
                 on_finish,
                 on_reasoning,
                 prompt_cache_enabled,
+                timeouts,
                 observation,
             } = args;
 
@@ -644,6 +647,7 @@ impl ManifestInterpreter {
                         body: Some(payload),
                         secret_ref: Some(secret_ref.to_string()),
                         stream: streaming,
+                        timeouts,
                     },
                     cancel,
                 )
@@ -2275,6 +2279,7 @@ mod tests {
             // Off: every caller below asserts on an unmarked body, and `agnes` — the configured
             // provider — reports no cache fields either way (measured 2026-09-28).
             prompt_cache_enabled: false,
+            timeouts: None,
             observation: None,
         }
     }
@@ -2717,6 +2722,7 @@ mod tests {
             on_finish: None,
             on_reasoning: None,
             prompt_cache_enabled: false,
+            timeouts: None,
             observation: None,
         };
         let stream =

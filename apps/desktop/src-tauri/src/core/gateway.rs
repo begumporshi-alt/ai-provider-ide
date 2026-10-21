@@ -1062,7 +1062,22 @@ impl GatewayCore {
     }
 
     pub fn first_msg_timeout(&self) -> Duration {
-        self.first_msg_timeout.lock().map(|g| *g).unwrap_or(FIRST_MSG_TIMEOUT)
+        let base = self.first_msg_timeout.lock().map(|g| *g).unwrap_or(FIRST_MSG_TIMEOUT);
+        // The engine's plan budget is per provider now, so the backstop follows the largest
+        // *configured* profile plus a margin. No profiles means no change: the constant stands,
+        // which is every install that has not opted in.
+        let configured = self
+            .store
+            .as_ref()
+            .and_then(|s| {
+                crate::core::router::RouterSettings::from_store(s)
+                    .provider_timeouts
+                    .configured_max_plan_budget()
+            });
+        match configured {
+            Some(plan) => base.max(plan + FIRST_MSG_MARGIN),
+            None => base,
+        }
     }
 
     /// R4: attach per-app key verification. Kept as a builder so `new()` — and therefore every
@@ -1457,6 +1472,11 @@ impl GatewayCore {
 /// bounds the wait for the *first* message, and a provider that answers starts the stream long
 /// before it.
 pub const FIRST_MSG_TIMEOUT: Duration = Duration::from_secs(48);
+
+/// Slack above the largest configured plan budget. The engine must always be the layer that
+/// gives up first, so the backstop is derived from the profiles rather than fixed: a provider
+/// allowed a 180s plan needs the gateway to wait past 180s, not 48s.
+const FIRST_MSG_MARGIN: Duration = Duration::from_secs(8);
 
 /// RAII slot: permit + registration + receiver, all released on drop — including on client
 /// disconnect mid-stream, which is what makes §3.5 cancellation work.

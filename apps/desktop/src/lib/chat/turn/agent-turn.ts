@@ -22,6 +22,7 @@ import { attachmentMeta } from "./ports";
 import type { TurnRequestBase } from "./ports";
 import type { AgentTurnPorts, FallbackAttempt } from "./ports";
 import { retryNoticeLabel } from "../../gateway-turn";
+import { startWaitingNotice } from "./waiting";
 
 export interface AgentTurnRequest extends TurnRequestBase {
   /** The workspace root; blank refuses the run (the guard is the engine's, not the UI's). */
@@ -341,6 +342,12 @@ export async function runAgentTurn(
         let callOut: number | undefined;
         /** Only clear a retry line that this call actually painted. */
         let retryPainted = false;
+        /** The local "still waiting" line for a call that has not produced a chunk yet. */
+        let waitingPainted = false;
+        const stopWaiting = startWaitingNotice((text) => {
+          waitingPainted = true;
+          ports.patchMsg(req.assistantMsgId, { retryStatus: text });
+        }, req.model);
         const p = ports.generate(
           {
             ...(req.thinking ? { reasoning: req.thinking } : {}),
@@ -352,6 +359,8 @@ export async function runAgentTurn(
               ? { maxTokens: req.maxTokens }
               : {}),
             onRetry: (n) => {
+              stopWaiting();
+              waitingPainted = false;
               retryPainted = true;
               ports.patchMsg(req.assistantMsgId, {
                 retryStatus: retryNoticeLabel(n),
@@ -384,8 +393,10 @@ export async function runAgentTurn(
             let cleared = false;
             try {
               for await (const chunk of exec.chunks) {
-                if (retryPainted && !cleared) {
+                if (!cleared && (retryPainted || waitingPainted)) {
                   cleared = true;
+                  waitingPainted = false;
+                  stopWaiting();
                   ports.patchMsg(req.assistantMsgId, {
                     retryStatus: undefined,
                   });
@@ -393,7 +404,8 @@ export async function runAgentTurn(
                 yield chunk;
               }
             } finally {
-              if (retryPainted && !cleared) {
+              stopWaiting();
+              if (!cleared && (retryPainted || waitingPainted)) {
                 ports.patchMsg(req.assistantMsgId, { retryStatus: undefined });
               }
               const s = exec.served();
@@ -401,7 +413,14 @@ export async function runAgentTurn(
               if (s?.fallbacks) chain.push(...s.fallbacks);
             }
           })(),
-        }));
+        }), (err: unknown) => {
+          // The request failed before any stream existed: do not leave a waiting line behind.
+          stopWaiting();
+          if (waitingPainted) {
+            ports.patchMsg(req.assistantMsgId, { retryStatus: undefined });
+          }
+          throw err;
+        });
       },
       host,
       generateImage: req.generateImage,

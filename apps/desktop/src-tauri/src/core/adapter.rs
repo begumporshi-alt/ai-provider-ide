@@ -42,6 +42,7 @@ use futures_util::stream::BoxStream;
 use serde_json::Value;
 
 use crate::core::engine::AttemptError;
+use crate::core::http_port::RequestTimeouts;
 pub use crate::core::manifest_view::Capabilities;
 use crate::core::usage::UsageTokens;
 
@@ -240,6 +241,9 @@ pub struct TextArgs<'a> {
     /// this is opt-in per operator. See `TextRequest::prompt_cache_enabled` for the read-side
     /// note.
     pub prompt_cache_enabled: bool,
+    /// Per-request upstream budgets, resolved by the engine from the provider's timeout profile.
+    /// `None` keeps the host's defaults.
+    pub timeouts: Option<RequestTimeouts>,
     /// Filled by the adapter with what the stream actually carried, whether or not the manifest
     /// could read any of it. The engine reads it only when the stream delivered nothing — the arm
     /// that files `PARSE_ERROR` with no status and an empty chain, and the reason 154 rows in the
@@ -1000,6 +1004,7 @@ mod tests {
             on_finish: None,
             on_reasoning: None,
             prompt_cache_enabled: false,
+            timeouts: None,
             observation: None,
         }
     }

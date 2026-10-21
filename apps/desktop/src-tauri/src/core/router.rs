@@ -78,6 +78,7 @@ use crate::core::planner::{
     build_plan, earliest_key_retry_at, Candidate, PlanContext, PlanInput, PROVIDER_HEALTH_WINDOW_MS,
 };
 use crate::core::pricing::{estimate_cost_micros, pricing_from_cache_json, PricingMicros};
+use crate::core::provider_timeouts::ProviderTimeouts;
 use crate::core::store::Store;
 use crate::core::usage::UsageTokens;
 
@@ -266,6 +267,13 @@ pub struct RouterSettings {
     ///
     /// The webview writes this key as `promptCacheEnabled` in the `router` settings row.
     pub prompt_cache_enabled: bool,
+    /// Per-provider network budgets. Absent providers inherit the built-in defaults, so a row
+    /// written before this field existed keeps exactly the behaviour it had.
+    ///
+    /// **Not a manifest field on purpose.** A timeout is execution policy, not part of the wire
+    /// shape; storing it here means changing it neither mints a manifest version nor waits for an
+    /// activation, and both serving hosts already read this row per request.
+    pub provider_timeouts: ProviderTimeouts,
 }
 
 impl Default for RouterSettings {
@@ -276,6 +284,7 @@ impl Default for RouterSettings {
             per_provider_concurrency: Value::from(PER_PROVIDER_DEFAULT),
             gateway_tools_enabled: true,
             prompt_cache_enabled: false,
+            provider_timeouts: ProviderTimeouts::default(),
         }
     }
 }
@@ -337,6 +346,7 @@ impl RouterSettings {
                 .get("promptCacheEnabled")
                 .and_then(Value::as_bool)
                 .unwrap_or(default.prompt_cache_enabled),
+            provider_timeouts: ProviderTimeouts::from_router_settings(v),
         }
     }
 }
@@ -375,6 +385,9 @@ pub struct TextRequest<'a> {
     pub on_retry: Option<&'a mut (dyn FnMut(crate::core::engine::RetryNotice) + Send)>,
     /// How many candidates this request may try. `None` is [`crate::core::engine::MAX_ATTEMPTS_DEFAULT`].
     pub max_attempts: Option<usize>,
+    /// Per-provider budgets, from the `router` settings row. The engine applies the serving
+    /// provider's profile to each attempt.
+    pub provider_timeouts: ProviderTimeouts,
     /// Whether to mark the system prompt with `cache_control` on egress so a provider with
     /// prefix caching bills the repeated block at reduced price.
     ///
@@ -962,6 +975,7 @@ impl<'a> ModelRouter<'a> {
             on_reasoning,
             on_retry,
             max_attempts,
+            provider_timeouts,
             prompt_cache_enabled,
         } = req;
 
@@ -1059,6 +1073,7 @@ impl<'a> ModelRouter<'a> {
                 on_reasoning: Some(&mut forward_reasoning),
                 on_retry: Some(&mut forward_retry),
                 max_attempts,
+                provider_timeouts,
                 prompt_cache_enabled,
             };
             execute_text(
@@ -1483,6 +1498,7 @@ impl<'a> ModelRouter<'a> {
                 // No client progress channel on this path; it is awaited, not streamed.
                 on_retry: None,
                 max_attempts: None,
+                provider_timeouts: self.settings.provider_timeouts.clone(),
                 // Read from the router settings rather than hardcoded off, so the operator's
                 // toggle governs this path too. `CompleteRequest` carries no flag of its own:
                 // it is the System-AI/generator path, and a second switch would only drift.
@@ -2215,6 +2231,7 @@ mod tests {
             on_reasoning: None,
             on_retry: None,
             max_attempts: None,
+            provider_timeouts: ProviderTimeouts::default(),
             prompt_cache_enabled: false,
         }
     }

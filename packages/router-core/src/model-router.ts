@@ -24,6 +24,26 @@ import {
   type CompressResult,
 } from "./context-compress.js";
 
+/**
+ * Per-provider network budgets. Every field is optional: an omitted field keeps the built-in
+ * default, and an unlisted provider keeps all of them. Durations are milliseconds because the
+ * row is JSON and the Rust side parses `*Ms` keys.
+ */
+export interface ProviderTimeoutProfile {
+  /** Wait for response headers before abandoning one attempt. */
+  headerMs?: number;
+  /** Wait for the first body byte; encloses `headerMs`. */
+  firstByteMs?: number;
+  /** Wait for the first item the gateway counts as output. */
+  firstOutputMs?: number;
+  /** Silence allowed after the stream has started. */
+  idleMs?: number;
+  /** Wall-clock budget for the whole plan, across every candidate. */
+  planBudgetMs?: number;
+  /** How many candidates the plan may dial. */
+  maxAttempts?: number;
+}
+
 export interface RouterSettings {
   failoverEnabled: boolean;
   systemAi: { providerId: string; model: string } | null;
@@ -33,6 +53,8 @@ export interface RouterSettings {
    * gateway's whole global budget.
    */
   perProviderConcurrency: number;
+  /** Keyed by provider id; read per request by both serving hosts. */
+  providerTimeouts?: Record<string, ProviderTimeoutProfile>;
 }
 
 /** §2.8 dependency inversion: the Generator depends on THIS, never on Router internals. */
@@ -60,6 +82,7 @@ export class ModelRouter implements RouterFacade, AiTextPort {
     failoverEnabled: true,
     systemAi: null,
     perProviderConcurrency: PER_PROVIDER_DEFAULT,
+    providerTimeouts: {},
   };
   /** Per-provider in-flight cap (audit R3). Exposed for tests and Router Settings. */
   readonly limiter = new ProviderLimiter(PER_PROVIDER_DEFAULT);

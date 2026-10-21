@@ -448,6 +448,7 @@ impl Job {
                     on_reasoning: Some(&mut on_reasoning),
                     on_retry: Some(&mut on_retry),
                     max_attempts: None,
+                    provider_timeouts: self.host.settings().provider_timeouts,
                     prompt_cache_enabled: self.host.settings().prompt_cache_enabled,
                 };
                 self.router().generate_text(text_req, &opts, cancel, &mut on_chunk).await

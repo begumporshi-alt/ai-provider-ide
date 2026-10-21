@@ -50,6 +50,7 @@
 //!   nothing to port — the absence is the point.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
@@ -83,6 +84,21 @@ pub struct HttpRequest {
     /// flag states the same fact without a second reader of the body, and it is the caller's
     /// answer to a question only the caller can answer — *am I going to consume a stream?*
     pub stream: bool,
+    /// Per-request upstream budgets. `None` keeps the host's defaults — the 20s pair sized for
+    /// providers that answer promptly. The engine fills this from the provider's timeout profile,
+    /// so one slow aggregator can wait longer without changing every other provider's failure
+    /// reporting.
+    pub timeouts: Option<RequestTimeouts>,
+}
+
+/// The two phases a provider's timeout profile can override per request.
+///
+/// `first_output` is deliberately absent: it is enforced by the engine, which is the layer that
+/// can tell a content event from a keep-alive, not by the byte-level egress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestTimeouts {
+    pub header: Duration,
+    pub first_byte: Duration,
 }
 
 /// The two methods a manifest may use. `egress::build` permits no others.

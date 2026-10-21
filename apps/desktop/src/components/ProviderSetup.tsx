@@ -15,10 +15,10 @@
  */
 import { useEffect, useState } from "react";
 import type { Modality } from "@aiprovider/adapter-spec";
-import { PROVIDER_PROFILES, PROVIDER_PROFILE_LABELS, type AdapterManifest } from "@aiprovider/router-core";
+import { PROVIDER_PROFILES, PROVIDER_PROFILE_LABELS, type AdapterManifest, type ProviderTimeoutProfile } from "@aiprovider/router-core";
 import {
-  adapters, addKey, addManualModel, addProvider, catalog, duplicateKeyHintExists, nextKeyLabel, refreshCatalog, registry,
-  removeManualModel, setProviderStatus, testModel, uniqueSlug, updateProvider,
+  adapters, addKey, addManualModel, addProvider, catalog, duplicateKeyHintExists, nextKeyLabel, persistRouterSettings,
+  refreshCatalog, registry, removeManualModel, router, setProviderStatus, testModel, uniqueSlug, updateProvider,
 } from "../store";
 import { useUi } from "../ui-state";
 import { Button, Field, Modal, inputCls, inputStyle } from "./atoms";
@@ -670,6 +670,56 @@ export function AddProviderModal({ onClose, onDone }: { onClose: () => void; onD
 // ---------- editor ----------
 
 /**
+ * The budgets the editor exposes, in seconds (and attempts), as text so a blank field means
+ * "use the built-in default" rather than "zero".
+ */
+interface TimeoutDraft {
+  headerSec: string;
+  firstByteSec: string;
+  planBudgetSec: string;
+  maxAttempts: string;
+}
+
+function timeoutDraftFrom(p: ProviderTimeoutProfile | undefined): TimeoutDraft {
+  const secs = (ms: number | undefined) => (ms === undefined ? "" : String(ms / 1000));
+  return {
+    headerSec: secs(p?.headerMs),
+    firstByteSec: secs(p?.firstByteMs),
+    planBudgetSec: secs(p?.planBudgetMs),
+    maxAttempts: p?.maxAttempts === undefined ? "" : String(p.maxAttempts),
+  };
+}
+
+/** `undefined` = blank, `null` = invalid, otherwise the parsed positive integer. */
+function positiveInt(text: string): number | undefined | null {
+  const trimmed = text.trim();
+  if (trimmed === "") return undefined;
+  const n = Number(trimmed);
+  return Number.isFinite(n) && n >= 1 && Number.isInteger(n) ? n : null;
+}
+
+/**
+ * `null` = invalid input, `undefined` = no overrides (remove the entry), otherwise the profile.
+ * The Rust side clamps and restores the phase ordering, so this only has to reject nonsense.
+ */
+function timeoutProfileFrom(d: TimeoutDraft): ProviderTimeoutProfile | null | undefined {
+  const values = [
+    positiveInt(d.headerSec),
+    positiveInt(d.firstByteSec),
+    positiveInt(d.planBudgetSec),
+    positiveInt(d.maxAttempts),
+  ];
+  const [header, firstByte, plan, attempts] = values;
+  if (header === null || firstByte === null || plan === null || attempts === null) return null;
+  const profile: ProviderTimeoutProfile = {};
+  if (header !== undefined) profile.headerMs = header * 1000;
+  if (firstByte !== undefined) profile.firstByteMs = firstByte * 1000;
+  if (plan !== undefined) profile.planBudgetMs = plan * 1000;
+  if (attempts !== undefined) profile.maxAttempts = attempts;
+  return Object.keys(profile).length > 0 ? profile : undefined;
+}
+
+/**
  * Edit a provider that already exists: its name, its connection, and its models.
  *
  * A changed connection is written as a new manifest version rather than an update in place, so the
@@ -685,6 +735,11 @@ export function EditProviderModal({
     name: p?.name ?? "",
     url: p?.baseUrl ?? "",
   }));
+  // Read once from the `router` settings row. A blank field means "built-in default"; the value
+  // this form writes is a provider override, not a manifest field, so saving it mints no version.
+  const [timeouts, setTimeouts] = useState<TimeoutDraft>(() =>
+    timeoutDraftFrom(router.settings.providerTimeouts?.[providerId]),
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
@@ -760,6 +815,11 @@ export function EditProviderModal({
   async function save() {
     const problem = draftError(draft);
     if (problem) { setError(problem); return; }
+    const profile = timeoutProfileFrom(timeouts);
+    if (profile === null) {
+      setError("Timeouts must be positive whole numbers (seconds, and attempts).");
+      return;
+    }
     setBusy(true);
     setError(null);
     setSaved(null);
@@ -775,6 +835,14 @@ export function EditProviderModal({
         baseUrl: draft.url,
         ...(changed ? { manifest: next } : {}),
       });
+      // The profile rides the `router` settings row, so it applies to the running gateway on the
+      // next request and does not create a manifest version. Clearing every field removes the
+      // entry and returns the provider to the defaults.
+      const nextProfiles = { ...(router.settings.providerTimeouts ?? {}) };
+      if (profile === undefined) delete nextProfiles[providerId];
+      else nextProfiles[providerId] = profile;
+      router.settings.providerTimeouts = nextProfiles;
+      persistRouterSettings();
       if (draft.url.trim() !== originalUrl) {
         // A repointed provider carries a manifest built for the OLD host — its dialect, auth
         // header and endpoint paths were derived from it. Stay open and offer the one flow that
@@ -804,6 +872,47 @@ export function EditProviderModal({
       {loadError && <p className="mb-3 text-[12px]" style={{ color: "var(--warn)" }}>{loadError}</p>}
 
       <ConnectionFields d={draft} setD={(patch) => setDraft((d) => ({ ...d, ...patch }))} />
+
+      <details className="mt-4 rounded border p-3" style={{ borderColor: "var(--border)" }}>
+        <summary className="cursor-pointer text-[12px] font-medium" style={{ color: "var(--text-dim)" }}>
+          Timeouts &amp; retries
+        </summary>
+        <p className="mt-2 text-[11px] leading-snug" style={{ color: "var(--text-faint)" }}>
+          Blank fields use the built-in defaults (20s headers, 44s plan, 6 attempts). A slow
+          aggregator such as agentrouter needs more; a value here applies to this provider only
+          and takes effect on the next request.
+        </p>
+        <div className="mt-2 grid grid-cols-2 gap-x-3">
+          <Field label="Headers (seconds)">
+            <input
+              className={inputCls} style={inputStyle} inputMode="numeric" placeholder="20"
+              value={timeouts.headerSec}
+              onChange={(e) => setTimeouts((t) => ({ ...t, headerSec: e.target.value }))}
+            />
+          </Field>
+          <Field label="First byte (seconds)">
+            <input
+              className={inputCls} style={inputStyle} inputMode="numeric" placeholder="20"
+              value={timeouts.firstByteSec}
+              onChange={(e) => setTimeouts((t) => ({ ...t, firstByteSec: e.target.value }))}
+            />
+          </Field>
+          <Field label="Plan budget (seconds)">
+            <input
+              className={inputCls} style={inputStyle} inputMode="numeric" placeholder="44"
+              value={timeouts.planBudgetSec}
+              onChange={(e) => setTimeouts((t) => ({ ...t, planBudgetSec: e.target.value }))}
+            />
+          </Field>
+          <Field label="Max attempts">
+            <input
+              className={inputCls} style={inputStyle} inputMode="numeric" placeholder="6"
+              value={timeouts.maxAttempts}
+              onChange={(e) => setTimeouts((t) => ({ ...t, maxAttempts: e.target.value }))}
+            />
+          </Field>
+        </div>
+      </details>
 
       <div className="flex justify-end gap-2">
         <Button onClick={onClose}>Close</Button>

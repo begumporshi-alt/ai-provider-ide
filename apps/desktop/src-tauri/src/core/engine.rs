@@ -942,6 +942,33 @@ mod tests {
     }
 
     #[test]
+    fn a_slow_profile_funds_three_attempts_inside_its_own_plan_budget() {
+        use crate::core::egress::UPSTREAM_HEADER_TIMEOUT as DEFAULT_ATTEMPT;
+
+        // The agent-router profile: 60s per attempt, 180s for the plan. All three keys fit.
+        let header = Duration::from_secs(60);
+        let plan = Duration::from_secs(180);
+        assert!(candidate_is_affordable_with(header, false, header, plan), "attempt 2 fits");
+        assert!(candidate_is_affordable_with(header * 2, false, header, plan), "attempt 3 fits");
+        assert!(
+            !candidate_is_affordable_with(
+                header * 2 + Duration::from_millis(1),
+                false,
+                header,
+                plan
+            ),
+            "a fourth attempt would overrun the plan"
+        );
+
+        // The same elapsed time under the default profile is refused — a slow provider's budget
+        // must not silently become every provider's budget.
+        assert!(
+            !candidate_is_affordable_with(header * 2, false, DEFAULT_ATTEMPT, PLAN_BUDGET),
+            "140s of elapsed time cannot fit the default 44s plan"
+        );
+    }
+
+    #[test]
     fn the_error_reports_the_same_wait_as_the_free_fold() {
         // One arithmetic, two entry points. If they ever disagree, the client is told a different
         // wait depending on which path produced the failure — and the TypeScript spells this fold
@@ -2001,6 +2028,7 @@ mod tests {
             on_reasoning: None,
             on_retry: None,
             max_attempts: None,
+            provider_timeouts: crate::core::provider_timeouts::ProviderTimeouts::default(),
             prompt_cache_enabled: false,
         }
     }
@@ -2766,6 +2794,36 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), vec!["recovered".to_string()]);
     }
 
+    /// **The key-04-twice regression.** A pre-output timeout used to be re-probed on the same key
+    /// whenever no *different provider* was queued — even when a second key of the same provider
+    /// was next. The measured chain (2026-10-22, row 7590) is `key-04` twice, while `key-03` and
+    /// `key-05` were never dialled. A fresh credential is exactly as much of a fresh roll as a
+    /// fresh host, so the next key must be tried before the failed one is dialled again.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_network_timeout_moves_to_the_next_key_of_the_same_provider() {
+        let adapter = HeaderTimeoutThenServe::new();
+        let health = HealthTracker::new();
+        let (seen, mut on_chunk) = sink();
+
+        let served = execute_text(
+            &Always(adapter.clone()),
+            &health,
+            None,
+            text_args(vec![candidate("p1", "k1", "m1"), candidate("p1", "k2", "m1")]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect("the second key serves after the first times out on headers");
+
+        assert_eq!(adapter.calls(), 2, "the queued key is dialled, not the failed key re-probed");
+        assert_eq!(served.candidate.key.label, "k2", "the other key served");
+        assert!(adapter.seen()[1].contains(":k2|"), "the second dial was the other key");
+        assert_eq!(served.attempts.len(), 1, "the timeout stays in the chain");
+        assert_eq!(served.attempts[0].cls, ErrorClass::Network);
+        assert_eq!(*seen.lock().unwrap(), vec!["recovered".to_string()]);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_pre_output_timeout_prefers_a_different_provider() {
         // The measured case (2026-10-19, ledger 7160): two keys of agent-router stalled for 20s
@@ -2815,17 +2873,19 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_network_timeout_reprobes_the_same_candidate_when_no_other_provider_exists() {
-        // Borrowed from ZCode: when the plan has no different provider, a pre-output timeout gets
-        // one bounded roll of the *same* request after a pause instead of moving to another key on
-        // the same host. The paused clock advances exactly 20s on the first dial, and the retry
-        // must still fit the 44s plan: 20s + 2s + 20s = 42s.
+        // Borrowed from ZCode: when the plan has nowhere else to go, a pre-output timeout gets
+        // one bounded roll of the *same* request after a pause. A second key of the same provider
+        // is a different candidate and is dialled first — pinned by
+        // `a_network_timeout_moves_to_the_next_key_of_the_same_provider` — so this test's plan is
+        // deliberately one candidate. The paused clock advances exactly 20s on the first dial, and
+        // the retry must still fit the 44s plan: 20s + 2s + 20s = 42s.
         let adapter = HeaderTimeoutThenServe::new();
         let health = HealthTracker::new();
         let (seen, mut on_chunk) = sink();
         let notices = Arc::new(Mutex::new(Vec::new()));
         let notice_sink = Arc::clone(&notices);
         let mut on_retry = move |n: RetryNotice| notice_sink.lock().unwrap().push(n);
-        let mut args = text_args(vec![candidate("p1", "k1", "m1"), candidate("p1", "k2", "m1")]);
+        let mut args = text_args(vec![candidate("p1", "k1", "m1")]);
         args.on_retry = Some(&mut on_retry);
 
         let served = execute_text(
@@ -2842,7 +2902,7 @@ mod tests {
         assert_eq!(
             adapter.seen(),
             vec!["key:p1:k1|m1".to_string(), "key:p1:k1|m1".to_string()],
-            "the same key was retried; the provider's second key was never dialled"
+            "the plan had no other candidate, so the same key was retried"
         );
         assert_eq!(served.candidate.key.label, "k1");
         assert_eq!(served.attempts.len(), 1);

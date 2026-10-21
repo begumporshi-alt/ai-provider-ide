@@ -56,7 +56,13 @@ export {
 export { UsageLedger, type LedgerEntry, type LedgerSource } from "./usage-ledger.js";
 export { AdapterRuntime } from "./adapter-runtime.js";
 export { ModelCatalog } from "./model-catalog.js";
-export { ModelRouter, type AiTextPort, type RouterSettings, type SystemAiHealth } from "./model-router.js";
+export {
+  ModelRouter,
+  type AiTextPort,
+  type ProviderTimeoutProfile,
+  type RouterSettings,
+  type SystemAiHealth,
+} from "./model-router.js";
 export * from "./ports.js";
 export * from "./domain.js";
 export * from "./errors.js";

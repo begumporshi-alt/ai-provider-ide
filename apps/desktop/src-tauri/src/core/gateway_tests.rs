@@ -421,6 +421,58 @@ fn test_core_with_store(
     (Arc::new(core), bridge)
 }
 
+/// The engine must always give up before the gateway does. A provider profile that allows a 180s
+/// plan therefore raises the gateway's backstop past 180s; the constant alone would cancel the
+/// request first and file it `CANCELLED`, losing the real attempt chain.
+#[test]
+fn the_first_message_bound_follows_a_slow_provider_profile() {
+    let dir = std::env::temp_dir().join(format!("aip-gw-profile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Arc::new(crate::core::store::Store::open(&dir).unwrap());
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value_json) VALUES ('router', ?1) \
+             ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+            [serde_json::json!({
+                "providerTimeouts": { "p1": { "headerMs": 60_000, "planBudgetMs": 180_000 } }
+            })
+            .to_string()],
+        )
+        .unwrap();
+    }
+    let (core, _) =
+        test_core_with_store(Arc::new(Mutex::new(Some("sk-aip-master".into()))), store);
+
+    assert_eq!(
+        core.first_msg_timeout(),
+        std::time::Duration::from_secs(188),
+        "180s plan + the 8s margin"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A store with no profiles must not move the bound: the default 44s plan is already covered by
+/// the 48s constant, and deriving a margin from it would change every unconfigured install.
+#[test]
+fn the_first_message_bound_ignores_an_empty_profile_map() {
+    let dir = std::env::temp_dir().join(format!("aip-gw-no-profile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Arc::new(crate::core::store::Store::open(&dir).unwrap());
+    let (core, _) =
+        test_core_with_store(Arc::new(Mutex::new(Some("sk-aip-master".into()))), store);
+    assert_eq!(core.first_msg_timeout(), FIRST_MSG_TIMEOUT);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Without a store the core keeps the constant, which is every test that builds a bare core and
+/// the behaviour the gateway had before profiles existed.
+#[test]
+fn the_first_message_bound_stays_at_the_constant_without_a_store() {
+    let (core, _) = test_core(Arc::new(Mutex::new(Some("sk-aip-master".into()))));
+    assert_eq!(core.first_msg_timeout(), FIRST_MSG_TIMEOUT);
+}
+
 /// `start`, with a store-backed core. Returns the dir so it outlives the server.
 async fn start_with_idem_store(
     key: Arc<Mutex<Option<String>>>,

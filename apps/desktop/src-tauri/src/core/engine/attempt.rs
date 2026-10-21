@@ -179,7 +179,25 @@ pub const PLAN_BUDGET: Duration = Duration::from_secs(44);
 /// alternative — admitting a candidate and cutting it short — is strictly worse: it spends the
 /// remaining time to reach a conclusion it already knew it could not reach.
 pub fn candidate_is_affordable(elapsed: Duration, is_first: bool) -> bool {
-    is_first || elapsed + crate::core::egress::UPSTREAM_HEADER_TIMEOUT <= PLAN_BUDGET
+    candidate_is_affordable_with(
+        elapsed,
+        is_first,
+        crate::core::egress::UPSTREAM_HEADER_TIMEOUT,
+        PLAN_BUDGET,
+    )
+}
+
+/// The same rule with the candidate's own budgets. A per-provider profile can be more patient than
+/// the default, and the admission check has to be priced by the profile actually in force — a
+/// candidate admitted under a 20s header budget while its provider's profile allows 60s would be
+/// refused after one attempt even though the plan still had room for another.
+pub fn candidate_is_affordable_with(
+    elapsed: Duration,
+    is_first: bool,
+    header_timeout: Duration,
+    plan_budget: Duration,
+) -> bool {
+    is_first || elapsed + header_timeout <= plan_budget
 }
 
 /// How long the text loop waits before re-dialing the **same** candidate whose plan just ran out on

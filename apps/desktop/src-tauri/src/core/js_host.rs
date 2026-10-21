@@ -830,6 +830,8 @@ impl JsHost {
             // The sandbox's `http` is unary by construction: the guest gets `{status, text}` and
             // there is no line stream to give it (`code-adapter.ts:300-306` reads the whole body).
             stream: false,
+            // A code adapter has no provider profile to consult; the engine's budgets apply.
+            timeouts: None,
         };
         match egress.request(request, cancel).await {
             Ok(response) => {

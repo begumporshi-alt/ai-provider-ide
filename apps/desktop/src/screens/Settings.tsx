@@ -204,9 +204,9 @@ export function SettingsScreen() {
         </div>
       </Section>
 
-      <Section title="Reliability" hint="Timeouts: connect 10s · first byte 30s · idle stream 60s · max 6 attempts (§3.6). Editing budgets lands with the Phase 5 drift work — the defaults are live now.">
+      <Section title="Reliability" hint="Defaults: connect 10s · headers 20s · first byte 20s · idle stream 120s · plan 44s · 6 attempts (§3.6). Per-provider overrides live under Providers → Edit → Timeouts & retries.">
         <div className="mono text-[12px]" style={{ color: "var(--text-dim)" }}>
-          connect 10s · first-byte 30s · idle 60s · attempts 6 · jittered backoff honoring Retry-After
+          connect 10s · headers 20s · first byte 20s · idle 120s · plan 44s · attempts 6 · jittered backoff honoring Retry-After
         </div>
       </Section>
 

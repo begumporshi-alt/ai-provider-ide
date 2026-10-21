@@ -139,14 +139,25 @@ One "request timeout" cannot serve every phase, so the budget is per phase.
 | Connect | 10 s |
 | Upstream headers | 20 s (`UPSTREAM_HEADER_TIMEOUT`) |
 | Upstream first byte | 20 s (`UPSTREAM_FIRST_BYTE_TIMEOUT`) |
+| Upstream first output | 20 s (`UPSTREAM_FIRST_OUTPUT_TIMEOUT`) |
 | Upstream idle stream | 120 s, reset on every chunk — long generations are not "timed out" |
+| Plan budget | 44 s (`PLAN_BUDGET`) — bounds every candidate in one request |
 | Gateway first message | 48 s (`FIRST_MSG_TIMEOUT`) — bounds the wait for the bridge's first frame, then `503` |
-| Max attempts per request | 6, across the whole plan (`PLAN_BUDGET` 44 s bounds the whole chain) |
+| Max attempts per request | 6, across the whole plan |
 | Upstream transport retries | 1, pre-header transport errors only — a header stall is deliberately *not* retried |
-| Network re-probes | 2, same candidate, 2 s apart — only when no different provider is planned; priced inside `PLAN_BUDGET` |
+| Network re-probes | 2, same candidate, 2 s apart — only when the plan has no other candidate; priced inside the plan budget |
 | Retry progress | `aip_retry` on a contentless OpenAI chunk (`attempt`, `max`, `delay_ms`, `reason`); other dialects drop it |
 | Backoff | Jittered exponential, honouring `Retry-After` |
 | Per-provider concurrency cap | 4 (`PER_PROVIDER_DEFAULT`), with a bounded queue |
+
+**Per-provider profiles.** `router` settings may carry
+`providerTimeouts: { "<provider-id>": { headerMs, firstByteMs, firstOutputMs, idleMs, planBudgetMs, maxAttempts } }`.
+Each attempt uses its provider's header/first-byte budgets, the plan uses the largest plan budget
+in the plan, and the engine uses the largest attempt count. The gateway's first-message backstop
+becomes `max(48s, largestConfiguredPlan + 8s)`, so the engine always fails first. An unlisted
+provider inherits every default in the table, and corrupt or out-of-range values fall back and are
+clamped (1–600 s per phase, plan ≤ 900 s, attempts 1–12). The built-in `agent-router` seed is
+60 s/60 s/60 s, 180 s plan, 4 attempts.
 
 ### Concurrency is two semaphores, not one
 
