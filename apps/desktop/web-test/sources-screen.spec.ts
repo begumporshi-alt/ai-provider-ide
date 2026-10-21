@@ -74,6 +74,41 @@ test("sources: search and the source/root filters compose", async ({ page }) => 
   await expect(sessions(page).first()).toHaveAttribute("data-source", "codex");
 });
 
+test("sources: time, order and imported-only filters compose", async ({ page }) => {
+  await open(page);
+  // The shim's fixtures: claude is 2h old, codex is 3d old.
+  await expect(row(page, "claude")).toContainText("updated 2h ago");
+  await expect(row(page, "codex")).toContainText("updated 3d ago");
+
+  const range = (id: string) =>
+    page.locator(`[data-testid="source-range"][data-range="${id}"]`);
+
+  await range("24h").click();
+  await expect(sessions(page)).toHaveCount(1);
+  await expect(sessions(page).first()).toHaveAttribute("data-source", "claude");
+
+  await range("7d").click();
+  await expect(sessions(page)).toHaveCount(2);
+
+  // Newest first is the default; oldest first flips the order.
+  await page.getByLabel("Sort sessions").selectOption("oldest");
+  await expect(sessions(page).first()).toHaveAttribute("data-source", "codex");
+  await page.getByLabel("Sort sessions").selectOption("newest");
+  await expect(sessions(page).first()).toHaveAttribute("data-source", "claude");
+
+  // Imported-only is empty until an import, then narrows to that row.
+  await range("all").click();
+  await page.getByTestId("source-imported-only").check();
+  await expect(page.getByText("No sessions match these filters.")).toBeVisible();
+  await page.getByTestId("source-imported-only").uncheck();
+
+  await page.getByRole("button", { name: "Import sess_1 from claude" }).click();
+  await expect(page.getByTestId("source-status")).toContainText("imp-claude-sess_1");
+  await page.getByTestId("source-imported-only").check();
+  await expect(sessions(page)).toHaveCount(1);
+  await expect(sessions(page).first()).toHaveAttribute("data-source", "claude");
+});
+
 test("sources: importing is explicit, idempotent and visible", async ({ page }) => {
   await open(page);
   const claude = row(page, "claude");

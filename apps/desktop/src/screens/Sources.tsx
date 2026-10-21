@@ -12,7 +12,7 @@
  * and root filters to those hits locally, so the controls compose the way the user expects while
  * discovery still searches everywhere.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Button,
   EmptyState,
@@ -22,6 +22,7 @@ import {
   inputStyle,
 } from "../components/atoms";
 import type { RelatedSourceSession } from "../lib/memory/manifest";
+import { exactTime, timeAgo } from "../lib/time-ago";
 import {
   importSourceSession,
   listAgentSources,
@@ -34,6 +35,15 @@ import { useUi } from "../ui-state";
 const SEARCH_DEBOUNCE_MS = 180;
 /** The listing cap. The management view is for browsing a machine, not paging an archive. */
 const LIST_LIMIT = 100;
+
+type TimeRange = "all" | "24h" | "7d" | "30d";
+const TIME_RANGES: ReadonlyArray<{ id: TimeRange; label: string; ms: number | null }> = [
+  { id: "all", label: "Any time", ms: null },
+  { id: "24h", label: "Last 24h", ms: 86_400_000 },
+  { id: "7d", label: "Last 7 days", ms: 7 * 86_400_000 },
+  { id: "30d", label: "Last 30 days", ms: 30 * 86_400_000 },
+];
+type SortOrder = "newest" | "oldest";
 
 /**
  * The last unfiltered listing, kept for the lifetime of the webview.
@@ -59,6 +69,11 @@ export function SourcesScreen() {
   const [root, setRoot] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [debouncedRoot, setDebouncedRoot] = useState("");
+  // Client-side view filters: the host returns the (up to 100) newest hits, so time, order and
+  // imported state are cheap to apply here and need no extra route parameters.
+  const [range, setRange] = useState<TimeRange>("all");
+  const [sort, setSort] = useState<SortOrder>("newest");
+  const [importedOnly, setImportedOnly] = useState(false);
   // A skeleton is for the first read of the webview; afterwards the cached list stays on screen
   // and the fetch is reported as a refresh instead of replacing the content with placeholders.
   const [loading, setLoading] = useState(!cached);
@@ -154,7 +169,24 @@ export function SourcesScreen() {
   }
 
   const totalSessions = sources.reduce((n, s) => n + s.sessionCount, 0);
-  const filtered = Boolean(debouncedQuery || debouncedRoot || source);
+  const filtered = Boolean(
+    debouncedQuery || debouncedRoot || source || range !== "all" || importedOnly,
+  );
+  const visible = useMemo(() => {
+    const cutoff =
+      TIME_RANGES.find((r) => r.id === range)?.ms == null
+        ? null
+        : Date.now() - (TIME_RANGES.find((r) => r.id === range)?.ms ?? 0);
+    const rows = sessions.filter(
+      (s) =>
+        (cutoff === null || s.updatedAt >= cutoff) &&
+        (!importedOnly || s.importId !== null),
+    );
+    // Copy before sorting: `sessions` is the load result and other views read it as given.
+    return rows.slice().sort((a, b) =>
+      sort === "oldest" ? a.updatedAt - b.updatedAt : b.updatedAt - a.updatedAt,
+    );
+  }, [sessions, range, importedOnly, sort]);
 
   return (
     <div className="mx-auto max-w-6xl">
@@ -239,11 +271,83 @@ export function SourcesScreen() {
               setQuery("");
               setRoot("");
               setSource(null);
+              setRange("all");
+              setImportedOnly(false);
+              setSort("newest");
             }}
           >
             Clear filters
           </Button>
         ) : null}
+      </div>
+
+      {/* Time/order/state are view filters over the loaded hits: no extra host round-trip, and
+          the controls describe exactly what the list shows. */}
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <span
+          className="text-[11px] uppercase tracking-wide"
+          style={{ color: "var(--text-faint)" }}
+        >
+          Updated
+        </span>
+        {TIME_RANGES.map((r) => (
+          <button
+            key={r.id}
+            type="button"
+            data-testid="source-range"
+            data-range={r.id}
+            aria-pressed={range === r.id}
+            onClick={() => setRange(r.id)}
+            className="rounded-md border px-2 py-1 text-[11px] transition-colors"
+            style={{
+              borderColor: range === r.id ? "var(--accent)" : "var(--border)",
+              background: range === r.id ? "var(--surface-2)" : "var(--surface)",
+              color: range === r.id ? "var(--text)" : "var(--text-dim)",
+            }}
+          >
+            {r.label}
+          </button>
+        ))}
+        <span
+          className="mx-1 h-4 border-l"
+          style={{ borderColor: "var(--border)" }}
+          aria-hidden="true"
+        />
+        <label
+          className="flex items-center gap-1.5 text-[11px]"
+          style={{ color: "var(--text-dim)" }}
+        >
+          <input
+            type="checkbox"
+            data-testid="source-imported-only"
+            checked={importedOnly}
+            onChange={(e) => setImportedOnly(e.target.checked)}
+          />
+          Imported only
+        </label>
+        <label
+          className="flex items-center gap-1.5 text-[11px]"
+          style={{ color: "var(--text-dim)" }}
+        >
+          Sort
+          <select
+            value={sort}
+            onChange={(e) => setSort(e.target.value as SortOrder)}
+            aria-label="Sort sessions"
+            className="rounded border px-1.5 py-0.5 text-[11px]"
+            style={inputStyle}
+          >
+            <option value="newest">Newest first</option>
+            <option value="oldest">Oldest first</option>
+          </select>
+        </label>
+        <span
+          className="ml-auto text-[11px]"
+          style={{ color: "var(--text-faint)" }}
+          data-testid="source-shown"
+        >
+          {visible.length} shown
+        </span>
       </div>
 
       {note ? (
@@ -282,7 +386,7 @@ export function SourcesScreen() {
           </div>
           <SkeletonRows />
         </div>
-      ) : sessions.length === 0 ? (
+      ) : visible.length === 0 ? (
         <EmptyState
           title={
             !filtered && totalSessions === 0
@@ -296,7 +400,7 @@ export function SourcesScreen() {
           style={{ borderColor: "var(--border)" }}
           data-testid="source-list"
         >
-          {sessions.map((s) => {
+          {visible.map((s) => {
             const key = `${s.source}:${s.nativeId}`;
             const title = s.title || s.preview || s.nativeId;
             const showPreview = Boolean(s.preview && s.title && s.preview !== s.title);
@@ -306,6 +410,7 @@ export function SourcesScreen() {
                 data-testid="source-session"
                 data-source={s.source}
                 data-native-id={s.nativeId}
+                data-updated-at={s.updatedAt}
                 className="flex items-start gap-3 border-t px-3 py-2.5 first:border-t-0"
                 style={{ borderColor: "var(--border)", background: "var(--surface)" }}
               >
@@ -328,8 +433,10 @@ export function SourcesScreen() {
                   <div
                     className="mono mt-0.5 truncate text-[10px]"
                     style={{ color: "var(--text-faint)" }}
+                    title={`Updated ${exactTime(s.updatedAt)}`}
                   >
-                    {s.root ?? "no workspace"} · {s.turns} turn(s) · {s.nativePath}
+                    updated {timeAgo(s.updatedAt)} · {s.root ?? "no workspace"} ·{" "}
+                    {s.turns} turn(s) · {s.nativePath}
                   </div>
                 </div>
                 <div className="shrink-0">

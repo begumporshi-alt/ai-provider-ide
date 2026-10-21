@@ -3615,11 +3615,15 @@ async function routeMemory(method: string, segs: string[], q: URLSearchParams, b
  * the TS surface has something to render, plus empty stubs for every other adapter (incl. the
  * user-locked workbuddy empty stub) so `listAgentSources` reports the full UI order. */
 const ADAPTER_ORDER = ["zcode", "claude", "codex", "qoder", "router", "workbuddy", "gemini"];
+// Anchored at module load so the time filters have stable, distinguishable fixtures: one session
+// is recent, the other is old enough to fall outside a 24-hour window.
+const SEED_NOW = Date.now();
 const SOURCES_SEED: Record<string, RelatedSessionSeed[]> = {
   claude: [
     {
       source: "claude", nativeId: "sess_1", title: "Claude: auth flow sketch",
       root: "/tmp/proj-beta", preview: "How do we rotate the refresh token?",
+      updatedAt: SEED_NOW - 2 * 3_600_000, // 2h ago
       nativePath: "~/.claude/projects/-tmp-proj-beta/sess_1.jsonl", importId: null,
       // What the adapter's `read()` returns; import copies these rows into this app's transcript
       // store. The second turn's phrase exists nowhere else in the harness, so a spec can prove
@@ -3651,6 +3655,7 @@ const SOURCES_SEED: Record<string, RelatedSessionSeed[]> = {
     {
       source: "codex", nativeId: "cafe", title: "Codex: build slowdown",
       root: "/tmp/proj-alpha", preview: "why is the build slow?",
+      updatedAt: SEED_NOW - 3 * 86_400_000, // 3d ago
       nativePath: "~/.codex/sessions/2026/10/02/rollout-cafe.jsonl", importId: null,
       turnRows: [
         { role: "user", content: "why is the build slow?", ts: 1_790_000_100_000 },
@@ -3669,6 +3674,7 @@ interface RelatedSessionSeed {
   title: string | null;
   root: string | null;
   preview: string;
+  updatedAt: number;
   nativePath: string;
   importId: string | null;
   turnRows: Array<{ role: string; content: string; ts: number }>;
@@ -3677,7 +3683,7 @@ interface RelatedSessionSeed {
 function sourceRef(s: RelatedSessionSeed): Record<string, unknown> {
   return {
     source: s.source, nativeId: s.nativeId, title: s.title, root: s.root,
-    updatedAt: 1_790_000_000_000, turns: s.turnRows.length, preview: s.preview,
+    updatedAt: s.updatedAt, turns: s.turnRows.length, preview: s.preview,
     nativePath: s.nativePath, readable: true, note: null, importId: s.importId,
   };
 }

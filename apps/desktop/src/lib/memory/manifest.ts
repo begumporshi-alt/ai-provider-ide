@@ -58,6 +58,8 @@ export interface RelatedSourceSession {
   nativeId: string;
   title: string | null;
   root: string | null;
+  /** Epoch ms of the foreign store's last update — the management view's time axis. */
+  updatedAt: number;
   turns: number;
   preview: string;
   nativePath: string;

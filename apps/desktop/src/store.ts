@@ -2212,6 +2212,7 @@ function isRelatedSourceSession(v: unknown): v is RelatedSourceSession {
     v !== null &&
     typeof (v as { source?: unknown }).source === "string" &&
     typeof (v as { nativeId?: unknown }).nativeId === "string" &&
+    typeof (v as { updatedAt?: unknown }).updatedAt === "number" &&
     typeof (v as { turns?: unknown }).turns === "number" &&
     typeof (v as { preview?: unknown }).preview === "string"
   );
