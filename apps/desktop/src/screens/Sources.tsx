@@ -35,16 +35,35 @@ const SEARCH_DEBOUNCE_MS = 180;
 /** The listing cap. The management view is for browsing a machine, not paging an archive. */
 const LIST_LIMIT = 100;
 
+/**
+ * The last unfiltered listing, kept for the lifetime of the webview.
+ *
+ * Screens unmount on navigation, so a return to Sources used to blink a full skeleton over data
+ * this app had seconds earlier — the store scan is not free. The default view shows this snapshot
+ * immediately and refreshes behind a small "Refreshing…" indicator; filtered views still fetch.
+ */
+let defaultListing: {
+  sources: AgentSourceInfo[];
+  sessions: RelatedSourceSession[];
+} | null = null;
+
 export function SourcesScreen() {
   const tick = useUi((s) => s.tick);
-  const [sources, setSources] = useState<AgentSourceInfo[]>([]);
-  const [sessions, setSessions] = useState<RelatedSourceSession[]>([]);
+  const cached = defaultListing;
+  const [sources, setSources] = useState<AgentSourceInfo[]>(cached?.sources ?? []);
+  const [sessions, setSessions] = useState<RelatedSourceSession[]>(
+    cached?.sessions ?? [],
+  );
   const [source, setSource] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [root, setRoot] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [debouncedRoot, setDebouncedRoot] = useState("");
-  const [loading, setLoading] = useState(true);
+  // A skeleton is for the first read of the webview; afterwards the cached list stays on screen
+  // and the fetch is reported as a refresh instead of replacing the content with placeholders.
+  const [loading, setLoading] = useState(!cached);
+  const [refreshing, setRefreshing] = useState(false);
+  const loadedOnce = useRef(Boolean(cached));
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
@@ -63,6 +82,8 @@ export function SourcesScreen() {
   const load = useCallback(async () => {
     const seq = ++requestSeq.current;
     setError(null);
+    if (loadedOnce.current) setRefreshing(true);
+    else setLoading(true);
     try {
       const [list, hits] = await Promise.all([
         listAgentSources(),
@@ -76,22 +97,32 @@ export function SourcesScreen() {
             }),
       ]);
       if (seq !== requestSeq.current) return;
+      const visible = debouncedQuery
+        ? hits.filter(
+            (h) =>
+              (!source || h.source === source) &&
+              (!debouncedRoot || h.root === debouncedRoot),
+          )
+        : hits;
       setSources(list);
-      setSessions(
-        debouncedQuery
-          ? hits.filter(
-              (h) =>
-                (!source || h.source === source) &&
-                (!debouncedRoot || h.root === debouncedRoot),
-            )
-          : hits,
-      );
+      setSessions(visible);
+      // Only the default view is cached: a filtered listing reused on a fresh mount would show
+      // rows the (reset) controls do not describe.
+      if (!debouncedQuery && !source && !debouncedRoot) {
+        defaultListing = { sources: list, sessions: visible };
+      }
+      loadedOnce.current = true;
     } catch (e) {
       if (seq !== requestSeq.current) return;
       setError(e instanceof Error ? e.message : String(e));
-      setSessions([]);
+      // A failed refresh keeps the rows the user can still read; only a first load has nothing
+      // to fall back to.
+      if (!loadedOnce.current) setSessions([]);
     } finally {
-      if (seq === requestSeq.current) setLoading(false);
+      if (seq === requestSeq.current) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
   }, [debouncedQuery, debouncedRoot, source]);
 
@@ -135,31 +166,41 @@ export function SourcesScreen() {
             import one.
           </p>
         </div>
-        <Button onClick={() => void load()} disabled={loading}>
-          Refresh
-        </Button>
+        <div className="flex items-center gap-3">
+          {refreshing ? <Spinner label="Refreshing…" /> : null}
+          <Button onClick={() => void load()} disabled={loading || refreshing}>
+            Refresh
+          </Button>
+        </div>
       </div>
 
       {/* One card per adapter (and "all"). The dot is availability, the count is what the
-          adapter's store actually holds, and the note explains the empty stubs. */}
+          adapter's store actually holds, and the note explains the empty stubs. While the first
+          scan runs, placeholder chips keep the layout from jumping when the real ones land. */}
       <div className="mb-3 flex flex-wrap gap-2" data-testid="source-adapters">
-        <AdapterChip
-          label="all"
-          count={totalSessions}
-          active={source === null}
-          onClick={() => setSource(null)}
-        />
-        {sources.map((s) => (
-          <AdapterChip
-            key={s.name}
-            label={s.name}
-            count={s.sessionCount}
-            available={s.available}
-            note={s.note ?? undefined}
-            active={source === s.name}
-            onClick={() => setSource(source === s.name ? null : s.name)}
-          />
-        ))}
+        {loading ? (
+          <SkeletonChips />
+        ) : (
+          <>
+            <AdapterChip
+              label="all"
+              count={totalSessions}
+              active={source === null}
+              onClick={() => setSource(null)}
+            />
+            {sources.map((s) => (
+              <AdapterChip
+                key={s.name}
+                label={s.name}
+                count={s.sessionCount}
+                available={s.available}
+                note={s.note ?? undefined}
+                active={source === s.name}
+                onClick={() => setSource(source === s.name ? null : s.name)}
+              />
+            ))}
+          </>
+        )}
       </div>
 
       <div className="mb-3 flex flex-wrap items-center gap-2">
@@ -230,7 +271,17 @@ export function SourcesScreen() {
       ) : null}
 
       {loading ? (
-        <Spinner label="Loading sessions…" />
+        // Name the work, not just the wait: the app is walking several on-disk stores, and a
+        // bare "Loading…" reads like a hang when the first scan takes a couple of seconds.
+        <div data-testid="source-loading" aria-busy="true">
+          <div className="mb-3 flex flex-wrap items-center gap-3">
+            <Spinner label="Scanning agent stores…" />
+            <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>
+              zcode · Claude · Codex · Qoder · this app's transcripts
+            </span>
+          </div>
+          <SkeletonRows />
+        </div>
       ) : sessions.length === 0 ? (
         <EmptyState
           title={
@@ -309,8 +360,57 @@ export function SourcesScreen() {
   );
 }
 
-function AdapterChip({
-  label,
+/** Placeholder chips, the same footprint as a real adapter card, so the toolbar does not jump. */
+function SkeletonChips() {
+  return (
+    <>
+      {Array.from({ length: 8 }).map((_, i) => (
+        <div
+          key={i}
+          aria-hidden="true"
+          className="h-[30px] w-24 animate-pulse rounded-md border"
+          style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
+        />
+      ))}
+    </>
+  );
+}
+
+/** Placeholder rows: the shape of a session row, not a spinner in an empty page. */
+function SkeletonRows({ count = 4 }: { count?: number }) {
+  return (
+    <div
+      aria-hidden="true"
+      className="overflow-hidden rounded-lg border"
+      style={{ borderColor: "var(--border)" }}
+    >
+      {Array.from({ length: count }).map((_, i) => (
+        <div
+          key={i}
+          className="flex items-start gap-3 border-t px-3 py-3 first:border-t-0"
+          style={{ borderColor: "var(--border)", background: "var(--surface)" }}
+        >
+          <div
+            className="h-4 w-14 animate-pulse rounded"
+            style={{ background: "var(--surface-2)" }}
+          />
+          <div className="flex-1 space-y-2">
+            <div
+              className="h-3 w-2/3 animate-pulse rounded"
+              style={{ background: "var(--surface-2)" }}
+            />
+            <div
+              className="h-2.5 w-1/2 animate-pulse rounded"
+              style={{ background: "var(--surface-2)" }}
+            />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function AdapterChip({  label,
   count,
   active,
   available,
