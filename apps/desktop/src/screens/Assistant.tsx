@@ -1812,6 +1812,11 @@ function Chat({
   active: boolean;
 }) {
   const tick = useUi((s) => s.tick);
+  // The transcript writers are memoized with no dependencies (they run mid-turn from callbacks
+  // that must not be rebuilt), so they cannot read this render's `root` prop directly. A ref
+  // carries the current value into those closures; the screen owns the value and passes it down.
+  const rootRef = useRef(root);
+  rootRef.current = root;
   // P8: the composer, so a shortcut (and the palette's "Focus the composer") can put the caret in
   // it without reaching into the DOM by id.
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -2601,6 +2606,9 @@ function Chat({
       attachments: e.attachments ?? null,
       model: e.model ?? null,
       memoryRefs: e.memoryRefs ?? null,
+      // 0034: the workspace this turn ran in. Without it our own sessions match only by keyword
+      // in the related-sessions search, never by root.
+      root: rootRef.current.trim() || null,
       ts,
     }));
     void transcriptAppend(rows).catch(() => undefined);
@@ -2634,6 +2642,8 @@ function Chat({
         m.recalledMemories && m.recalledMemories.length > 0
           ? JSON.stringify(m.recalledMemories)
           : null,
+      // Rewriting a session keeps its workspace attribution — the same 0034 stamp an append writes.
+      root: rootRef.current.trim() || null,
       ts,
     }));
     // The next append continues past the rewritten view, not past the rows just removed.

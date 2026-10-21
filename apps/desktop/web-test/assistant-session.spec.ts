@@ -144,6 +144,39 @@ test("assistant: resuming a session continues it in place — no same-named dupl
   await expect(page.getByTestId("history-session").filter({ hasText: "Dhaka timezone thread" })).toHaveCount(1);
 });
 
+test("assistant: a turn records its workspace root on the durable rows", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  await page.getByRole("button", { name: "Assistant", exact: true }).click();
+  await pickModel(page, /oracle-mini/);
+
+  // Set the workspace root the way the composer does, then run one ordinary turn.
+  await page.getByRole("button", { name: "Root", exact: true }).click();
+  await page.getByPlaceholder(/absolute\/path/).fill("/tmp/proj-beta");
+  await page.getByRole("button", { name: "Chat", exact: true }).click();
+  await sendHello(page);
+
+  const rows = await page.evaluate(async () => {
+    const h = (
+      window as unknown as {
+        __webTest: { invoke: (c: string, a?: unknown) => Promise<unknown> };
+      }
+    ).__webTest;
+    const sessions = (await h.invoke("history_sessions", { limit: 1 })) as Array<{
+      session_id: string;
+    }>;
+    if (!sessions.length) return [];
+    return (await h.invoke("transcript_list", {
+      session_id: sessions[0]!.session_id,
+    })) as Array<{ role: string; root?: string | null }>;
+  });
+
+  expect(rows.length).toBeGreaterThan(0);
+  // 0034: every row the screen writes carries the turn's workspace root, so our own past
+  // sessions can be scoped by root instead of keyword-only. A writer that dropped the field
+  // would leave NULLs and this assertion is what notices.
+  expect(rows.every((r) => r.root === "/tmp/proj-beta")).toBe(true);
+});
+
 test("assistant: switching screens and back restores the open conversation", async ({ page }) => {
   await page.goto(`${APP}?seed=systemai`);
   await page.getByRole("button", { name: "Assistant", exact: true }).click();

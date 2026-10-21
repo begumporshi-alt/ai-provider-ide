@@ -1565,6 +1565,8 @@ export interface SessionMessageRow {
   model?: string | null;
   /** Serialized `RecalledMemory[]` (0028) — the memories this turn's answer drew on. */
   memoryRefs?: string | null;
+  /** The workspace root this turn ran in (0034). Imported rows carry their foreign root. */
+  root?: string | null;
   ts: number;
 }
 
