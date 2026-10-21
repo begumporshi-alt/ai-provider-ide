@@ -50,11 +50,26 @@ pub struct SessionRef {
     pub title: Option<String>,
     pub root: Option<String>,
     pub updated_at: i64,
+    /// The UI's `turns` (the wire contract the manifest card and its guards read), not a second
+    /// estimate: the field is named for the adapter's job, and serialized for the consumer's.
+    #[serde(rename = "turns")]
     pub turn_estimate: usize,
     pub preview: String,
     pub native_path: String,
     pub readable: bool,
     pub note: Option<String>,
+    /// Set by the listing handlers when this session's derived id already has transcript rows.
+    /// `None` means "not checked" — an adapter never writes to our store and cannot know.
+    pub import_id: Option<String>,
+}
+
+/// The id `POST /admin/sources/import` derives for a foreign session.
+///
+/// Deterministic on purpose: re-importing the same session upserts the same rows instead of
+/// minting a duplicate history. It lives here so the list handlers (which mark already-imported
+/// rows) and the import handlers (which mint the id) cannot drift apart.
+pub fn imported_session_id(source: &str, native_id: &str) -> String {
+    format!("imp-{}-{:016x}", source, crate::core::gateway::context_scope::fnv1a(native_id))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -364,6 +379,7 @@ impl AgentSource for JsonlSource {
                 native_path: path.display().to_string(),
                 readable: true,
                 note: None,
+                import_id: None,
             });
         }
         out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -511,6 +527,7 @@ impl AgentSource for CodexSource {
                 native_path: path.display().to_string(),
                 readable: true,
                 note: None,
+                import_id: None,
             });
         }
         out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -668,6 +685,7 @@ impl AgentSource for ZcodeSource {
                 native_path: self.db.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
                 readable: true,
                 note: None,
+                import_id: None,
             });
         }
         Ok(out)
@@ -879,6 +897,7 @@ impl AgentSource for RouterSource {
                     native_path: "session_messages".into(),
                     readable: true,
                     note: None,
+                    import_id: None,
                 }
             })
             .collect();

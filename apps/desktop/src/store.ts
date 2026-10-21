@@ -2121,10 +2121,14 @@ export interface AgentSourceInfo {
 }
 
 export async function listAgentSources(): Promise<AgentSourceInfo[]> {
-  const res = await fetchAdminAs(
+  // Same wrapper as `listSourceSessions`: the route answers `{ sources: [...] }`.
+  const body = await fetchAdminAs(
     "GET",
     "/admin/sources",
-    arrayOf(isAgentSource),
+    (v): v is { sources: AgentSourceInfo[] } =>
+      isObj(v) &&
+      Array.isArray((v as { sources?: unknown }).sources) &&
+      (v as { sources: unknown[] }).sources.every(isAgentSource),
   );
   // Preserve the UI's card order from `all_sources` rather than trusting the host's ordering.
   const order = [
@@ -2136,7 +2140,7 @@ export async function listAgentSources(): Promise<AgentSourceInfo[]> {
     "workbuddy",
     "gemini",
   ];
-  return res
+  return body.sources
     .slice()
     .sort((a, b) => order.indexOf(a.name) - order.indexOf(b.name));
 }
@@ -2156,7 +2160,18 @@ export async function listSourceSessions(opts: {
   const path = opts.source
     ? `/admin/sources/${opts.source}/sessions?${q.toString()}`
     : `/admin/sources/sessions?${q.toString()}`;
-  return fetchAdminAs("GET", path, arrayOf(isRelatedSourceSession));
+  // The route answers `{ sessions: [...] }` (the same wrapper `gateway_admin.rs` writes), not a
+  // bare array — guarding the body as an array made every call throw and the manifest's related
+  // section silently compose empty. The wrapper is part of the contract, so unwrap it here.
+  const body = await fetchAdminAs(
+    "GET",
+    path,
+    (v): v is { sessions: RelatedSourceSession[] } =>
+      isObj(v) &&
+      Array.isArray((v as { sessions?: unknown }).sessions) &&
+      (v as { sessions: unknown[] }).sessions.every(isRelatedSourceSession),
+  );
+  return body.sessions;
 }
 
 /** Pull a single foreign session into this app's transcript store. Idempotent. */

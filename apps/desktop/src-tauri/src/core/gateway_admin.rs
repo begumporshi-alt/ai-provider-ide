@@ -1901,6 +1901,17 @@ pub async fn source_sessions_h(
         b_home.cmp(&a_home).then_with(|| b.updated_at.cmp(&a.updated_at))
     });
     hits.truncate(limit);
+    // Mark the sessions already pulled in. The derived id is deterministic, so a cheap existence
+    // probe is the whole answer — and the card can show "imported" instead of offering the same
+    // import twice.
+    if let Some(store) = core.store() {
+        for hit in &mut hits {
+            let id = agent_sources::imported_session_id(&hit.source, &hit.native_id);
+            if context::session_exists(store, &id).unwrap_or(false) {
+                hit.import_id = Some(id);
+            }
+        }
+    }
     (StatusCode::OK, Json(json!({ "sessions": hits }))).into_response()
 }
 
@@ -1970,11 +1981,7 @@ pub async fn source_import_h(
     /// a reference, not the store of record, and the original stays intact.
     const IMPORT_MAX_BYTES: usize = 2 * 1024 * 1024;
 
-    let session_id = format!(
-        "imp-{}-{:016x}",
-        body.source,
-        crate::core::gateway::context_scope::fnv1a(&body.native_id)
-    );
+    let session_id = agent_sources::imported_session_id(&body.source, &body.native_id);
 
     let mut rows = Vec::new();
     let mut bytes = 0usize;

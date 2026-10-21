@@ -648,6 +648,35 @@ async function oracle(req, res, path) {
         const title = /"title":\s*"([^"]+)"/.exec(lastToolResult)?.[1] ?? "";
         content = `You have ${count} past session(s)${title ? `, including “${title}”` : ""}.`;
       }
+    } else if (tools && /find the claude session/i.test(userPrompt)) {
+      // Agent mode, CROSS-AGENT variant: search_agents → load_session → read_session, then an
+      // answer quoting the imported transcript. The quoted sentence exists only in the foreign
+      // session's own rows, so it can only reach this line through search → import → store → read.
+      const round = toolMsgs.length;
+      if (round === 0) {
+        toolCall = { name: "search_agents", arguments: JSON.stringify({ query: "refresh token" }) };
+        content = "";
+      } else if (round === 1) {
+        // The loop formats hits as one pretty-printed JSON array after a header line.
+        let hit = {};
+        try {
+          hit = JSON.parse(lastToolResult.split("\n\n").slice(1).join("\n\n"))[0] ?? {};
+        } catch { /* the refusal path answers below */ }
+        toolCall = {
+          name: "load_session",
+          arguments: JSON.stringify({ source: hit.source, native_id: hit.nativeId }),
+        };
+        content = "";
+      } else if (round === 2) {
+        const sid = /as session (\S+)/.exec(lastToolResult)?.[1] ?? "unknown";
+        toolCall = { name: "read_session", arguments: JSON.stringify({ session_id: sid }) };
+        content = "";
+      } else {
+        const quote =
+          /keep the previous token valid[^.]*\./.exec(lastToolResult)?.[0] ??
+          "(no imported transcript came back)";
+        content = `The imported session says: ${quote}`;
+      }
     } else if (tools && /plan the/i.test(userPrompt) && !sawPlanCall) {
       // Agent mode, PLAN-EXIT variant: a planning pass ends the way the real contract says it must
       // — by calling `exit_plan_mode` with the plan document, which is what raises the review.

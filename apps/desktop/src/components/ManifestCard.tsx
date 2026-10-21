@@ -81,7 +81,7 @@ export function ManifestCard({
             className="mb-1 font-medium"
             style={{ color: "var(--text-dim)", fontSize: "11px" }}
           >
-            Imported sessions ({manifest.related.length})
+            Related sessions ({manifest.related.length})
           </div>
           <ul className="space-y-1">
             {manifest.related.map((s) => (

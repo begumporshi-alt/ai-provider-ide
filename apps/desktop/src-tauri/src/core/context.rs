@@ -887,6 +887,22 @@ pub fn max_message_seq(store: &Store, session_id: &str) -> Result<i64, String> {
     Ok(max.unwrap_or(0))
 }
 
+/// Whether this session already has transcript rows.
+///
+/// The sources listing uses it to mark a foreign session as imported without loading the rows:
+/// an import is a deterministic id, so existence is the whole answer and the content is not
+/// needed to render a badge.
+pub fn session_exists(store: &Store, session_id: &str) -> Result<bool, String> {
+    let conn = store.conn.lock().map_err(|e| e.to_string())?;
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_messages WHERE session_id = ?1)",
+        params![session_id],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n != 0)
+    .map_err(|e| e.to_string())
+}
+
 /// The highest sequence number already used by this session's generated node ids.
 ///
 /// Resuming a session continues it in place, so the recorder must start its sequence past what is

@@ -3103,6 +3103,35 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       return found ? cloneJson(found) : null;
     }
 
+    // ---- cross-agent sources: the Tauri commands behind the agent tools' port ----
+    // The agent loop reaches these through `assistant.sources` (invoke), not through the admin
+    // HTTP routes the TS surface uses, so a shim without these cases would reject every
+    // search_agents / load_session call as an unknown command.
+    case "admin_sources_list":
+      return sourceList();
+    case "admin_source_sessions": {
+      const source = typeof args.source === "string" && args.source ? args.source : null;
+      const query = typeof args.query === "string" ? args.query.trim().toLowerCase() : "";
+      const root = typeof args.root === "string" && args.root.trim() ? args.root.trim() : null;
+      const limit = Math.min(Number(args.limit ?? 25) || 25, 100);
+      const pool = source
+        ? SOURCES_SEED[source] ?? []
+        : ADAPTER_ORDER.flatMap((n) => SOURCES_SEED[n] ?? []);
+      return pool
+        .filter((s) => !root || s.root === root)
+        .filter(
+          (s) =>
+            !query ||
+            (s.title ?? "").toLowerCase().includes(query) ||
+            s.preview.toLowerCase().includes(query) ||
+            (s.root ?? "").toLowerCase().includes(query),
+        )
+        .slice(0, limit)
+        .map(sourceRef);
+    }
+    case "admin_source_import":
+      return importSourceSeed(String(args.source ?? ""), String(args.native_id ?? ""));
+
     default:
       // Unknown commands must reject, exactly as Rust would, so a typo can't pass silently.
       //
@@ -3590,8 +3619,47 @@ const SOURCES_SEED: Record<string, RelatedSessionSeed[]> = {
   claude: [
     {
       source: "claude", nativeId: "sess_1", title: "Claude: auth flow sketch",
-      root: "/tmp/proj-beta", turns: 12, preview: "How do we rotate the refresh token?",
+      root: "/tmp/proj-beta", preview: "How do we rotate the refresh token?",
       nativePath: "~/.claude/projects/-tmp-proj-beta/sess_1.jsonl", importId: null,
+      // What the adapter's `read()` returns; import copies these rows into this app's transcript
+      // store. The second turn's phrase exists nowhere else in the harness, so a spec can prove
+      // it reached the answer through import → transcript_append → read_session.
+      turnRows: [
+        { role: "user", content: "How do we rotate the refresh token?", ts: 1_790_000_000_000 },
+        {
+          role: "assistant",
+          content:
+            "Rotate on a 15-minute cadence and keep the previous token valid for one overlap " +
+            "window so in-flight requests do not fail.",
+          ts: 1_790_000_005_000,
+        },
+        { role: "user", content: "Does that hold when the clock skews?", ts: 1_790_000_010_000 },
+        {
+          role: "assistant",
+          content:
+            "Widen the overlap to two windows under skew; the refresh endpoint tolerates the " +
+            "older token until it expires.",
+          ts: 1_790_000_015_000,
+        },
+      ],
+    },
+  ],
+  // A second agent's session in a DIFFERENT workspace. The related list is scoped by root, so
+  // this row must never appear alongside the claude one — the harness proves the scoping, not
+  // just that some foreign session renders.
+  codex: [
+    {
+      source: "codex", nativeId: "cafe", title: "Codex: build slowdown",
+      root: "/tmp/proj-alpha", preview: "why is the build slow?",
+      nativePath: "~/.codex/sessions/2026/10/02/rollout-cafe.jsonl", importId: null,
+      turnRows: [
+        { role: "user", content: "why is the build slow?", ts: 1_790_000_100_000 },
+        {
+          role: "assistant",
+          content: "The typecheck runs twice; dedupe the plugin.",
+          ts: 1_790_000_105_000,
+        },
+      ],
     },
   ],
 };
@@ -3600,10 +3668,35 @@ interface RelatedSessionSeed {
   nativeId: string;
   title: string | null;
   root: string | null;
-  turns: number;
   preview: string;
   nativePath: string;
   importId: string | null;
+  turnRows: Array<{ role: string; content: string; ts: number }>;
+}
+/** The wire shape `SessionRef` serializes in Rust (camelCase, `turns`, `importId`). */
+function sourceRef(s: RelatedSessionSeed): Record<string, unknown> {
+  return {
+    source: s.source, nativeId: s.nativeId, title: s.title, root: s.root,
+    updatedAt: 1_790_000_000_000, turns: s.turnRows.length, preview: s.preview,
+    nativePath: s.nativePath, readable: true, note: null, importId: s.importId,
+  };
+}
+/** Mirror the Rust import: a deterministic id, the seed marked imported, and the rows written into
+ * this app's own transcript store under that id — the rows `read_session` serves afterwards. */
+async function importSourceSeed(
+  source: string,
+  nativeId: string,
+): Promise<{ sessionId: string; turns: number }> {
+  const match = (SOURCES_SEED[source] ?? []).find((s) => s.nativeId === nativeId);
+  if (!match) refuse(404, "unknown session", "unknown_session");
+  const sessionId = `imp-${source}-${match.nativeId}`;
+  match.importId = sessionId;
+  await dispatch("transcript_append", {
+    rows: match.turnRows.map((t, i) => ({
+      sessionId, seq: i, role: t.role, content: t.content, ts: t.ts, root: match.root,
+    })),
+  });
+  return { sessionId, turns: match.turnRows.length };
 }
 function sourceList(): unknown[] {
   return ADAPTER_ORDER.map((name) => {
@@ -3637,18 +3730,13 @@ async function routeSources(method: string, segs: string[], q: URLSearchParams, 
       );
     }
     const limit = limitOf(q, 25);
-    return { sessions: hits.slice(0, limit) };
+    return { sessions: hits.slice(0, limit).map(sourceRef) };
   }
   // POST /admin/sources/import — `import` is a static segment, so it precedes any {name}/sessions
   // match the same way the Rust router declares it before `{name}/sessions`.
   if (method === "POST" && segs.length === 3 && at(2) === "import") {
     const b = (body ?? {}) as { source?: unknown; native_id?: unknown };
-    const sessions = SOURCES_SEED[String(b.source ?? "")] ?? [];
-    const match = sessions.find((s) => s.nativeId === b.native_id);
-    if (!match) refuse(404, "unknown session", "unknown_session");
-    const id = `imp-${b.source}-${match.nativeId}`;
-    match.importId = id;
-    return { sessionId: id, turns: match.turns };
+    return importSourceSeed(String(b.source ?? ""), String(b.native_id ?? ""));
   }
   refuse(404, `no admin route for ${method} /${segs.join("/")}`, "unknown_route");
 }

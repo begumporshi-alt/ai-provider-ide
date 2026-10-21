@@ -6329,4 +6329,21 @@ async fn source_import_writes_a_resumable_scrubbed_transcript_and_is_idempotent(
         )
         .unwrap();
     assert_eq!(count, 2);
+
+    // The listing speaks the UI's wire shape: `turns` (what the manifest's guard and card read),
+    // never the adapter's field name, and the deterministic import id rides along so the card can
+    // show "imported" instead of offering the same import twice.
+    let listing = s
+        .client
+        .get(format!("{}/admin/sources/codex/sessions?root=/tmp/proj-alpha", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listing.status(), 200);
+    let body: Value = listing.json().await.unwrap();
+    let hit = body["sessions"].as_array().unwrap().first().expect("the imported session is listed");
+    assert_eq!(hit["turns"], 2, "the wire field is the one the TS consumer guards on");
+    assert!(hit.get("turnEstimate").is_none(), "the adapter's internal name must not leak");
+    assert_eq!(hit["importId"].as_str(), Some(session_id.as_str()));
 }

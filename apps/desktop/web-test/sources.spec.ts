@@ -143,7 +143,7 @@ test("importSourceSession is idempotent and returns the derived session id", asy
     native_id: "sess_1",
   })) as { sessionId: string; turns: number };
   expect(first.sessionId).toMatch(/^imp-claude-/);
-  expect(first.turns).toBe(12);
+  expect(first.turns).toBe(4);
 
   // Re-import: same id, same turn count — the import is a snapshot, not a duplicate.
   const second = (await admin(page, "POST", "/sources/import", {
@@ -151,7 +151,7 @@ test("importSourceSession is idempotent and returns the derived session id", asy
     native_id: "sess_1",
   })) as { sessionId: string; turns: number };
   expect(second.sessionId).toBe(first.sessionId);
-  expect(second.turns).toBe(12);
+  expect(second.turns).toBe(4);
 
   // Unknown native id: 404 surfaces as a thrown error, not a silent empty import.
   await expect(

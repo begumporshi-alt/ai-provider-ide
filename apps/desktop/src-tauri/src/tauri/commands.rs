@@ -367,6 +367,14 @@ pub fn admin_source_sessions(
         b_home.cmp(&a_home).then_with(|| b.updated_at.cmp(&a.updated_at))
     });
     hits.truncate(limit);
+    // Mark already-imported rows the same way the HTTP listing does: the derived id is
+    // deterministic, so existence is the whole answer.
+    for hit in &mut hits {
+        let id = crate::core::agent_sources::imported_session_id(&hit.source, &hit.native_id);
+        if crate::core::context::session_exists(&store, &id).unwrap_or(false) {
+            hit.import_id = Some(id);
+        }
+    }
     Ok(hits)
 }
 
@@ -384,15 +392,9 @@ pub fn admin_source_import(
     };
     let turns = src.read(&native_id).map_err(|e| CommandError(format!("could not read: {e}")))?;
     if turns.is_empty() {
-        return Err(CommandError(format!(
-            "no readable turns in '{source}' for '{native_id}'"
-        )));
+        return Err(CommandError(format!("no readable turns in '{source}' for '{native_id}'")));
     }
-    let session_id = format!(
-        "imp-{}-{:016x}",
-        source,
-        crate::core::gateway::context_scope::fnv1a(&native_id),
-    );
+    let session_id = crate::core::agent_sources::imported_session_id(&source, &native_id);
     let root = src
         .list()
         .unwrap_or_default()
