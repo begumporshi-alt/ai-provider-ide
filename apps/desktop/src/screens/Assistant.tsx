@@ -3190,6 +3190,20 @@ function Chat({
           // answer` — the order the live view just showed and the model actually worked in.
           onReplaceTranscript: (next) =>
             setMsgs(attachReasoning(next, timelineRef.current)),
+          // A failed or stopped run's completed rounds. They render before the optimistic
+          // assistant bubble, which the engine's catch fills with the `⚠` line — without this the
+          // `clearRunUi` below erased every step the user had already watched from the turn.
+          onFailedTranscript: (rounds) =>
+            setMsgs((m) => {
+              if (rounds.length === 0) return m;
+              const last = m[m.length - 1];
+              // The optimistic placeholder stays last so `fillIfEmpty` can still address it.
+              const tail = last?.role === "assistant" ? [last] : [];
+              return attachReasoning(
+                [...m.slice(0, m.length - tail.length), ...rounds, ...tail],
+                timelineRef.current,
+              );
+            }),
           fillIfEmpty: (id, note) =>
             setMsgs((m) =>
               m.map((x) =>

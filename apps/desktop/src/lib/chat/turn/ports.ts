@@ -214,6 +214,16 @@ export interface AgentTurnSink extends TurnEventSink {
   /** Replace the whole transcript (agent runs return the full conversation; the root guard undoes
    *  the optimistic append with it). */
   onReplaceTranscript(msgs: Msg[]): void;
+  /**
+   * Show a failed or stopped run's completed rounds, in front of the optimistic assistant bubble
+   * the catch then fills with the `⚠` line.
+   *
+   * Appended rather than replacing: the live transcript still holds the user turn (with the
+   * attachments the request may have dropped) and any history auto-compaction removed from the
+   * request, so replacing it with the loop's view would itself look like a wipe. Optional because
+   * a caller that only paints live can ignore it.
+   */
+  onFailedTranscript?(rounds: Msg[]): void;
   /** Fill an assistant bubble only while it is still empty (the failure-path wording). */
   fillIfEmpty(id: string, note: string): void;
   /** Every loop event, forwarded raw — the screen owns the paint half, the engine the recording. */

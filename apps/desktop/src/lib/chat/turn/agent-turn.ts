@@ -16,7 +16,7 @@ import { runAgentLoop, withSubagentDefs } from "../../tools";
 import { fetchMcpTools } from "../../tools/mcp-client";
 import { RunCheckpoint, createCheckpointingHost } from "../../tools/changeset";
 import { buildAgentSystem } from "./prompt";
-import { newMsgId, recalledLight, replayHistory } from "./messages";
+import { newMsgId, recalledLight, replayHistory, type Msg } from "./messages";
 import { clip, recordAgentTurn } from "./graph-record";
 import { attachmentMeta } from "./ports";
 import type { TurnRequestBase } from "./ports";
@@ -268,6 +268,23 @@ export async function runAgentTurn(
   // the plain-chat branch already does this. `transcriptWritten` keeps the two paths exclusive.
   let transcriptWritten = false;
   let failureText = "";
+  /** The failed/stopped turn's completed rounds as transcript messages; written by the catch and
+   *  consumed by the `finally` below. Empty when nothing was completed before the failure. */
+  let failureRounds: Msg[] = [];
+  /**
+   * The loop's conversation as of its most recent model call.
+   *
+   * `runAgentLoop` throws without returning its `messages`, and the screen's live timeline is
+   * cleared when the run settles — so without this snapshot a mid-run failure erased every round
+   * the user had already watched: prose, tool calls and their results all vanished, leaving only
+   * the user turn and the `⚠` line. The generate port is the one place the loop hands its own
+   * transcript back, and each request carries everything completed before that call.
+   */
+  let lastLoopMessages: ChatMessage[] | undefined;
+  /** This turn's completed rounds — everything past the replayed history the loop was seeded
+   *  with. Used by both the visible commit and the durable write, so the two cannot disagree. */
+  const completedRounds = (): ChatMessage[] =>
+    (lastLoopMessages ?? history).slice(history.length);
   try {
     const {
       text: finalText,
@@ -304,6 +321,16 @@ export async function runAgentTurn(
       // Tier 2: when this request has to drop context, the dropped turns are summarized rather
       // than discarded (server-side, or the caller's client-side summarizer above the engine).
       generate: (loopReq, opts) => {
+        // Keep the loop's own conversation from the request it is about to send. Each request
+        // carries every round completed before it, so on a mid-run failure this is the only copy
+        // of the work the user already saw. The per-call system turn is steering, not transcript —
+        // drop it (a compaction summary at the head of `history` is the one system row kept).
+        const sent = (loopReq.messages ?? []) as ChatMessage[];
+        const first = sent[0];
+        lastLoopMessages =
+          first?.role === "system" && first !== history[0]
+            ? sent.slice(1)
+            : [...sent];
         // The loop's generate port is the gateway engine — the same serving path ZCode and Claude
         // Code drive. The loop's own reasoning override — the NO_OUTPUT fallback's forced "off" —
         // is spread after the run-config level on purpose: it must win, or the fallback could not
@@ -555,6 +582,19 @@ export async function runAgentTurn(
     // The turn's own bubble, not only the trace line. A failed agent run left an empty
     // assistant turn behind, which rendered as a bare "…" — indistinguishable from a model that
     // had not answered yet — with the only clue a thin red line above the composer.
+    //
+    // The completed rounds are committed here as well. The screen's live timeline is cleared in
+    // the `finally`, so a run that fails after doing work would otherwise show only the user turn
+    // and the `⚠` line: every prose/tool step the user watched is gone, and a resume cannot
+    // restore what was never written. A partial turn is still a turn on this branch too.
+    failureRounds = completedRounds().map((m) => ({
+      id: newMsgId(),
+      role: m.role as Msg["role"],
+      content: textOfContent(m.content),
+      ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
+      ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
+    }));
+    ports.onFailedTranscript?.(failureRounds);
     if (req.controller.signal.aborted) {
       ports.orchestrator.endRun(
         runId,
@@ -590,8 +630,9 @@ export async function runAgentTurn(
       ports.fillIfEmpty(req.assistantMsgId, failureText);
     }
   } finally {
-    // A stopped or failed run never reached the success append. Record the user's turn and the
-    // failure the bubble shows, so resuming the session does not silently lose the exchange.
+    // A stopped or failed run never reached the success append. Record the user's turn, the
+    // rounds it completed, and the failure the bubble shows, so resuming the session does not
+    // silently lose the exchange — or the work that preceded the failure.
     if (!transcriptWritten) {
       ports.transcript.append([
         {
@@ -600,6 +641,13 @@ export async function runAgentTurn(
           attachments: attachmentMeta(req.attachments),
           model: null,
         },
+        ...failureRounds.map((m) => ({
+          role: m.role,
+          content: m.content,
+          toolCalls: m.tool_calls ? JSON.stringify(m.tool_calls) : null,
+          toolCallId: m.tool_call_id ?? null,
+          model: m.role === "assistant" ? req.model : null,
+        })),
         {
           role: "assistant",
           content: failureText || "⚠ this turn did not finish",

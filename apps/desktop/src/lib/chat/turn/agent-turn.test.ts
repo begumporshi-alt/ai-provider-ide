@@ -339,6 +339,49 @@ describe("runAgentTurn", () => {
     expect(appended[0]![1]!.content).toContain("stopped by you");
   });
 
+  /**
+   * A provider failure on a later round is the incident this pins: an agent run does the work,
+   * the next model call dies with NETWORK, and the `finally` clears the live timeline. Before,
+   * the catch filled the `⚠` line and nothing else — every completed round (prose, tool call,
+   * result) vanished from the screen and the durable transcript, so the turn read as if the
+   * user had asked a question and the assistant had done nothing. The completed rounds must
+   * survive on both halves: the visible commit and the resume copy.
+   */
+  it("keeps the completed rounds when a later model call fails", async () => {
+    const { ports, appended } = makePorts({
+      steps: [{ text: "", calls: [{ id: "call_7", name: "read_file", arguments: '{"path":"a.txt"}' }] }],
+    });
+    let calls = 0;
+    const original = ports.generate;
+    ports.generate = (async (
+      req: Parameters<typeof original>[0],
+      opts: Parameters<typeof original>[1],
+    ) => {
+      calls += 1;
+      if (calls === 2) {
+        throw new Error(
+          "all attempts failed for agent-router/deepseek-v4-flash [agent-router/key-04:NETWORK (upstream sent no response headers for 20s — abandoning the request)]",
+        );
+      }
+      return original(req, opts);
+    }) as never;
+
+    const shown: { role: string; content: string; tool_calls?: unknown; tool_call_id?: string }[] = [];
+    ports.onFailedTranscript = (rounds) => shown.push(...rounds);
+    await runAgentTurn(makeRequest({ useMemory: false }), ports);
+
+    // Visible: the completed round, in order, in front of the ⚠ line the screen fills.
+    expect(shown.map((m) => m.role)).toEqual(["assistant", "tool"]);
+    expect((shown[0]!.tool_calls as { function: { name: string } }[])[0]!.function.name).toBe("read_file");
+    expect(shown[1]!.tool_call_id).toBe("call_7");
+    // Durable: the same round, so a resume restores what the live turn showed.
+    expect(appended[0]!.map((e) => e.role)).toEqual(["user", "assistant", "tool", "assistant"]);
+    expect(appended[0]![1]!.toolCalls).toContain("call_7");
+    expect(appended[0]![2]!.toolCallId).toBe("call_7");
+    expect(appended[0]![3]!.content).toContain("all attempts failed");
+    expect(ports.fillIfEmpty).toHaveBeenCalledWith("assistant-1", expect.stringContaining("all attempts failed"));
+  });
+
   it("accumulates each model call's failover chain into the run's trace", async () => {
     // Two model calls, each served after its own failed attempt: the trace's chain is the
     // whole run's, in order — not the hardcoded `[]` the pre-wire trace carried.
