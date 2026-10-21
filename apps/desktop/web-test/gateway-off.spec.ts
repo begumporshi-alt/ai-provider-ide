@@ -33,6 +33,7 @@ const NAV_LABELS = [
   "Activity",
   "Context",
   "History",
+  "Sources",
   "Skills",
   "Agents",
   "Memory",

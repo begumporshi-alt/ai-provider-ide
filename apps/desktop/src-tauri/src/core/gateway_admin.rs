@@ -1854,6 +1854,27 @@ pub async fn source_sessions_h(
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
+    source_sessions(core, headers, Some(name), params).await
+}
+
+/// `GET /admin/sources/sessions?root=&q=&limit=` — the same listing across every adapter.
+///
+/// The UI's no-source path: the manifest's related list and the Sources screen both browse all
+/// agents at once. It shares the implementation with the named route so the two cannot drift.
+pub async fn source_sessions_all_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    source_sessions(core, headers, None, params).await
+}
+
+async fn source_sessions(
+    core: Arc<GatewayCore>,
+    headers: HeaderMap,
+    name: Option<String>,
+    params: HashMap<String, String>,
+) -> Response {
     if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
@@ -1862,18 +1883,26 @@ pub async fn source_sessions_h(
     let limit = params.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(25).min(100);
 
     let sources = agent_sources::all_sources(core.store().cloned());
-    if query.is_none() && !sources.iter().any(|s| s.name() == name) {
-        return admin_error(
-            StatusCode::NOT_FOUND,
-            &format!("unknown session source '{name}'"),
-            Some("unknown_source"),
-        );
+    // A named listing must resolve; the all-sources route has no name to resolve, and a combined
+    // search is deliberately a fan-out (the name is not a filter once `q` is present).
+    if let Some(name) = &name {
+        if query.is_none() && !sources.iter().any(|s| s.name() == name) {
+            return admin_error(
+                StatusCode::NOT_FOUND,
+                &format!("unknown session source '{name}'"),
+                Some("unknown_source"),
+            );
+        }
     }
 
     let mut refs = Vec::new();
     for source in sources {
-        if query.is_none() && source.name() != name {
-            continue;
+        if query.is_none() {
+            if let Some(name) = &name {
+                if source.name() != name {
+                    continue;
+                }
+            }
         }
         refs.extend(source.list().unwrap_or_default());
     }

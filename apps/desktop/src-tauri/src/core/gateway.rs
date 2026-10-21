@@ -2477,6 +2477,9 @@ pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, St
         // `{name}/sessions` pattern the same way the memory statics precede `/admin/memory/{id}`.
         .route("/admin/sources", get(admin::sources_list_h))
         .route("/admin/sources/import", post(admin::source_import_h))
+        // The all-sources listing. The UI's no-source path (`/admin/sources/sessions`) is three
+        // segments, so it is its own route, not a `{name}` that happens to be "sessions".
+        .route("/admin/sources/sessions", get(admin::source_sessions_all_h))
         .route("/admin/sources/{name}/sessions", get(admin::source_sessions_h))
         .route(
             "/admin/context",

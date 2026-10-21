@@ -3713,9 +3713,15 @@ async function routeSources(method: string, segs: string[], q: URLSearchParams, 
   const at = (i: number): string => (i < segs.length ? decodeURIComponent(segs[i]) : "");
   // GET /admin/sources
   if (method === "GET" && segs.length === 2) return { sources: sourceList() };
-  // GET /admin/sources/{name}/sessions  |  GET /admin/sources/sessions
-  if (method === "GET" && segs.length === 3) {
-    const which = at(2);
+  // GET /admin/sources/sessions            (all adapters)
+  // GET /admin/sources/{name}/sessions     (one adapter)
+  // The Rust router declares the all-sources path as its own three-segment route, so the shim
+  // must not assume every listing carries a name.
+  if (
+    method === "GET" &&
+    (segs.length === 3 || (segs.length === 4 && at(3) === "sessions"))
+  ) {
+    const which = segs.length === 4 ? at(2) : "sessions";
     const root = q.get("root");
     const qstr = (q.get("q") || "").trim().toLowerCase();
     const pool: RelatedSessionSeed[] =
